@@ -1,0 +1,8 @@
+infra/images/
+tmp/
+results/*.log
+*.img
+*.qcow2
+*.raw
+*.iso
+.DS_Store

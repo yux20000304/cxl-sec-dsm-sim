@@ -1,0 +1,40 @@
+## Gramine manifest template for Redis
+
+loader.entrypoint = "/usr/bin/redis-server"
+loader.argv = [ "redis-server", "redis.conf" ]
+loader.insecure__use_cmdline_argv = true
+loader.log_level = "{{ log_level | default('warning') }}"
+loader.env.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+loader.env.LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu"
+
+libos.entrypoint = "/usr/bin/redis-server"
+libos.heap_size = "256M"
+
+fs.mounts = [
+  { path = "/lib",  uri = "file:/lib",  type = "chroot" },
+  { path = "/lib64", uri = "file:/lib64", type = "chroot" },
+  { path = "/usr",  uri = "file:/usr",  type = "chroot" },
+  { path = "/etc",  uri = "file:/etc",  type = "chroot" },
+  { path = "/tmp",  uri = "file:/tmp",  type = "chroot" },
+  { path = "/dev",  uri = "file:/dev",  type = "chroot" },
+  { path = "/home", uri = "file:/home", type = "chroot" },
+  { path = ".", uri = "file:.", type = "chroot" },
+]
+
+sgx.enclave_size = "{{ sgx_size | default('1024M') }}"
+sgx.max_threads = {{ sgx_threads | default(64) }}
+sgx.debug = {{ sgx_debug | default(true) }}
+sgx.allowed_files = [
+  "file:redis.conf",
+  "file:/usr/bin/redis-server",
+  "file:/lib/**",
+  "file:/usr/lib/**",
+  "file:/etc/**",
+  "file:/dev/urandom",
+  "file:/dev/null",
+  "file:/dev/uio0",
+  "file:/tmp/cxl_shared.raw",
+]
+
+net.allow_ipv4 = true
+net.allow_ipv6 = true
