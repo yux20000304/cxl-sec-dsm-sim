@@ -6,3 +6,4 @@ results/*.log
 *.raw
 *.iso
 .DS_Store
+.vscode/

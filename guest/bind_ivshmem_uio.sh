@@ -12,7 +12,7 @@ fi
 modprobe uio_pci_generic
 
 echo "[*] Searching for ivshmem (virtio vendor 0x1af4, device 0x1110)..."
-# new_id 可能已存在，再写会报错；忽略此类错误
+# new_id may already exist; writing again can error out, so ignore failures here
 echo "1af4 1110" > /sys/bus/pci/drivers/uio_pci_generic/new_id 2>/dev/null || true
 
 found=0

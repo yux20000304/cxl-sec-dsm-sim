@@ -32,7 +32,7 @@
 #define STATUS_MISS 1
 #define STATUS_ERR 2
 
-/* When >1 thread and ring_count不足，才加锁保护 head/tail */
+/* Only grab a lock when >1 thread shares the same ring (protect head/tail). */
 static int use_lock = 0;
 static pthread_mutex_t req_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t resp_lock = PTHREAD_MUTEX_INITIALIZER;
