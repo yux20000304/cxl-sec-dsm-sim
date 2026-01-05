@@ -133,8 +133,29 @@ if [[ "${VMNET_ENABLE}" == "1" ]]; then
 fi
 
 enable_kvm=()
-if [[ -e /dev/kvm ]]; then
+host_has_aes=0
+if grep -q -m1 -w aes /proc/cpuinfo 2>/dev/null; then
+  host_has_aes=1
+fi
+
+if [[ -c /dev/kvm && "${host_has_aes}" == "1" ]]; then
   enable_kvm=( -enable-kvm -cpu host )
+else
+  # No usable KVM path (either missing /dev/kvm, or host CPU doesn't expose AES).
+  # Gramine (Linux backend) requires AES-NI (`aes` CPUID flag). When we can't
+  # pass through host CPU features via KVM, force a CPU model that exposes AES
+  # so Gramine can at least run under TCG (functional testing; very slow).
+  if "${QEMU_BIN}" -cpu help 2>/dev/null | grep -q '^x86 max'; then
+    enable_kvm=( -cpu max )
+  else
+    enable_kvm=( -cpu qemu64,+aes )
+  fi
+
+  if [[ ! -c /dev/kvm ]]; then
+    echo "[!] /dev/kvm not found; running QEMU without KVM (TCG). Performance will be very slow." >&2
+  elif [[ "${host_has_aes}" != "1" ]]; then
+    echo "[!] Host CPU doesn't expose AES-NI ('aes' flag). Gramine requires it; using TCG with emulated AES (slow)." >&2
+  fi
 fi
 
 VM1_CPU_NODE="${VM1_CPU_NODE:-}"

@@ -202,7 +202,14 @@ ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_native_gramine >/dev/null 2>&1 || true"
 ssh_vm1 "tmux new-session -d -s redis_native_gramine \"cd /mnt/hostshare/gramine && gramine-direct ./redis-native /repo/gramine/redis.conf >/tmp/redis_native_gramine.log 2>&1\""
-ssh_vm1 "for i in \$(seq 1 80); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'redis-server not ready' >&2; exit 1"
+if ! ssh_vm1 "for i in \$(seq 1 80); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
+  echo "[!] redis-server not ready (vm1). Dumping diagnostics..." >&2
+  ssh_vm1 "tail -n 200 /tmp/redis_native_gramine.log 2>/dev/null || true" >&2
+  ssh_vm1 "ss -lntp 2>/dev/null | grep -E ':6379\\b' || true" >&2
+  ssh_vm1 "pgrep -a redis-server 2>/dev/null || true" >&2
+  ssh_vm1 "tmux capture-pane -pt redis_native_gramine -S -200 2>/dev/null || true" >&2
+  exit 1
+fi
 
 # Wait until VM2 can reach VM1 over the internal NIC.
 ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
