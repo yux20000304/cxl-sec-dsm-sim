@@ -4,7 +4,7 @@ set -euo pipefail
 # Create per-VM qcow2 disks from a base Ubuntu cloud image.
 # Example:
 #   bash infra/create_vm_images.sh \
-#     --base /path/to/jammy-server-cloudimg-amd64.img \
+#     --base /path/to/ubuntu-24.04-server-cloudimg-amd64.img \
 #     --outdir infra/images --vm1 vm1.qcow2 --vm2 vm2.qcow2 --size 12G
 
 usage() {

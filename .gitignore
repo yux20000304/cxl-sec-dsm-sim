@@ -1,6 +1,19 @@
 infra/images/
 tmp/
 results/*.log
+results/*.csv
+
+# Gramine outputs are environment-specific; keep only *.manifest.template in git.
+gramine/*.manifest
+gramine/*.manifest.sgx
+gramine/*.sig
+gramine/*.token
+gramine/*.pem
+gramine/redis-native
+gramine/redis-ring
+
+ring_client/cxl_ring_client
+ring_client/cxl_ring_direct
 *.img
 *.qcow2
 *.raw

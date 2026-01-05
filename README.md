@@ -27,10 +27,10 @@ sudo bash infra/create_cxl_shared.sh /tmp/cxl_shared.raw 4G
 ```
 
 ### Prepare Ubuntu cloud image + VM disks
-Download a cloud image (e.g., `jammy-server-cloudimg-amd64.img`), then:
+Download a cloud image (e.g., `ubuntu-24.04-server-cloudimg-amd64.img`), then:
 ```bash
 bash infra/create_vm_images.sh \
-  --base /path/to/jammy-server-cloudimg-amd64.img \
+  --base /path/to/ubuntu-24.04-server-cloudimg-amd64.img \
   --outdir infra/images \
   --vm1 vm1.qcow2 \
   --vm2 vm2.qcow2
@@ -70,6 +70,20 @@ ls -la /dev/uio*
 ```
 
 ### Install Redis / Gramine (VM1)
+Install Gramine + SGX repo keys (Jammy/Noble) and update:
+```bash
+sudo curl -fsSLo /etc/apt/keyrings/gramine-keyring-$(lsb_release -sc).gpg https://packages.gramineproject.io/gramine-keyring-$(lsb_release -sc).gpg
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/gramine-keyring-$(lsb_release -sc).gpg] https://packages.gramineproject.io/ $(lsb_release -sc) main" \
+  | sudo tee /etc/apt/sources.list.d/gramine.list
+
+sudo curl -fsSLo /etc/apt/keyrings/intel-sgx-deb.asc https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/intel-sgx-deb.asc] https://download.01.org/intel-sgx/sgx_repo/ubuntu $(lsb_release -sc) main" \
+  | sudo tee /etc/apt/sources.list.d/intel-sgx.list
+
+sudo apt-get update
+sudo apt-get install -y gramine
+```
+
 Use apt or the helper:
 ```bash
 sudo bash guest/vm1_setup.sh   # optional helper
@@ -77,8 +91,19 @@ sudo bash guest/vm1_setup.sh   # optional helper
 Gramine templates live in `gramine/`:
 ```bash
 cd gramine
-make SGX=1
-gramine-sgx ./redis-server -c redis.conf
+# Build two manifests:
+# - `redis-native.manifest` for `/usr/bin/redis-server` (TCP/RESP baseline)
+# - `redis-ring.manifest`   for `/repo/redis/src/redis-server` (CXL ring enabled)
+make links native ring
+
+# Run native Redis under Gramine (direct mode).
+gramine-direct ./redis-native /repo/gramine/redis.conf
+
+# Run ring-enabled Redis under Gramine (direct mode, needs BAR2 access).
+sudo gramine-direct ./redis-ring /repo/gramine/redis.conf
+
+# Optional (build SGX-signed manifests, no hardware required to sign):
+# make sgx
 ```
 
 ## Phase 3: CXL shim – direct binary ring (C)
@@ -164,10 +189,25 @@ Result: SET/GET ≈ 199,800 req/s.
 ## One-command host bootstrap
 If you already have a cloud image (BASE_IMG) and host deps installed:
 ```bash
-BASE_IMG=/path/to/jammy-server-cloudimg-amd64.img \
+BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img \
 bash scripts/host_quickstart.sh
 ```
 This creates the shared file, qcow2/seed, and boots both VMs (SSH: 2222/2223). Tune memory/CPU/NUMA via env vars if needed.
+
+If you switch the base image (e.g., Jammy -> Noble), recreate the VM disks:
+```bash
+FORCE_RECREATE=1 bash scripts/host_quickstart.sh
+```
+
+### One command: recreate VMs + Gramine benchmarks
+This rebuilds VM1/VM2 from the base image and runs:
+- Gramine + native Redis over TCP (VM2 -> VM1 via `cxl0` internal NIC)
+- Gramine + ring-enabled Redis over BAR2 (VM2 uses `cxl_ring_direct`)
+
+```bash
+bash scripts/host_recreate_and_bench_gramine.sh
+```
+Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
 
 ## Quick shared-memory sanity check
 VM1:

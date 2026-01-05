@@ -1,0 +1,83 @@
+## Gramine manifest template: ring-enabled Redis server.
+##
+## This runs the modified Redis under Gramine and enables the CXL ring path via
+## env vars (no TCP/RESP on the hot path; the client writes to the shared BAR2
+## region directly).
+##
+## Usage inside VM1:
+##   cd /mnt/hostshare/gramine
+##   make ring
+##   sudo gramine-direct ./redis-ring /repo/gramine/redis.conf
+##
+## Notes:
+## - The shared BAR2 region must be mapped as `untrusted_shm` so mmap() is truly
+##   MAP_SHARED and not affected by Gramine file caching.
+## - By default we use the guest's system libc. If you want Gramine's runtime
+##   glibc instead, run: `USE_RUNTIME_GLIBC=1 make ring`.
+
+libos.entrypoint = "/repo/redis/src/redis-server"
+
+loader.entrypoint = { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so" }
+loader.insecure__use_cmdline_argv = true
+loader.log_level = "{{ log_level | default('warning') }}"
+
+loader.env.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+loader.env.LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu"
+
+loader.env.CXL_RING_PATH = "{{ cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') }}"
+loader.env.CXL_RING_COUNT = "{{ cxl_ring_count | default('4') }}"
+loader.env.CXL_RING_MAP_SIZE = "{{ cxl_ring_map_size | default('134217728') }}"
+
+fs.mounts = [
+  # Repo root (parent dir of this `gramine/` folder).
+  { uri = "file:..", path = "/repo" },
+
+  # System directories.
+  { uri = "file:/usr",  path = "/usr" },
+  { uri = "file:/etc",  path = "/etc" },
+  { uri = "file:/tmp",  path = "/tmp" },
+  { uri = "file:/dev",  path = "/dev" },
+  { uri = "file:/home", path = "/home" },
+  # The BAR2 resource file must be mounted as `untrusted_shm` so that mmap() with
+  # MAP_SHARED works under Gramine (otherwise Gramine may reject MAP_SHARED).
+  #
+  # NOTE: `untrusted_shm` currently requires `dev:` URIs (Gramine 1.9).
+  { uri = "dev:{{ cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') }}", path = "{{ cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') }}", type = "untrusted_shm" },
+  # NOTE: we intentionally do NOT mount the whole `/sys` tree; the BAR2 resource
+  # file above is sufficient for the ring transport and avoids extra sysfs
+  # surface area.
+
+{% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
+  # Use Gramine runtime glibc (closer to SGX mode).
+  { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc", path = "/lib" },
+  { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc", path = "/lib64" },
+{% else %}
+  # Use guest system libc (often faster for direct mode).
+  { uri = "file:/lib",   path = "/lib" },
+  { uri = "file:/lib64", path = "/lib64" },
+{% endif %}
+]
+
+# SGX settings are ignored in direct mode; keep them minimal to avoid huge manifests.
+sgx.enclave_size = "{{ sgx_size | default('1024M') }}"
+sgx.max_threads = {{ sgx_threads | default(64) }}
+sgx.debug = true
+
+sgx.trusted_files = [
+  "file:redis.conf",
+  "file:../redis/src/redis-server",
+  "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so",
+]
+
+sgx.allowed_files = [
+  "file:/usr/",
+  "file:/etc/",
+  "file:/tmp/",
+  "file:/dev/",
+  "file:/home/",
+  "file:/sys/",
+  "file:/lib/",
+  "file:/lib64/",
+  "file:..",
+  "file:{{ cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') }}",
+]

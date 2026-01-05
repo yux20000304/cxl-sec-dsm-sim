@@ -1,0 +1,68 @@
+## Gramine manifest template: native (TCP/RESP) Redis server.
+##
+## This is intended for Gramine *direct* mode (no SGX hardware required), but it
+## also keeps a minimal SGX section so you can later experiment with
+## `gramine-sgx` if desired.
+##
+## Usage inside VM1 (after installing `gramine` and `redis-server`):
+##   cd /mnt/hostshare/gramine
+##   make native
+##   gramine-direct ./redis-native /repo/gramine/redis.conf
+##
+## Notes:
+## - We mount the repo root as `/repo` via `file:..` (relative to this folder).
+## - By default we use the guest's system libc. If you want Gramine's runtime
+##   glibc instead, run: `USE_RUNTIME_GLIBC=1 make native`.
+
+libos.entrypoint = "/usr/bin/redis-server"
+
+loader.entrypoint = { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so" }
+loader.insecure__use_cmdline_argv = true
+loader.log_level = "{{ log_level | default('warning') }}"
+
+loader.env.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+loader.env.LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu"
+
+fs.mounts = [
+  # Repo root (parent dir of this `gramine/` folder).
+  { uri = "file:..", path = "/repo" },
+
+  # System directories (keep it simple for direct mode).
+  { uri = "file:/usr",  path = "/usr" },
+  { uri = "file:/etc",  path = "/etc" },
+  { uri = "file:/tmp",  path = "/tmp" },
+  { uri = "file:/dev",  path = "/dev" },
+  { uri = "file:/home", path = "/home" },
+
+{% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
+  # Use Gramine runtime glibc (closer to SGX mode).
+  { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc", path = "/lib" },
+  { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc", path = "/lib64" },
+{% else %}
+  # Use guest system libc (often faster for direct mode).
+  { uri = "file:/lib",   path = "/lib" },
+  { uri = "file:/lib64", path = "/lib64" },
+{% endif %}
+]
+
+# SGX settings are ignored in direct mode; keep them minimal to avoid huge manifests.
+sgx.enclave_size = "{{ sgx_size | default('1024M') }}"
+sgx.max_threads = {{ sgx_threads | default(64) }}
+sgx.debug = true
+
+sgx.trusted_files = [
+  "file:/usr/bin/redis-server",
+  "file:redis.conf",
+  "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so",
+]
+
+sgx.allowed_files = [
+  "file:/usr/",
+  "file:/etc/",
+  "file:/tmp/",
+  "file:/dev/",
+  "file:/home/",
+  "file:/lib/",
+  "file:/lib64/",
+  "file:..",
+]

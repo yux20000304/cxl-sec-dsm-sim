@@ -9,11 +9,11 @@ set -euo pipefail
 # Requirements on host: qemu-system-x86, qemu-utils, cloud-localds, numactl (optional)
 #
 # Usage:
-#   BASE_IMG=/path/to/jammy-server-cloudimg-amd64.img \
+#   BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img \
 #   bash scripts/host_quickstart.sh
 #
 # Tunables (env):
-#   BASE_IMG      : path to Ubuntu cloud image (required)
+#   BASE_IMG      : path to Ubuntu cloud image (optional if auto-detected)
 #   OUTDIR        : where to place qcow2/seed images (default: infra/images)
 #   CXL_PATH      : shared backing file (default: /tmp/cxl_shared.raw)
 #   CXL_SIZE      : size of shared file (default: 4G)
@@ -23,12 +23,17 @@ set -euo pipefail
 #   VM1_CPUS/VM2_CPUS (default: 4)
 #   HOSTSHARE     : path to share into guest via 9p (default: repo root)
 #   VM1_CPU_NODE/VM2_CPU_NODE/CXL_MEM_NODE : optional numactl binding
+#   FORCE_RECREATE: 1 to recreate qcow2 + seed images (default: 0)
+#   STOP_EXISTING : 1 to stop existing VMs automatically when recreating (default: 0)
+#   CLOUD_INIT_SSH_KEY_FILE: path to an SSH public key to inject into cloud-init
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INFRA="${ROOT}/infra"
 
-# BASE_IMG="${BASE_IMG:-}"
-BASE_IMG="/home/yyang460/projects/mirror/jammy-server-cloudimg-amd64.img"
+FORCE_RECREATE="${FORCE_RECREATE:-0}"
+STOP_EXISTING="${STOP_EXISTING:-0}"
+CLOUD_INIT_SSH_KEY_FILE="${CLOUD_INIT_SSH_KEY_FILE:-}"
+BASE_IMG="${BASE_IMG:-}"
 OUTDIR="${OUTDIR:-${INFRA}/images}"
 CXL_PATH="${CXL_PATH:-/tmp/cxl_shared.raw}"
 CXL_SIZE="${CXL_SIZE:-4G}"
@@ -40,8 +45,20 @@ VM1_CPUS="${VM1_CPUS:-4}"
 VM2_CPUS="${VM2_CPUS:-4}"
 HOSTSHARE="${HOSTSHARE:-${ROOT}}"
 
+MIRROR_DIR="${MIRROR_DIR:-$(realpath "${ROOT}/../mirror" 2>/dev/null || echo "")}"
+DEFAULT_NOBLE_IMG="${MIRROR_DIR}/ubuntu-24.04-server-cloudimg-amd64.img"
+DEFAULT_JAMMY_IMG="${MIRROR_DIR}/jammy-server-cloudimg-amd64.img"
+
 if [[ -z "${BASE_IMG}" ]]; then
-  echo "[!] Please set BASE_IMG to Ubuntu cloud image path (e.g. jammy-server-cloudimg-amd64.img)" >&2
+  if [[ -f "${DEFAULT_NOBLE_IMG}" ]]; then
+    BASE_IMG="${DEFAULT_NOBLE_IMG}"
+  elif [[ -f "${DEFAULT_JAMMY_IMG}" ]]; then
+    BASE_IMG="${DEFAULT_JAMMY_IMG}"
+  fi
+fi
+
+if [[ -z "${BASE_IMG}" ]]; then
+  echo "[!] Please set BASE_IMG to Ubuntu cloud image path (e.g. ubuntu-24.04-server-cloudimg-amd64.img)" >&2
   exit 1
 fi
 if [[ ! -f "${BASE_IMG}" ]]; then
@@ -59,16 +76,125 @@ else
 fi
 
 echo "[2/3] VM disks + cloud-init seeds..."
+stamp="${OUTDIR}/.base_img_path"
+old_base=""
+if [[ -f "${stamp}" ]]; then
+  old_base="$(cat "${stamp}" || true)"
+fi
+echo "    base image: ${BASE_IMG}"
+
+vm_running=0
+for name in vm1 vm2; do
+  pidfile="/tmp/${name}.pid"
+  if [[ -f "${pidfile}" ]]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      vm_running=1
+    fi
+  fi
+done
+
+need_recreate_disks=0
+need_recreate_seeds=0
+
+if [[ "${FORCE_RECREATE}" == "1" ]]; then
+  need_recreate_disks=1
+  need_recreate_seeds=1
+elif [[ -n "${old_base}" && "${old_base}" != "${BASE_IMG}" ]]; then
+  need_recreate_disks=1
+else
+  # If the stamp is missing (or empty), try to infer the backing file from qcow2.
+  # This also works when the image is currently in use (qemu-img -U).
+  if [[ -z "${old_base}" && -f "${OUTDIR}/vm1.qcow2" && -f "${OUTDIR}/vm2.qcow2" ]] && command -v qemu-img >/dev/null 2>&1; then
+    backing1="$(qemu-img info -U "${OUTDIR}/vm1.qcow2" 2>/dev/null | sed -n 's/^backing file: //p' | head -n 1 || true)"
+    backing2="$(qemu-img info -U "${OUTDIR}/vm2.qcow2" 2>/dev/null | sed -n 's/^backing file: //p' | head -n 1 || true)"
+    if [[ -n "${backing1}" && "${backing1}" != "${BASE_IMG}" ]]; then
+      need_recreate_disks=1
+    fi
+    if [[ -n "${backing2}" && "${backing2}" != "${BASE_IMG}" ]]; then
+      need_recreate_disks=1
+    fi
+  fi
+fi
+
+if [[ "${need_recreate_disks}" == "1" || "${need_recreate_seeds}" == "1" ]]; then
+  if [[ "${vm_running}" == "1" ]]; then
+    if [[ "${STOP_EXISTING}" != "1" ]]; then
+      echo "[!] VMs appear to be running; stop them before recreating images." >&2
+      echo "    Hint: sudo kill -9 \$(cat /tmp/vm1.pid) \$(cat /tmp/vm2.pid)  # then rerun" >&2
+      echo "    Or:  sudo env STOP_EXISTING=1 FORCE_RECREATE=1 bash scripts/host_quickstart.sh" >&2
+      exit 1
+    fi
+
+    echo "[*] STOP_EXISTING=1: stopping running VMs (vm1/vm2)"
+    for name in vm1 vm2; do
+      pidfile="/tmp/${name}.pid"
+      if [[ -f "${pidfile}" && ! -r "${pidfile}" ]]; then
+        echo "[!] Cannot read ${pidfile}; please run this script with sudo." >&2
+        exit 1
+      fi
+    done
+
+    for name in vm1 vm2; do
+      pidfile="/tmp/${name}.pid"
+      pid="$(cat "${pidfile}" 2>/dev/null || true)"
+      if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+        echo "    SIGTERM ${name} pid=${pid}"
+        kill "${pid}" 2>/dev/null || true
+      fi
+    done
+
+    for _ in $(seq 1 20); do
+      still=0
+      for name in vm1 vm2; do
+        pidfile="/tmp/${name}.pid"
+        pid="$(cat "${pidfile}" 2>/dev/null || true)"
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+          still=1
+        fi
+      done
+      [[ "${still}" == "0" ]] && break
+      sleep 1
+    done
+
+    for name in vm1 vm2; do
+      pidfile="/tmp/${name}.pid"
+      pid="$(cat "${pidfile}" 2>/dev/null || true)"
+      if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+        echo "    SIGKILL ${name} pid=${pid}"
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+    done
+
+    rm -f /tmp/vm1.pid /tmp/vm2.pid /tmp/vm1.monitor /tmp/vm2.monitor || true
+  fi
+  if [[ "${FORCE_RECREATE}" == "1" ]]; then
+    echo "    FORCE_RECREATE=1: removing existing qcow2 + seed images"
+  else
+    echo "    base image changed/unknown; recreating qcow2 disks"
+  fi
+  rm -f "${OUTDIR}/vm1.qcow2" "${OUTDIR}/vm2.qcow2"
+  if [[ "${need_recreate_seeds}" == "1" ]]; then
+    rm -f "${OUTDIR}/seed-vm1.img" "${OUTDIR}/seed-vm2.img"
+  fi
+fi
+
 if [[ ! -f "${OUTDIR}/vm1.qcow2" || ! -f "${OUTDIR}/vm2.qcow2" ]]; then
   bash "${INFRA}/create_vm_images.sh" --base "${BASE_IMG}" --outdir "${OUTDIR}" --vm1 vm1.qcow2 --vm2 vm2.qcow2
 else
   echo "    reuse ${OUTDIR}/vm1.qcow2, vm2.qcow2"
 fi
 if [[ ! -f "${OUTDIR}/seed-vm1.img" || ! -f "${OUTDIR}/seed-vm2.img" ]]; then
-  bash "${INFRA}/create_cloud_init.sh" --outdir "${OUTDIR}"
+  args=(--outdir "${OUTDIR}")
+  if [[ -n "${CLOUD_INIT_SSH_KEY_FILE}" ]]; then
+    args+=(--ssh-key "${CLOUD_INIT_SSH_KEY_FILE}")
+  fi
+  bash "${INFRA}/create_cloud_init.sh" "${args[@]}"
 else
   echo "    reuse ${OUTDIR}/seed-vm1.img, seed-vm2.img"
 fi
+
+echo "${BASE_IMG}" > "${stamp}"
 
 echo "[3/3] Launching VMs..."
 bash "${INFRA}/run_vms.sh" \

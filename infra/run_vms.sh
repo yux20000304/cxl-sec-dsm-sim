@@ -22,6 +22,11 @@ Optional:
   --vm1-cpus 4 --vm2-cpus 4
   --hostshare <path-to-share-into-guests>
 Environment:
+  VMNET_ENABLE=1 (default) enables a VM-to-VM internal NIC via QEMU socket netdev.
+  VMNET_HOST=127.0.0.1 (default) host address for the point-to-point netdev socket.
+  VMNET_PORT=0 (default) auto-picks a free TCP port on VMNET_HOST.
+  VMNET_VM1_MAC / VMNET_VM2_MAC set internal NIC MACs (used by cloud-init netplan).
+Environment:
   VM1_CPU_NODE (bind qemu vCPUs to host NUMA node)
   VM2_CPU_NODE
   CXL_MEM_NODE (bind shared memory allocation to host NUMA node)
@@ -88,6 +93,45 @@ if ! command -v "${QEMU_BIN}" >/dev/null 2>&1; then
   exit 1
 fi
 
+VMNET_ENABLE="${VMNET_ENABLE:-1}"
+VMNET_HOST="${VMNET_HOST:-127.0.0.1}"
+VMNET_PORT="${VMNET_PORT:-0}"
+VMNET_VM1_MAC="${VMNET_VM1_MAC:-52:54:00:12:34:01}"
+VMNET_VM2_MAC="${VMNET_VM2_MAC:-52:54:00:12:34:02}"
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn "sport = :${port}" 2>/dev/null | grep -q .
+    return $?
+  fi
+  return 1
+}
+
+pick_free_port() {
+  local port=""
+  for _ in $(seq 1 200); do
+    port=$(( 40000 + (RANDOM % 20000) ))
+    if ! port_in_use "${port}"; then
+      echo "${port}"
+      return 0
+    fi
+  done
+  echo "[!] Failed to pick a free VMNET_PORT" >&2
+  return 1
+}
+
+if [[ "${VMNET_ENABLE}" == "1" ]]; then
+  if [[ "${VMNET_PORT}" == "0" ]]; then
+    VMNET_PORT="$(pick_free_port)"
+  elif port_in_use "${VMNET_PORT}"; then
+    echo "[!] VMNET_PORT already in use on host: ${VMNET_HOST}:${VMNET_PORT}" >&2
+    echo "    Hint: set VMNET_PORT=0 to auto-pick a free port." >&2
+    exit 1
+  fi
+  VMNET_ADDR="${VMNET_HOST}:${VMNET_PORT}"
+fi
+
 enable_kvm=()
 if [[ -e /dev/kvm ]]; then
   enable_kvm=( -enable-kvm -cpu host )
@@ -125,6 +169,29 @@ run_vm() {
     cxl_opts+=",host-nodes=${CXL_MEM_NODE},policy=bind"
   fi
 
+  local vmnet_opts=()
+  if [[ "${VMNET_ENABLE}" == "1" ]]; then
+    if [[ "${name}" == "vm1" ]]; then
+      vmnet_opts=(
+        -netdev socket,id=net1,listen="${VMNET_ADDR}"
+        -device virtio-net-pci,netdev=net1,mac="${VMNET_VM1_MAC}"
+      )
+    else
+      for _ in $(seq 1 50); do
+        if command -v ss >/dev/null 2>&1; then
+          ss -H -ltn "sport = :${VMNET_PORT}" 2>/dev/null | grep -q . && break
+        else
+          break
+        fi
+        sleep 0.1
+      done
+      vmnet_opts=(
+        -netdev socket,id=net1,connect="${VMNET_ADDR}"
+        -device virtio-net-pci,netdev=net1,mac="${VMNET_VM2_MAC}"
+      )
+    fi
+  fi
+
   local cmd=(
     ${QEMU_BIN}
     -name "${name}"
@@ -140,6 +207,7 @@ run_vm() {
     -drive if=virtio,file="${seed}",format=raw
     -netdev user,id=net0,hostfwd=tcp::${ssh_port}-:22
     -device virtio-net-pci,netdev=net0
+    "${vmnet_opts[@]}"
     -virtfs local,path="${HOSTSHARE}",mount_tag=hostshare,security_model=none,id=hostshare
     -daemonize
     -monitor unix:"${monitor}",server,nowait
