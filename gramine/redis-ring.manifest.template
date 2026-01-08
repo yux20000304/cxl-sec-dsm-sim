@@ -42,7 +42,8 @@ fs.mounts = [
 
   # A convenient, purely-software shared-memory backing for SGX host runs.
   # If `CXL_RING_PATH` points to `/dev/shm/<file>`, it will be covered by this.
-  { uri = "file:/dev/shm", path = "/dev/shm", type = "untrusted_shm" },
+  # Note: `untrusted_shm` mounts must use `dev:` URIs (see Gramine manifest docs).
+  { uri = "dev:/dev/shm", path = "/dev/shm", type = "untrusted_shm" },
 
   # The BAR2 resource file must be mounted as `untrusted_shm` so that mmap() with
   # MAP_SHARED works under Gramine (otherwise Gramine may reject MAP_SHARED).
@@ -53,7 +54,7 @@ fs.mounts = [
   # Covered by the `/dev/shm` untrusted_shm mount above.
 {% else %}
   # For any other file-backed ring, mount the file itself as untrusted_shm.
-  { uri = "file:{{ ring_path }}", path = "{{ ring_path }}", type = "untrusted_shm" },
+  { uri = "dev:{{ ring_path }}", path = "{{ ring_path }}", type = "untrusted_shm" },
 {% endif %}
 
 {% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
@@ -100,5 +101,6 @@ sgx.allowed_files = [
   "file:/lib/",
   "file:/lib64/",
   "file:..",
-  "file:{{ ring_path }}",
+  "dev:/dev/shm/",
+  "dev:{{ ring_path }}",
 ]
