@@ -21,6 +21,7 @@ set -euo pipefail
 #   RING_MAP_SIZE: bytes (default: 134217728 = 128MB)
 #   RING_COUNT   : number of rings (default: 4)
 #   MAX_INFLIGHT : ring client inflight limit (default: 512)
+#   SGX_TOKEN_MODE: auto|require|skip (default: auto). "auto" tries to fetch a launch token if tooling exists.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
@@ -42,12 +43,29 @@ RING_PATH="${RING_PATH:-/dev/shm/cxl_shared.raw}"
 RING_MAP_SIZE="${RING_MAP_SIZE:-134217728}" # 128MB
 RING_COUNT="${RING_COUNT:-4}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
+SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
 
 need_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "[!] Missing command: $1" >&2
-    return 1
+  local cmd="$1"
+  if command -v "${cmd}" >/dev/null 2>&1; then
+    return 0
   fi
+  echo "[!] Missing command: ${cmd}" >&2
+  case "${cmd}" in
+    redis-cli|redis-benchmark)
+      echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y redis-tools" >&2
+      ;;
+    tmux)
+      echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y tmux" >&2
+      ;;
+    ss)
+      echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y iproute2" >&2
+      ;;
+    gramine-manifest|gramine-sgx|gramine-sgx-sign|gramine-sgx-get-token)
+      echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y gramine" >&2
+      ;;
+  esac
+  return 1
 }
 
 check_sgx_host() {
@@ -85,7 +103,9 @@ check_prereqs() {
   need_cmd gramine-manifest
   need_cmd gramine-sgx
   need_cmd gramine-sgx-sign
-  need_cmd gramine-sgx-get-token
+  if [[ "${SGX_TOKEN_MODE}" == "require" ]]; then
+    need_cmd gramine-sgx-get-token
+  fi
 }
 
 cleanup_tmux() {
@@ -130,7 +150,28 @@ echo "[*] Building Gramine manifests + SGX artifacts ..."
   make ring USE_RUNTIME_GLIBC=1 CXL_RING_PATH="${RING_PATH}" CXL_RING_COUNT="${RING_COUNT}" CXL_RING_MAP_SIZE="${RING_MAP_SIZE}"
 
   make sgx-sign
-  make sgx-token
+
+  if [[ "${SGX_TOKEN_MODE}" != "skip" ]]; then
+    if command -v gramine-sgx-get-token >/dev/null 2>&1; then
+      set +e
+      make sgx-token
+      rc=$?
+      set -e
+      if [[ "${rc}" -ne 0 ]]; then
+        if [[ "${SGX_TOKEN_MODE}" == "require" ]]; then
+          echo "[!] Failed to fetch SGX launch token (make sgx-token)." >&2
+          exit 1
+        fi
+        echo "[!] Failed to fetch SGX launch token; continuing (SGX_TOKEN_MODE=${SGX_TOKEN_MODE})." >&2
+      fi
+    else
+      if [[ "${SGX_TOKEN_MODE}" == "require" ]]; then
+        echo "[!] Missing command: gramine-sgx-get-token (required by SGX_TOKEN_MODE=require)." >&2
+        exit 1
+      fi
+      echo "[!] Missing command: gramine-sgx-get-token; skipping token fetch (SGX_TOKEN_MODE=${SGX_TOKEN_MODE})." >&2
+    fi
+  fi
 )
 
 ts="$(date +%Y%m%d_%H%M%S)"
@@ -196,4 +237,3 @@ echo "    ${native_log}"
 echo "    ${ring_log}"
 echo "    ${ring_csv}"
 echo "    ${compare_csv}"
-
