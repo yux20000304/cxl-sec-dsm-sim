@@ -26,6 +26,11 @@ Environment:
   VMNET_HOST=127.0.0.1 (default) host address for the point-to-point netdev socket.
   VMNET_PORT=0 (default) auto-picks a free TCP port on VMNET_HOST.
   VMNET_VM1_MAC / VMNET_VM2_MAC set internal NIC MACs (used by cloud-init netplan).
+Environment (optional SGX-in-guest):
+  VM_SGX_ENABLE=1 enables SGX virtualization in guests (requires KVM + QEMU SGX support).
+  VM1_SGX_ENABLE / VM2_SGX_ENABLE override per-VM (default: VM_SGX_ENABLE).
+  SGX_EPC_SIZE=256M EPC section size per enabled VM.
+  VM1_SGX_EPC_SIZE / VM2_SGX_EPC_SIZE override per-VM EPC size.
 Environment:
   VM1_CPU_NODE (bind qemu vCPUs to host NUMA node)
   VM2_CPU_NODE
@@ -138,7 +143,45 @@ if grep -q -m1 -w aes /proc/cpuinfo 2>/dev/null; then
   host_has_aes=1
 fi
 
-if [[ -c /dev/kvm && "${host_has_aes}" == "1" ]]; then
+VM_SGX_ENABLE="${VM_SGX_ENABLE:-0}"
+VM1_SGX_ENABLE="${VM1_SGX_ENABLE:-${VM_SGX_ENABLE}}"
+VM2_SGX_ENABLE="${VM2_SGX_ENABLE:-${VM_SGX_ENABLE}}"
+SGX_EPC_SIZE="${SGX_EPC_SIZE:-256M}"
+VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-${SGX_EPC_SIZE}}"
+VM2_SGX_EPC_SIZE="${VM2_SGX_EPC_SIZE:-${SGX_EPC_SIZE}}"
+
+host_has_sgx=0
+if grep -q -m1 -w sgx /proc/cpuinfo 2>/dev/null; then
+  host_has_sgx=1
+fi
+
+qemu_has_sgx_epc=0
+if "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'memory-backend-epc'; then
+  qemu_has_sgx_epc=1
+fi
+
+if [[ "${VM1_SGX_ENABLE}" == "1" || "${VM2_SGX_ENABLE}" == "1" ]]; then
+  if [[ ! -c /dev/kvm ]]; then
+    echo "[!] VM_SGX_ENABLE=1 requires /dev/kvm (KVM acceleration). Nested virt must be enabled on the host." >&2
+    exit 1
+  fi
+  if [[ "${host_has_aes}" != "1" ]]; then
+    echo "[!] VM_SGX_ENABLE=1 requires host AES-NI ('aes' flag) because Gramine requires it." >&2
+    exit 1
+  fi
+  if [[ "${host_has_sgx}" != "1" ]]; then
+    echo "[!] VM_SGX_ENABLE=1 requires host SGX ('sgx' flag). Check BIOS SGX setting." >&2
+    exit 1
+  fi
+  if [[ "${qemu_has_sgx_epc}" != "1" ]]; then
+    echo "[!] QEMU does not support SGX EPC objects (missing 'memory-backend-epc')." >&2
+    echo "    You need a QEMU build with SGX virtualization enabled to run gramine-sgx inside guests." >&2
+    echo "    Check: ${QEMU_BIN} -object help | grep memory-backend-epc" >&2
+    exit 1
+  fi
+
+  enable_kvm=( -enable-kvm -cpu host )
+elif [[ -c /dev/kvm && "${host_has_aes}" == "1" ]]; then
   enable_kvm=( -enable-kvm -cpu host )
 else
   # No usable KVM path (either missing /dev/kvm, or host CPU doesn't expose AES).
@@ -173,6 +216,8 @@ bind_cmd() {
 
 run_vm() {
   local name="$1"; shift
+  local sgx_enable="$1"; shift
+  local sgx_epc_size="$1"; shift
   local ssh_port="$1"; shift
   local disk="$1"; shift
   local seed="$1"; shift
@@ -184,6 +229,17 @@ run_vm() {
   local monitor="/tmp/${name}.monitor"
   local pidfile="/tmp/${name}.pid"
   local log="/tmp/${name}.log"
+
+  local machine="q35"
+  local sgx_opts=()
+  if [[ "${sgx_enable}" == "1" ]]; then
+    # Provide a virtual EPC section to the guest. This requires host SGX + KVM SGX virtualization.
+    # QEMU syntax reference: /usr/share/doc/qemu-system-common/system/i386/sgx.html
+    sgx_opts=(
+      -object "memory-backend-epc,id=epc-${name},size=${sgx_epc_size},prealloc=on"
+    )
+    machine="q35,sgx-epc.0.memdev=epc-${name},sgx-epc.0.node=0"
+  fi
 
   local cxl_opts="-object memory-backend-file,id=cxlmem-${name},share=on,mem-path=${CXL_PATH},size=${CXL_SIZE}"
   if [[ -n "${CXL_MEM_NODE}" ]]; then
@@ -216,8 +272,9 @@ run_vm() {
   local cmd=(
     ${QEMU_BIN}
     -name "${name}"
-    -machine q35
+    -machine "${machine}"
     "${enable_kvm[@]}"
+    "${sgx_opts[@]}"
     -display none
     -smp "${cpus}"
     -m "${mem}"
@@ -242,8 +299,8 @@ run_vm() {
   eval "${full_cmd}"
 }
 
-run_vm "vm1" "${VM1_SSH_PORT}" "${VM1_DISK}" "${VM1_SEED}" "${VM1_MEM}" "${VM1_CPUS}" "${CXL_MEM_NODE}" "${VM1_CPU_NODE}"
-run_vm "vm2" "${VM2_SSH_PORT}" "${VM2_DISK}" "${VM2_SEED}" "${VM2_MEM}" "${VM2_CPUS}" "${CXL_MEM_NODE}" "${VM2_CPU_NODE}"
+run_vm "vm1" "${VM1_SGX_ENABLE}" "${VM1_SGX_EPC_SIZE}" "${VM1_SSH_PORT}" "${VM1_DISK}" "${VM1_SEED}" "${VM1_MEM}" "${VM1_CPUS}" "${CXL_MEM_NODE}" "${VM1_CPU_NODE}"
+run_vm "vm2" "${VM2_SGX_ENABLE}" "${VM2_SGX_EPC_SIZE}" "${VM2_SSH_PORT}" "${VM2_DISK}" "${VM2_SEED}" "${VM2_MEM}" "${VM2_CPUS}" "${CXL_MEM_NODE}" "${VM2_CPU_NODE}"
 
 echo "[+] VMs started."
 echo "    VM1 ssh: ssh ubuntu@127.0.0.1 -p ${VM1_SSH_PORT}"

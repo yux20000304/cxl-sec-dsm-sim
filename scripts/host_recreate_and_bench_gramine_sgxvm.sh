@@ -1,35 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Recreate VM1/VM2 from a fresh Ubuntu cloud image (prefer 24.04 "noble"),
-# then run two Gramine benchmarks:
-# 1) Native Redis under Gramine over TCP (direct VM-to-VM via internal NIC).
-# 2) Ring-enabled Redis under Gramine over BAR2 (shared ivshmem).
+# Recreate VM1/VM2 from a fresh Ubuntu cloud image, enable SGX virtualization in VM1,
+# then run two benchmarks with Redis running under Gramine SGX *inside the guest*:
+# 1) Native Redis (TCP/RESP) under gramine-sgx (VM2 -> VM1 over internal NIC).
+# 2) Ring-enabled Redis under gramine-sgx (VM2 -> VM1 over shared ivshmem BAR2).
 #
-# This script is intended to be run on the host with sudo because QEMU/KVM is
-# started as root in this repo's default setup.
+# Requirements on host:
+# - SGX-capable hardware with SGX enabled in BIOS.
+# - KVM acceleration available (/dev/kvm) and nested virtualization enabled if needed.
+# - QEMU built with SGX virtualization support (must accept `-object memory-backend-epc,...`).
 #
 # Usage:
-#   sudo bash scripts/host_recreate_and_bench_gramine.sh
+#   sudo -E bash scripts/host_recreate_and_bench_gramine_sgxvm.sh
 #
 # Tunables (env):
-#   BASE_IMG     : path to ubuntu-24.04-server-cloudimg-amd64.img (preferred)
-#   VM1_SSH/VM2_SSH: ssh forwarded ports (default: 2222/2223)
-#   REQ_N        : total requests for TCP benchmark (default: 200000)
-#   CLIENTS      : redis-benchmark concurrency (default: 4)
-#   THREADS      : thread count for both benches (default: 4)
-#   PIPELINE     : redis-benchmark pipeline depth (-P) (default: 256)
-#   VMNET_VM1_IP : VM1 internal IP on cxl0 (default: 192.168.100.1)
-#   RING_MAP_SIZE: bytes to mmap for BAR2 (default: 134217728 = 128MB)
-#   RING_PATH    : BAR2 resource file (default: /sys/bus/pci/devices/0000:00:02.0/resource2)
-#   MAX_INFLIGHT : ring client inflight limit (default: 512)
+#   BASE_IMG       : ubuntu cloud image path (24.04 preferred)
+#   VM1_SSH/VM2_SSH: forwarded SSH ports (default: 2222/2223)
+#   REQ_N          : total requests for TCP benchmark (default: 200000)
+#   CLIENTS        : redis-benchmark concurrency (default: 4)
+#   THREADS        : thread count for both benches (default: 4)
+#   PIPELINE       : redis-benchmark pipeline depth (-P) (default: 256)
+#   VMNET_VM1_IP   : VM1 internal IP on cxl0 (default: 192.168.100.1)
+#   RING_MAP_SIZE  : BAR2 mmap size (default: 134217728 = 128MB)
+#   RING_PATH      : BAR2 sysfs resource file (default: /sys/bus/pci/devices/0000:00:02.0/resource2)
+#   MAX_INFLIGHT   : ring client inflight limit (default: 512)
+#
+# SGX-in-guest knobs:
+#   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: 256M)
+#   SGX_TOKEN_MODE  : auto|require|skip (default: auto). "auto" tries to fetch token but continues if it fails.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
 mkdir -p "${RESULTS_DIR}"
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "[*] Re-exec with sudo..."
   exec sudo -E bash "$0" "$@"
 fi
 
@@ -45,6 +50,9 @@ VMNET_VM1_IP="${VMNET_VM1_IP:-192.168.100.1}"
 RING_MAP_SIZE="${RING_MAP_SIZE:-134217728}" # 128MB
 RING_PATH="${RING_PATH:-/sys/bus/pci/devices/0000:00:02.0/resource2}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
+
+VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-256M}"
+SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
 
 MIRROR_DIR="${MIRROR_DIR:-$(realpath "${ROOT}/../mirror" 2>/dev/null || echo "")}"
 DEFAULT_NOBLE_IMG="${MIRROR_DIR}/ubuntu-24.04-server-cloudimg-amd64.img"
@@ -63,7 +71,7 @@ if [[ -z "${BASE_IMG}" || ! -f "${BASE_IMG}" ]]; then
   exit 1
 fi
 
-tmpdir="$(mktemp -d /tmp/cxl-sec-dsm-sim-gramine.XXXXXX)"
+tmpdir="$(mktemp -d /tmp/cxl-sec-dsm-sim-sgxvm.XXXXXX)"
 cleanup() { rm -rf "${tmpdir}"; }
 trap cleanup EXIT
 
@@ -80,7 +88,21 @@ ssh_opts=(
 
 ssh_vm1() { ssh "${ssh_opts[@]}" -p "${VM1_SSH}" ubuntu@127.0.0.1 "$@"; }
 ssh_vm2() { ssh "${ssh_opts[@]}" -p "${VM2_SSH}" ubuntu@127.0.0.1 "$@"; }
-ssh_vm1_tty() { ssh -tt "${ssh_opts[@]}" -p "${VM1_SSH}" ubuntu@127.0.0.1 "$@"; }
+
+wait_ssh() {
+  local name="$1"
+  local port="$2"
+  echo "[*] Waiting for ${name} SSH on 127.0.0.1:${port} ..."
+  for _ in $(seq 1 300); do
+    if ssh "${ssh_opts[@]}" -p "${port}" ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
+      echo "    ${name} SSH ready."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[!] Timeout waiting for ${name} SSH." >&2
+  return 1
+}
 
 ssh_retry_lock() {
   local ssh_func="$1"
@@ -115,24 +137,10 @@ ssh_retry_lock() {
   return 1
 }
 
-wait_ssh() {
-  local name="$1"
-  local port="$2"
-  echo "[*] Waiting for ${name} SSH on 127.0.0.1:${port} ..."
-  for _ in $(seq 1 300); do
-    if ssh "${ssh_opts[@]}" -p "${port}" ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
-      echo "    ${name} SSH ready."
-      return 0
-    fi
-    sleep 1
-  done
-  echo "[!] Timeout waiting for ${name} SSH." >&2
-  return 1
-}
-
 echo "[*] Recreating VMs from base image: ${BASE_IMG}"
 STOP_EXISTING=1 FORCE_RECREATE=1 BASE_IMG="${BASE_IMG}" \
 VM1_SSH="${VM1_SSH}" VM2_SSH="${VM2_SSH}" \
+VM_SGX_ENABLE=1 VM1_SGX_ENABLE=1 VM2_SGX_ENABLE=0 VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE}" \
 CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \
 bash "${ROOT}/scripts/host_quickstart.sh"
 
@@ -145,9 +153,7 @@ ssh_vm2 "lsb_release -sd || true"
 
 echo "[*] Waiting for cloud-init to finish (avoids apt/dpkg locks) ..."
 ssh_vm1 "sudo timeout 300 cloud-init status --wait >/dev/null 2>&1 || true"
-echo "    vm1 cloud-init: done."
 ssh_vm2 "sudo timeout 300 cloud-init status --wait >/dev/null 2>&1 || true"
-echo "    vm2 cloud-init: done."
 
 mount_hostshare='
 sudo mkdir -p /mnt/hostshare
@@ -158,6 +164,11 @@ fi
 ssh_vm1 "${mount_hostshare}"
 ssh_vm2 "${mount_hostshare}"
 
+echo "[*] Checking SGX availability in vm1 ..."
+ssh_vm1 "grep -m1 -w sgx /proc/cpuinfo >/dev/null 2>&1 || (echo '[!] vm1: SGX flag missing in /proc/cpuinfo' >&2; exit 1)"
+ssh_vm1 "sudo modprobe intel_sgx >/dev/null 2>&1 || true"
+ssh_vm1 "ls -l /dev/sgx_enclave /dev/sgx/enclave /dev/isgx 2>/dev/null | head -n 5 || (echo '[!] vm1: no SGX device node found' >&2; exit 1)"
+
 echo "[*] Installing dependencies in guests ..."
 ssh_retry_lock ssh_vm1 "vm1 apt-get update" "sudo env DEBIAN_FRONTEND=noninteractive apt-get update"
 ssh_retry_lock ssh_vm1 "vm1 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config ca-certificates curl lsb-release redis-server redis-tools net-tools tmux"
@@ -165,7 +176,7 @@ ssh_retry_lock ssh_vm1 "vm1 apt-get install deps" "sudo env DEBIAN_FRONTEND=noni
 ssh_retry_lock ssh_vm2 "vm2 apt-get update" "sudo env DEBIAN_FRONTEND=noninteractive apt-get update"
 ssh_retry_lock ssh_vm2 "vm2 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl lsb-release redis-tools net-tools"
 
-echo "[*] Installing Gramine in vm1 (direct mode; no SGX hardware required) ..."
+echo "[*] Installing Gramine in vm1 (SGX) ..."
 ssh_vm1 '
 set -e
 sudo mkdir -p /etc/apt/keyrings
@@ -179,62 +190,67 @@ ssh_retry_lock ssh_vm1 "vm1 apt-get install gramine" "sudo env DEBIAN_FRONTEND=n
 echo "[*] Building Redis (ring version) and Gramine manifests in vm1 ..."
 ssh_vm1 "sudo systemctl disable --now redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "cd /mnt/hostshare/redis/src && sudo make -j2 MALLOC=libc USE_LTO=no CFLAGS='-O2 -fno-lto' LDFLAGS='-fno-lto'"
-# NOTE: `/mnt/hostshare` is a 9p mount that exposes host UID/GID numbers.
-# Running as `ubuntu` (uid=1000) may not be able to write there, so use sudo.
-ssh_vm1 "cd /mnt/hostshare/gramine && sudo make clean && sudo make links native ring"
+ssh_vm1 "cd /mnt/hostshare/gramine && sudo make clean && sudo make links native ring USE_RUNTIME_GLIBC=1"
+ssh_vm1 "cd /mnt/hostshare/gramine && sudo make sgx-sign"
+
+set +e
+token_out="$(ssh_vm1 "cd /mnt/hostshare/gramine && sudo make sgx-token" 2>&1)"
+token_rc=$?
+set -e
+if [[ "${token_rc}" -ne 0 ]]; then
+  msg="[!] Failed to fetch SGX launch token in vm1 (sgx-token)."
+  if [[ "${SGX_TOKEN_MODE}" == "require" ]]; then
+    echo "${msg}" >&2
+    printf '%s\n' "${token_out}" >&2
+    echo "    Install/enable AESM in vm1 or provide a token via your SGX stack, then rerun." >&2
+    exit 1
+  fi
+  if [[ "${SGX_TOKEN_MODE}" != "skip" ]]; then
+    echo "${msg} Continuing (SGX_TOKEN_MODE=${SGX_TOKEN_MODE})." >&2
+    printf '%s\n' "${token_out}" >&2
+  fi
+fi
 
 echo "[*] Building ring client in vm2 (/tmp/cxl_ring_direct) ..."
 ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c"
 
 ts="$(date +%Y%m%d_%H%M%S)"
-native_log="${RESULTS_DIR}/gramine_native_tcp_${ts}.log"
-ring_log="${RESULTS_DIR}/gramine_ring_${ts}.log"
-ring_csv="${RESULTS_DIR}/gramine_ring_${ts}.csv"
-compare_csv="${RESULTS_DIR}/gramine_compare_${ts}.csv"
+native_log="${RESULTS_DIR}/sgxvm_native_tcp_${ts}.log"
+ring_log="${RESULTS_DIR}/sgxvm_ring_${ts}.log"
+ring_csv="${RESULTS_DIR}/sgxvm_ring_${ts}.csv"
+compare_csv="${RESULTS_DIR}/sgxvm_compare_${ts}.csv"
 
 echo "[*] Internal VM network (cxl0):"
 ssh_vm1 "ip -brief addr show cxl0 2>/dev/null || true"
 ssh_vm2 "ip -brief addr show cxl0 2>/dev/null || true"
 
-echo "[*] Benchmark 1/2: native Redis under Gramine (TCP via cxl0)"
+echo "[*] Benchmark 1/2: native Redis under Gramine SGX (TCP via cxl0)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
-ssh_vm1 "tmux kill-session -t redis_native_gramine >/dev/null 2>&1 || true"
-ssh_vm1 "tmux new-session -d -s redis_native_gramine \"cd /mnt/hostshare/gramine && gramine-direct ./redis-native /repo/gramine/redis.conf >/tmp/redis_native_gramine.log 2>&1\""
-if ! ssh_vm1 "for i in \$(seq 1 80); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
-  echo "[!] redis-server not ready (vm1). Dumping diagnostics..." >&2
-  ssh_vm1 "tail -n 200 /tmp/redis_native_gramine.log 2>/dev/null || true" >&2
-  ssh_vm1 "ss -lntp 2>/dev/null | grep -E ':6379\\b' || true" >&2
-  ssh_vm1 "pgrep -a redis-server 2>/dev/null || true" >&2
-  ssh_vm1 "tmux capture-pane -pt redis_native_gramine -S -200 2>/dev/null || true" >&2
-  exit 1
-fi
+ssh_vm1 "tmux kill-session -t redis_native_sgxvm >/dev/null 2>&1 || true"
+ssh_vm1 "tmux new-session -d -s redis_native_sgxvm \"cd /mnt/hostshare/gramine && sudo gramine-sgx ./redis-native /repo/gramine/redis.conf >/tmp/redis_native_sgxvm.log 2>&1\""
+ssh_vm1 "for i in \$(seq 1 200); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'redis-server not ready' >&2; tail -n 200 /tmp/redis_native_sgxvm.log >&2 || true; exit 1"
 
-# Wait until VM2 can reach VM1 over the internal NIC.
-ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
-
+ssh_vm2 "for i in \$(seq 1 200); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${native_log}"
 
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
-ssh_vm1 "tmux kill-session -t redis_native_gramine >/dev/null 2>&1 || true"
+ssh_vm1 "tmux kill-session -t redis_native_sgxvm >/dev/null 2>&1 || true"
 
-echo "[*] Benchmark 2/2: ring Redis under Gramine (BAR2 shared memory)"
-ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
+echo "[*] Benchmark 2/2: ring Redis under Gramine SGX (BAR2 shared memory)"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
-ssh_vm1 "tmux kill-session -t redis_ring_gramine >/dev/null 2>&1 || true"
-ssh_vm1 "tmux new-session -d -s redis_ring_gramine \"cd /mnt/hostshare/gramine && sudo gramine-direct ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_gramine.log 2>&1\""
+ssh_vm1 "tmux kill-session -t redis_ring_sgxvm >/dev/null 2>&1 || true"
+ssh_vm1 "tmux new-session -d -s redis_ring_sgxvm \"cd /mnt/hostshare/gramine && sudo gramine-sgx ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_sgxvm.log 2>&1\""
 
-# Wait until the ring is usable by doing a small shared-memory ping from VM2.
-ssh_vm2 "for i in \$(seq 1 120); do sudo timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'ring not ready' >&2; exit 1"
+ssh_vm2 "for i in \$(seq 1 200); do sudo timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'ring not ready' >&2; exit 1"
 
-ring_label="gramine_ring_${ts}"
+ring_label="sgxvm_ring_${ts}"
 ring_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
-
 ssh_vm2 "cd /tmp && sudo /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
 ssh_vm2 "cat /tmp/${ring_label}.csv" > "${ring_csv}"
-ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
-ssh_vm1 "tmux kill-session -t redis_ring_gramine >/dev/null 2>&1 || true"
+
+ssh_vm1 "tmux kill-session -t redis_ring_sgxvm >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 
 native_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
@@ -244,10 +260,10 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
 
 {
   echo "label,op,throughput_rps"
-  echo "GramineNativeTCP,SET,${native_set}"
-  echo "GramineNativeTCP,GET,${native_get}"
-  echo "GramineRing,SET,${ring_set}"
-  echo "GramineRing,GET,${ring_get}"
+  echo "GramineSGXVMNativeTCP,SET,${native_set}"
+  echo "GramineSGXVMNativeTCP,GET,${native_get}"
+  echo "GramineSGXVMRing,SET,${ring_set}"
+  echo "GramineSGXVMRing,GET,${ring_get}"
 } > "${compare_csv}"
 
 echo "[+] Done."

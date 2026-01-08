@@ -54,6 +54,18 @@ sgx.trusted_files = [
   "file:/usr/bin/redis-server",
   "file:redis.conf",
   "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so",
+
+  # In SGX mode, all executable code pages must come from trusted files.
+  # Include the dynamic loader + libc (either Gramine runtime glibc or the
+  # guest system libc, depending on `USE_RUNTIME_GLIBC`).
+{% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
+  "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc/",
+{% else %}
+  "file:/lib/",
+  "file:/lib64/",
+  "file:/lib/x86_64-linux-gnu/",
+  "file:/usr/lib/x86_64-linux-gnu/",
+{% endif %}
 ]
 
 sgx.allowed_files = [

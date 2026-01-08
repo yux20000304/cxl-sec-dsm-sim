@@ -24,7 +24,8 @@ loader.log_level = "{{ log_level | default('warning') }}"
 loader.env.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 loader.env.LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu"
 
-loader.env.CXL_RING_PATH = "{{ cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') }}"
+{% set ring_path = cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') %}
+loader.env.CXL_RING_PATH = "{{ ring_path }}"
 loader.env.CXL_RING_COUNT = "{{ cxl_ring_count | default('4') }}"
 loader.env.CXL_RING_MAP_SIZE = "{{ cxl_ring_map_size | default('134217728') }}"
 
@@ -38,14 +39,22 @@ fs.mounts = [
   { uri = "file:/tmp",  path = "/tmp" },
   { uri = "file:/dev",  path = "/dev" },
   { uri = "file:/home", path = "/home" },
+
+  # A convenient, purely-software shared-memory backing for SGX host runs.
+  # If `CXL_RING_PATH` points to `/dev/shm/<file>`, it will be covered by this.
+  { uri = "file:/dev/shm", path = "/dev/shm", type = "untrusted_shm" },
+
   # The BAR2 resource file must be mounted as `untrusted_shm` so that mmap() with
   # MAP_SHARED works under Gramine (otherwise Gramine may reject MAP_SHARED).
-  #
-  # NOTE: `untrusted_shm` currently requires `dev:` URIs (Gramine 1.9).
-  { uri = "dev:{{ cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') }}", path = "{{ cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') }}", type = "untrusted_shm" },
-  # NOTE: we intentionally do NOT mount the whole `/sys` tree; the BAR2 resource
-  # file above is sufficient for the ring transport and avoids extra sysfs
-  # surface area.
+{% if ring_path.startswith('/sys/') %}
+  # Sysfs BAR resources are exposed as "device-like" files.
+  { uri = "dev:{{ ring_path }}", path = "{{ ring_path }}", type = "untrusted_shm" },
+{% elif ring_path.startswith('/dev/shm/') %}
+  # Covered by the `/dev/shm` untrusted_shm mount above.
+{% else %}
+  # For any other file-backed ring, mount the file itself as untrusted_shm.
+  { uri = "file:{{ ring_path }}", path = "{{ ring_path }}", type = "untrusted_shm" },
+{% endif %}
 
 {% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
   # Use Gramine runtime glibc (closer to SGX mode).
@@ -67,6 +76,18 @@ sgx.trusted_files = [
   "file:redis.conf",
   "file:../redis/src/redis-server",
   "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so",
+
+  # In SGX mode, all executable code pages must come from trusted files.
+  # Include the dynamic loader + libc (either Gramine runtime glibc or the
+  # guest system libc, depending on `USE_RUNTIME_GLIBC`).
+{% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
+  "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc/",
+{% else %}
+  "file:/lib/",
+  "file:/lib64/",
+  "file:/lib/x86_64-linux-gnu/",
+  "file:/usr/lib/x86_64-linux-gnu/",
+{% endif %}
 ]
 
 sgx.allowed_files = [
@@ -79,5 +100,5 @@ sgx.allowed_files = [
   "file:/lib/",
   "file:/lib64/",
   "file:..",
-  "file:{{ cxl_ring_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') }}",
+  "file:{{ ring_path }}",
 ]

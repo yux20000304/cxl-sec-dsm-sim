@@ -102,8 +102,12 @@ gramine-direct ./redis-native /repo/gramine/redis.conf
 # Run ring-enabled Redis under Gramine (direct mode, needs BAR2 access).
 sudo gramine-direct ./redis-ring /repo/gramine/redis.conf
 
-# Optional (build SGX-signed manifests, no hardware required to sign):
-# make sgx
+# Optional SGX artifacts:
+# - sign manifests (no SGX hardware required): make sgx-sign
+# - fetch launch tokens (requires SGX + AESM): make sgx-token
+#
+# Run under SGX (requires SGX hardware in the environment):
+# sudo gramine-sgx ./redis-native /repo/gramine/redis.conf
 ```
 
 ## Phase 3: CXL shim – direct binary ring (C)
@@ -208,6 +212,38 @@ This rebuilds VM1/VM2 from the base image and runs:
 bash scripts/host_recreate_and_bench_gramine.sh
 ```
 Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
+
+## SGX hardware: Gramine SGX compare (no VMs)
+This workflow runs on an SGX-capable *host OS* (not inside QEMU guests): it starts
+Redis under `gramine-sgx` and benchmarks (native TCP vs ring shared-memory).
+
+Prereqs:
+- CPU flags include `aes` and `sgx`
+- SGX device nodes exist (typically `/dev/sgx_enclave`)
+- AESM is running (`aesmd`)
+- Gramine is installed (`gramine-sgx`, `gramine-sgx-sign`, `gramine-sgx-get-token`)
+
+One command:
+```bash
+sudo -E bash scripts/host_bench_gramine_sgx.sh
+```
+Outputs are written to `results/` as timestamped `sgx_*.log` / `sgx_*.csv`.
+
+## SGX hardware: Gramine SGX inside guests (VMs + ivshmem)
+This workflow keeps the two-VM + ivshmem setup, but runs Redis under `gramine-sgx`
+*inside VM1*. This requires **SGX virtualization** support in the host KVM/QEMU
+stack; otherwise the guest won't have `/dev/sgx_enclave`.
+
+Host prereqs:
+- `/dev/kvm` available (nested virt enabled if running inside a cloud VM)
+- CPU flags include `aes` and `sgx`
+- QEMU supports SGX EPC objects (`qemu-system-x86_64 -object help | grep memory-backend-epc`)
+
+One command:
+```bash
+sudo -E bash scripts/host_recreate_and_bench_gramine_sgxvm.sh
+```
+Outputs are written to `results/` as timestamped `sgxvm_*.log` / `sgxvm_*.csv`.
 
 ## Quick shared-memory sanity check
 VM1:

@@ -35,15 +35,27 @@ $(SGX_SIGNER_KEY):
 	openssl genrsa -out $@ 3072
 
 # Optional SGX artifacts (not needed for `gramine-direct`).
-sgx: redis-native.manifest.sgx redis-ring.manifest.sgx
+sgx: sgx-sign
 
-redis-native.manifest.sgx: redis-native.manifest $(SGX_SIGNER_KEY)
-	gramine-sgx-sign --manifest $< --output $@ --key $(SGX_SIGNER_KEY)
+# Sign manifests (does not require SGX hardware).
+sgx-sign: redis-native.manifest.sgx redis-ring.manifest.sgx
 
-redis-ring.manifest.sgx: redis-ring.manifest $(SGX_SIGNER_KEY)
-	gramine-sgx-sign --manifest $< --output $@ --key $(SGX_SIGNER_KEY)
+# Fetch launch tokens (requires SGX driver + AESM on the machine).
+sgx-token: redis-native.token redis-ring.token
+
+redis-native.manifest.sgx redis-native.sig: redis-native.manifest $(SGX_SIGNER_KEY)
+	gramine-sgx-sign --manifest $< --output redis-native.manifest.sgx --key $(SGX_SIGNER_KEY)
+
+redis-ring.manifest.sgx redis-ring.sig: redis-ring.manifest $(SGX_SIGNER_KEY)
+	gramine-sgx-sign --manifest $< --output redis-ring.manifest.sgx --key $(SGX_SIGNER_KEY)
+
+redis-native.token: redis-native.sig
+	gramine-sgx-get-token --output $@ --sig $<
+
+redis-ring.token: redis-ring.sig
+	gramine-sgx-get-token --output $@ --sig $<
 
 clean:
 	rm -f *.manifest *.manifest.sgx *.sig *.token $(SGX_SIGNER_KEY)
 
-.PHONY: all native ring links sgx clean
+.PHONY: all native ring links sgx sgx-sign sgx-token clean
