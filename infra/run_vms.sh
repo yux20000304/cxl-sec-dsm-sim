@@ -155,14 +155,29 @@ if grep -q -m1 -w sgx /proc/cpuinfo 2>/dev/null; then
   host_has_sgx=1
 fi
 
+host_has_vtx=0
+if grep -Eq -m1 '\<(vmx|svm)\>' /proc/cpuinfo 2>/dev/null; then
+  host_has_vtx=1
+fi
+
 qemu_has_sgx_epc=0
 if "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'memory-backend-epc'; then
   qemu_has_sgx_epc=1
 fi
 
 if [[ "${VM1_SGX_ENABLE}" == "1" || "${VM2_SGX_ENABLE}" == "1" ]]; then
+  if [[ ! -c /dev/kvm && "${EUID}" -eq 0 ]]; then
+    modprobe kvm >/dev/null 2>&1 || true
+    modprobe kvm_intel >/dev/null 2>&1 || true
+    modprobe kvm_amd >/dev/null 2>&1 || true
+  fi
   if [[ ! -c /dev/kvm ]]; then
-    echo "[!] VM_SGX_ENABLE=1 requires /dev/kvm (KVM acceleration). Nested virt must be enabled on the host." >&2
+    echo "[!] VM_SGX_ENABLE=1 requires /dev/kvm (KVM acceleration)." >&2
+    if [[ "${host_has_vtx}" != "1" ]]; then
+      echo "    CPU virtualization flags (vmx/svm) are not visible; nested virtualization is likely disabled." >&2
+    fi
+    echo "    - Bare metal: enable VT-x/AMD-V in BIOS and load KVM modules (modprobe kvm_intel|kvm_amd)." >&2
+    echo "    - VM/cloud: enable nested virtualization in your hypervisor/provider, or use host SGX tests (no VMs)." >&2
     exit 1
   fi
   if [[ "${host_has_aes}" != "1" ]]; then

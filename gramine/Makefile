@@ -32,7 +32,8 @@ redis-ring.manifest: redis-ring.manifest.template redis.conf
 	USE_RUNTIME_GLIBC="$(USE_RUNTIME_GLIBC)" gramine-manifest $(MANIFEST_COMMON_DEFS) $(MANIFEST_RING_DEFS) $< $@
 
 $(SGX_SIGNER_KEY):
-	openssl genrsa -out $@ 3072
+	# Gramine SGX signing requires RSA public exponent 3.
+	openssl genrsa -3 -out $@ 3072
 
 # Optional SGX artifacts (not needed for `gramine-direct`).
 sgx: sgx-sign
