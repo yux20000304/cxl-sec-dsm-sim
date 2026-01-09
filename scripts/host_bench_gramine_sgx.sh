@@ -384,6 +384,7 @@ echo "[*] Building Gramine manifests + SGX artifacts ..."
 )
 
 ts="$(date +%Y%m%d_%H%M%S)"
+plain_dir="$(mktemp -d "/tmp/cxl-sec-dsm-sim-redis-plain.${ts}.XXXXXX")"
 plain_log="${RESULTS_DIR}/sgx_plain_tcp_${ts}.log"
 native_log="${RESULTS_DIR}/sgx_native_tcp_${ts}.log"
 sodium_log="${RESULTS_DIR}/sgx_sodium_tcp_${ts}.log"
@@ -392,7 +393,8 @@ ring_csv="${RESULTS_DIR}/sgx_ring_${ts}.csv"
 compare_csv="${RESULTS_DIR}/sgx_compare_${ts}.csv"
 
 echo "[*] Benchmark 1/4: native Redis (no Gramine) (TCP)"
-tmux new-session -d -s redis_plain_tcp "redis-server '${ROOT}/gramine/redis.conf' --bind 127.0.0.1 --port '${PLAIN_PORT}' >/tmp/redis_plain_tcp.log 2>&1"
+rm -f "${plain_dir}/dump.rdb" >/dev/null 2>&1 || true
+tmux new-session -d -s redis_plain_tcp "redis-server '${ROOT}/gramine/redis.conf' --bind 127.0.0.1 --port '${PLAIN_PORT}' --dir '${plain_dir}' --dbfilename dump.rdb >/tmp/redis_plain_tcp.log 2>&1"
 for _ in $(seq 1 120); do
   redis-cli -p "${PLAIN_PORT}" ping >/dev/null 2>&1 && break
   sleep 0.25
@@ -405,6 +407,7 @@ fi
 redis-benchmark -h 127.0.0.1 -p "${PLAIN_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${plain_log}"
 redis-cli -p "${PLAIN_PORT}" shutdown nosave >/dev/null 2>&1 || true
 tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true
+rm -rf "${plain_dir}" >/dev/null 2>&1 || true
 
 echo "[*] Benchmark 2/4: native Redis under Gramine SGX (TCP)"
 tmux new-session -d -s redis_native_sgx "cd '${ROOT}/gramine' && gramine-sgx ./redis-native /repo/gramine/redis.conf --port '${NATIVE_PORT}' >/tmp/redis_native_sgx.log 2>&1"

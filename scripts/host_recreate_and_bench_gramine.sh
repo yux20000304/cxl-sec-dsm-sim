@@ -186,6 +186,7 @@ ssh_vm1 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
 ssh_vm2 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
 
 ts="$(date +%Y%m%d_%H%M%S)"
+plain_dir_vm1="/tmp/cxl-sec-dsm-sim-redis-plain-${ts}"
 plain_log="${RESULTS_DIR}/gramine_plain_tcp_${ts}.log"
 native_log="${RESULTS_DIR}/gramine_native_tcp_${ts}.log"
 sodium_log="${RESULTS_DIR}/gramine_sodium_tcp_${ts}.log"
@@ -202,7 +203,8 @@ ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true"
-ssh_vm1 "tmux new-session -d -s redis_plain_tcp \"redis-server /mnt/hostshare/gramine/redis.conf >/tmp/redis_plain_tcp.log 2>&1\""
+ssh_vm1 "rm -rf '${plain_dir_vm1}' >/dev/null 2>&1 || true; mkdir -p '${plain_dir_vm1}'"
+ssh_vm1 "tmux new-session -d -s redis_plain_tcp \"redis-server /mnt/hostshare/gramine/redis.conf --dir '${plain_dir_vm1}' --dbfilename dump.rdb >/tmp/redis_plain_tcp.log 2>&1\""
 if ! ssh_vm1 "for i in \$(seq 1 80); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
   echo "[!] redis-server (plain) not ready (vm1). Dumping diagnostics..." >&2
   ssh_vm1 "tail -n 200 /tmp/redis_plain_tcp.log 2>/dev/null || true" >&2
@@ -214,6 +216,7 @@ ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${plain_log}"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true"
+ssh_vm1 "rm -rf '${plain_dir_vm1}' >/dev/null 2>&1 || true"
 
 echo "[*] Benchmark 2/4: native Redis under Gramine (TCP via cxl0)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
