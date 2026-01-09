@@ -223,7 +223,7 @@ Prereqs:
 - CPU flags include `aes` and `sgx`
 - SGX device nodes exist (typically `/dev/sgx_enclave`)
 - AESM is running (`aesmd`)
-- Gramine is installed (`gramine-sgx`, `gramine-sgx-sign`, `gramine-sgx-get-token`)
+- Gramine is installed (`gramine-sgx`, `gramine-sgx-sign`, `gramine-sgx-get-token`) or let `scripts/host_bench_gramine_sgx.sh` install it on Ubuntu (`INSTALL_GRAMINE=1`)
 - Redis tools are installed (`redis-cli`, `redis-benchmark`, usually via `redis-tools`)
 Notes:
 - Some platforms use SGX Launch Control (FLC) and don't need a launch token. If your Gramine package doesn't ship `gramine-sgx-get-token`, run with `SGX_TOKEN_MODE=skip`.

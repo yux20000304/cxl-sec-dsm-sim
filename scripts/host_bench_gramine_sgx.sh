@@ -22,6 +22,8 @@ set -euo pipefail
 #   RING_COUNT   : number of rings (default: 4)
 #   MAX_INFLIGHT : ring client inflight limit (default: 512)
 #   SGX_TOKEN_MODE: auto|require|skip (default: auto). "auto" tries to fetch a launch token if tooling exists.
+#   INSTALL_GRAMINE: 1 to auto-install Gramine via apt when missing (default: 1)
+#   GRAMINE_CODENAME: override distro codename for Gramine repo (default: lsb_release/os-release)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
@@ -44,6 +46,118 @@ RING_MAP_SIZE="${RING_MAP_SIZE:-134217728}" # 128MB
 RING_COUNT="${RING_COUNT:-4}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
 SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
+INSTALL_GRAMINE="${INSTALL_GRAMINE:-1}"
+GRAMINE_CODENAME="${GRAMINE_CODENAME:-}"
+
+apt_retry_lock() {
+  local desc="$1"
+  shift
+  local out=""
+  local rc=0
+
+  for _ in $(seq 1 180); do
+    set +e
+    out="$("$@" 2>&1)"
+    rc=$?
+    set -e
+
+    if [[ "${rc}" -eq 0 ]]; then
+      [[ -n "${out}" ]] && printf '%s\n' "${out}"
+      return 0
+    fi
+
+    if printf '%s' "${out}" | grep -qiE 'could not get lock|unable to acquire the dpkg frontend lock|could not open lock file|unable to lock directory'; then
+      echo "[*] ${desc}: apt lock held, waiting..."
+      sleep 2
+      continue
+    fi
+
+    printf '%s\n' "${out}" >&2
+    return "${rc}"
+  done
+
+  echo "[!] ${desc}: timed out waiting for apt lock" >&2
+  printf '%s\n' "${out}" >&2
+  return 1
+}
+
+detect_codename() {
+  local c=""
+  if [[ -n "${GRAMINE_CODENAME}" ]]; then
+    echo "${GRAMINE_CODENAME}"
+    return 0
+  fi
+  if command -v lsb_release >/dev/null 2>&1; then
+    c="$(lsb_release -sc 2>/dev/null || true)"
+  fi
+  if [[ -z "${c}" && -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    c="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+  fi
+  echo "${c}"
+}
+
+install_gramine_apt() {
+  if command -v gramine-sgx >/dev/null 2>&1 && command -v gramine-manifest >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "[!] Gramine not found and apt-get is unavailable; install Gramine manually." >&2
+    return 1
+  fi
+
+  local arch=""
+  arch="$(dpkg --print-architecture 2>/dev/null || true)"
+  if [[ "${arch}" != "amd64" ]]; then
+    echo "[!] Unsupported arch for Gramine SGX packages: ${arch} (expected amd64)." >&2
+    return 1
+  fi
+
+  local codename=""
+  codename="$(detect_codename)"
+  if [[ -z "${codename}" ]]; then
+    echo "[!] Failed to detect distro codename (set GRAMINE_CODENAME=<jammy|noble>). " >&2
+    return 1
+  fi
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "[*] Installing curl (required to fetch Gramine repo keyring) ..."
+    apt_retry_lock "apt-get update" apt-get update
+    apt_retry_lock "apt-get install curl" apt-get install -y curl
+  fi
+
+  mkdir -p /etc/apt/keyrings
+
+  local keyring="/etc/apt/keyrings/gramine-keyring-${codename}.gpg"
+  local repo="https://packages.gramineproject.io/"
+  local key_url="https://packages.gramineproject.io/gramine-keyring-${codename}.gpg"
+  local list="/etc/apt/sources.list.d/gramine.list"
+
+  if [[ ! -f "${keyring}" ]]; then
+    echo "[*] Fetching Gramine keyring: ${key_url}"
+    if command -v curl >/dev/null 2>&1; then
+      if ! curl -fsSLo "${keyring}" "${key_url}"; then
+        echo "[!] Failed to download Gramine keyring for codename='${codename}'." >&2
+        echo "    Set GRAMINE_CODENAME=<jammy|noble> or install Gramine manually." >&2
+        return 1
+      fi
+    else
+      if ! wget -qO "${keyring}" "${key_url}"; then
+        echo "[!] Failed to download Gramine keyring for codename='${codename}'." >&2
+        echo "    Set GRAMINE_CODENAME=<jammy|noble> or install Gramine manually." >&2
+        return 1
+      fi
+    fi
+    chmod 644 "${keyring}" || true
+  fi
+
+  echo "deb [arch=amd64 signed-by=${keyring}] ${repo} ${codename} main" > "${list}"
+
+  echo "[*] Installing Gramine (apt) ..."
+  apt_retry_lock "apt-get update (gramine)" apt-get update
+  apt_retry_lock "apt-get install gramine" apt-get install -y gramine
+}
 
 need_cmd() {
   local cmd="$1"
@@ -127,6 +241,9 @@ port_in_use() {
 
 check_prereqs() {
   check_sgx_host
+  if [[ "${INSTALL_GRAMINE}" == "1" ]]; then
+    install_gramine_apt
+  fi
   need_cmd ss
   need_cmd tmux
   need_cmd make
