@@ -13,7 +13,7 @@ set -euo pipefail
 #   sudo bash scripts/host_recreate_and_bench_gramine.sh
 #
 # Tunables (env):
-#   BASE_IMG     : path to ubuntu-24.04-server-cloudimg-amd64.img (preferred)
+#   BASE_IMG     : path to ubuntu-24.04-server-cloudimg-amd64.img (optional; if unset, host_quickstart downloads 24.04 by default)
 #   VM1_SSH/VM2_SSH: ssh forwarded ports (default: 2222/2223)
 #   REQ_N        : total requests for TCP benchmark (default: 200000)
 #   CLIENTS      : redis-benchmark concurrency (default: 4)
@@ -46,22 +46,7 @@ RING_MAP_SIZE="${RING_MAP_SIZE:-134217728}" # 128MB
 RING_PATH="${RING_PATH:-/sys/bus/pci/devices/0000:00:02.0/resource2}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
 
-MIRROR_DIR="${MIRROR_DIR:-$(realpath "${ROOT}/../mirror" 2>/dev/null || echo "")}"
-DEFAULT_NOBLE_IMG="${MIRROR_DIR}/ubuntu-24.04-server-cloudimg-amd64.img"
-DEFAULT_JAMMY_IMG="${MIRROR_DIR}/jammy-server-cloudimg-amd64.img"
-
 BASE_IMG="${BASE_IMG:-}"
-if [[ -z "${BASE_IMG}" ]]; then
-  if [[ -f "${DEFAULT_NOBLE_IMG}" ]]; then
-    BASE_IMG="${DEFAULT_NOBLE_IMG}"
-  elif [[ -f "${DEFAULT_JAMMY_IMG}" ]]; then
-    BASE_IMG="${DEFAULT_JAMMY_IMG}"
-  fi
-fi
-if [[ -z "${BASE_IMG}" || ! -f "${BASE_IMG}" ]]; then
-  echo "[!] BASE_IMG not found. Set BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img" >&2
-  exit 1
-fi
 
 tmpdir="$(mktemp -d /tmp/cxl-sec-dsm-sim-gramine.XXXXXX)"
 cleanup() { rm -rf "${tmpdir}"; }
@@ -130,7 +115,8 @@ wait_ssh() {
   return 1
 }
 
-echo "[*] Recreating VMs from base image: ${BASE_IMG}"
+base_desc="${BASE_IMG:-auto (download Ubuntu 24.04 if missing)}"
+echo "[*] Recreating VMs (BASE_IMG=${base_desc})"
 STOP_EXISTING=1 FORCE_RECREATE=1 BASE_IMG="${BASE_IMG}" \
 VM1_SSH="${VM1_SSH}" VM2_SSH="${VM2_SSH}" \
 CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \

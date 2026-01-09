@@ -69,12 +69,30 @@ need_cmd() {
 }
 
 check_sgx_host() {
-  if ! grep -q -m1 -w aes /proc/cpuinfo 2>/dev/null; then
+  local has_aes=0
+  local has_sgx=0
+
+  if grep -q -m1 -w aes /proc/cpuinfo 2>/dev/null; then
+    has_aes=1
+  fi
+  if grep -q -m1 -w sgx /proc/cpuinfo 2>/dev/null; then
+    has_sgx=1
+  fi
+
+  # Some platforms report SGX capability via CPUID but don't expose it in
+  # /proc/cpuinfo (e.g., SGX disabled in BIOS/firmware, or kernel support missing).
+  if [[ "${has_sgx}" != "1" ]] && command -v cpuid >/dev/null 2>&1; then
+    if cpuid -1 -l 0x7 2>/dev/null | grep -qiE '^[[:space:]]*SGX:.*=[[:space:]]*true'; then
+      has_sgx=1
+    fi
+  fi
+
+  if [[ "${has_aes}" != "1" ]]; then
     echo "[!] Host CPU does not expose AES-NI ('aes' flag). Gramine SGX cannot run." >&2
     exit 1
   fi
-  if ! grep -q -m1 -w sgx /proc/cpuinfo 2>/dev/null; then
-    echo "[!] Host CPU does not expose SGX ('sgx' flag). Gramine SGX cannot run." >&2
+  if [[ "${has_sgx}" != "1" ]]; then
+    echo "[!] Host CPU does not expose SGX to software (no 'sgx' flag / CPUID SGX= true)." >&2
     exit 1
   fi
 
@@ -82,8 +100,23 @@ check_sgx_host() {
     return 0
   fi
 
-  echo "[!] No SGX device node found (/dev/sgx_enclave or /dev/isgx)." >&2
-  echo "    Check BIOS SGX setting and SGX driver installation." >&2
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe intel_sgx >/dev/null 2>&1 || true
+    modprobe isgx >/dev/null 2>&1 || true
+  fi
+
+  if [[ -c /dev/sgx_enclave || -c /dev/sgx/enclave || -c /dev/isgx ]]; then
+    return 0
+  fi
+
+  echo "[!] SGX-capable CPU detected, but no SGX device node is available (/dev/sgx_enclave or /dev/isgx)." >&2
+  echo "    Common causes:" >&2
+  echo "    - BIOS/UEFI has SGX disabled or EPC not configured." >&2
+  echo "    - Linux kernel lacks SGX support/modules for this kernel." >&2
+  echo "    Next checks:" >&2
+  echo "    - dmesg | grep -i sgx | tail -n 50" >&2
+  echo "    - grep CONFIG_X86_SGX /boot/config-$(uname -r)" >&2
+  echo "    - Ubuntu: sudo apt-get install -y linux-modules-extra-$(uname -r)" >&2
   exit 1
 }
 

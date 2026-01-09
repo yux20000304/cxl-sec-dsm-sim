@@ -6,7 +6,7 @@ set -euo pipefail
 # 2) Create VM disks + cloud-init seeds if missing
 # 3) Launch both VMs with ivshmem sharing + SSH port forwards
 #
-# Requirements on host: qemu-system-x86, qemu-utils, cloud-localds, numactl (optional)
+# Requirements on host: qemu-system-x86, qemu-utils, cloud-localds, numactl (optional), curl (or wget for download)
 #
 # Usage:
 #   BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img \
@@ -14,6 +14,9 @@ set -euo pipefail
 #
 # Tunables (env):
 #   BASE_IMG      : path to Ubuntu cloud image (optional if auto-detected)
+#   DOWNLOAD_BASE_IMG: 1 to auto-download Ubuntu 24.04 image if missing (default: 1)
+#   BASE_IMG_URL  : override download URL (default: Ubuntu 24.04 cloud image)
+#   MIRROR_DIR    : download/cache dir for base images (default: ../mirror)
 #   OUTDIR        : where to place qcow2/seed images (default: infra/images)
 #   CXL_PATH      : shared backing file (default: /tmp/cxl_shared.raw)
 #   CXL_SIZE      : size of shared file (default: 4G)
@@ -34,6 +37,8 @@ FORCE_RECREATE="${FORCE_RECREATE:-0}"
 STOP_EXISTING="${STOP_EXISTING:-0}"
 CLOUD_INIT_SSH_KEY_FILE="${CLOUD_INIT_SSH_KEY_FILE:-}"
 BASE_IMG="${BASE_IMG:-}"
+DOWNLOAD_BASE_IMG="${DOWNLOAD_BASE_IMG:-1}"
+BASE_IMG_URL="${BASE_IMG_URL:-https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img}"
 OUTDIR="${OUTDIR:-${INFRA}/images}"
 CXL_PATH="${CXL_PATH:-/tmp/cxl_shared.raw}"
 CXL_SIZE="${CXL_SIZE:-4G}"
@@ -45,25 +50,63 @@ VM1_CPUS="${VM1_CPUS:-4}"
 VM2_CPUS="${VM2_CPUS:-4}"
 HOSTSHARE="${HOSTSHARE:-${ROOT}}"
 
-MIRROR_DIR="${MIRROR_DIR:-$(realpath "${ROOT}/../mirror" 2>/dev/null || echo "")}"
+MIRROR_DIR="${MIRROR_DIR:-${ROOT}/../mirror}"
 DEFAULT_NOBLE_IMG="${MIRROR_DIR}/ubuntu-24.04-server-cloudimg-amd64.img"
 DEFAULT_JAMMY_IMG="${MIRROR_DIR}/jammy-server-cloudimg-amd64.img"
+
+download_file() {
+  local url="$1"
+  local out="$2"
+  local tmp="${out}.part"
+
+  mkdir -p "$(dirname "${out}")"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 5 --retry-delay 2 -C - -o "${tmp}" "${url}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "${tmp}" "${url}"
+  else
+    echo "[!] Need curl or wget to download base image." >&2
+    return 1
+  fi
+
+  mv -f "${tmp}" "${out}"
+  chmod 644 "${out}" || true
+  if [[ ! -s "${out}" ]]; then
+    echo "[!] Downloaded base image is empty: ${out}" >&2
+    return 1
+  fi
+}
 
 if [[ -z "${BASE_IMG}" ]]; then
   if [[ -f "${DEFAULT_NOBLE_IMG}" ]]; then
     BASE_IMG="${DEFAULT_NOBLE_IMG}"
   elif [[ -f "${DEFAULT_JAMMY_IMG}" ]]; then
     BASE_IMG="${DEFAULT_JAMMY_IMG}"
+  elif [[ "${DOWNLOAD_BASE_IMG}" == "1" ]]; then
+    echo "[*] Base image not found; downloading Ubuntu 24.04 cloud image..."
+    echo "    url:  ${BASE_IMG_URL}"
+    echo "    path: ${DEFAULT_NOBLE_IMG}"
+    download_file "${BASE_IMG_URL}" "${DEFAULT_NOBLE_IMG}"
+    BASE_IMG="${DEFAULT_NOBLE_IMG}"
   fi
 fi
 
 if [[ -z "${BASE_IMG}" ]]; then
   echo "[!] Please set BASE_IMG to Ubuntu cloud image path (e.g. ubuntu-24.04-server-cloudimg-amd64.img)" >&2
+  echo "    Or rerun with DOWNLOAD_BASE_IMG=1 to auto-download Ubuntu 24.04." >&2
   exit 1
 fi
 if [[ ! -f "${BASE_IMG}" ]]; then
-  echo "[!] BASE_IMG not found: ${BASE_IMG}" >&2
-  exit 1
+  if [[ "${DOWNLOAD_BASE_IMG}" == "1" ]]; then
+    echo "[*] BASE_IMG not found; downloading Ubuntu 24.04 cloud image..."
+    echo "    url:  ${BASE_IMG_URL}"
+    echo "    path: ${BASE_IMG}"
+    download_file "${BASE_IMG_URL}" "${BASE_IMG}"
+  else
+    echo "[!] BASE_IMG not found: ${BASE_IMG}" >&2
+    exit 1
+  fi
 fi
 
 mkdir -p "${OUTDIR}"

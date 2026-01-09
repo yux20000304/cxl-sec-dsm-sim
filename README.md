@@ -19,7 +19,7 @@ Highlights
 
 ## Phase 1: Dual VMs + shared “CXL medium” (ivshmem)
 ### Host prerequisites (Ubuntu 22.04/24.04)
-`qemu-system-x86`, `qemu-utils`, `numactl`, `cloud-image-utils`
+`qemu-system-x86`, `qemu-utils`, `numactl`, `cloud-image-utils`, `curl` (or `wget`)
 
 ### Create shared backing file (host)
 ```bash
@@ -37,6 +37,7 @@ bash infra/create_vm_images.sh \
 
 bash infra/create_cloud_init.sh --outdir infra/images
 ```
+Or let `scripts/host_quickstart.sh` auto-download Ubuntu 24.04 into `../mirror/` (default).
 
 ### Launch dual VMs (host)
 User-mode networking with SSH forwards:
@@ -196,6 +197,7 @@ If you already have a cloud image (BASE_IMG) and host deps installed:
 BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img \
 bash scripts/host_quickstart.sh
 ```
+If you don't have one, `scripts/host_quickstart.sh` downloads Ubuntu 24.04 by default (set `DOWNLOAD_BASE_IMG=0` to disable).
 This creates the shared file, qcow2/seed, and boots both VMs (SSH: 2222/2223). Tune memory/CPU/NUMA via env vars if needed.
 
 If you switch the base image (e.g., Jammy -> Noble), recreate the VM disks:
