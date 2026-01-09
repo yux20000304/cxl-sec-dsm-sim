@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # Recreate VM1/VM2 from a fresh Ubuntu cloud image (prefer 24.04 "noble"),
-# then run three Gramine benchmarks:
-# 1) Native Redis under Gramine over TCP (direct VM-to-VM via internal NIC).
-# 2) Native Redis over libsodium-encrypted TCP (user-space tunnel).
-# 3) Ring-enabled Redis under Gramine over BAR2 (shared ivshmem).
+# then run four benchmarks:
+# 1) Native Redis (no Gramine) over TCP (direct VM-to-VM via internal NIC).
+# 2) Native Redis under Gramine over TCP (direct VM-to-VM via internal NIC).
+# 3) Native Redis under Gramine over libsodium-encrypted TCP (user-space tunnel).
+# 4) Ring-enabled Redis under Gramine over BAR2 (shared ivshmem).
 #
 # This script is intended to be run on the host with sudo because QEMU/KVM is
 # started as root in this repo's default setup.
@@ -185,6 +186,7 @@ ssh_vm1 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
 ssh_vm2 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
 
 ts="$(date +%Y%m%d_%H%M%S)"
+plain_log="${RESULTS_DIR}/gramine_plain_tcp_${ts}.log"
 native_log="${RESULTS_DIR}/gramine_native_tcp_${ts}.log"
 sodium_log="${RESULTS_DIR}/gramine_sodium_tcp_${ts}.log"
 ring_log="${RESULTS_DIR}/gramine_ring_${ts}.log"
@@ -195,7 +197,25 @@ echo "[*] Internal VM network (cxl0):"
 ssh_vm1 "ip -brief addr show cxl0 2>/dev/null || true"
 ssh_vm2 "ip -brief addr show cxl0 2>/dev/null || true"
 
-echo "[*] Benchmark 1/3: native Redis under Gramine (TCP via cxl0)"
+echo "[*] Benchmark 1/4: native Redis (no Gramine) (TCP via cxl0)"
+ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
+ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
+ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
+ssh_vm1 "tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true"
+ssh_vm1 "tmux new-session -d -s redis_plain_tcp \"redis-server /mnt/hostshare/gramine/redis.conf >/tmp/redis_plain_tcp.log 2>&1\""
+if ! ssh_vm1 "for i in \$(seq 1 80); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
+  echo "[!] redis-server (plain) not ready (vm1). Dumping diagnostics..." >&2
+  ssh_vm1 "tail -n 200 /tmp/redis_plain_tcp.log 2>/dev/null || true" >&2
+  ssh_vm1 "ss -lntp 2>/dev/null | grep -E ':6379\\b' || true" >&2
+  ssh_vm1 "pgrep -a redis-server 2>/dev/null || true" >&2
+  exit 1
+fi
+ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
+ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${plain_log}"
+ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
+ssh_vm1 "tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true"
+
+echo "[*] Benchmark 2/4: native Redis under Gramine (TCP via cxl0)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
@@ -215,7 +235,7 @@ ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/
 
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${native_log}"
 
-echo "[*] Benchmark 2/3: native Redis over libsodium-encrypted TCP (tunnel)"
+echo "[*] Benchmark 3/4: native Redis over libsodium-encrypted TCP (tunnel)"
 ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
 ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
 
@@ -239,7 +259,7 @@ ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_native_gramine >/dev/null 2>&1 || true"
 
-echo "[*] Benchmark 3/3: ring Redis under Gramine (BAR2 shared memory)"
+echo "[*] Benchmark 4/4: ring Redis under Gramine (BAR2 shared memory)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_gramine >/dev/null 2>&1 || true"
@@ -257,6 +277,8 @@ ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_gramine >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 
+plain_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${plain_log}" || true)"
+plain_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${plain_log}" || true)"
 native_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
 native_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
 sodium_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
@@ -266,6 +288,8 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
 
 {
   echo "label,op,throughput_rps"
+  echo "NativeTCP,SET,${plain_set}"
+  echo "NativeTCP,GET,${plain_get}"
   echo "GramineNativeTCP,SET,${native_set}"
   echo "GramineNativeTCP,GET,${native_get}"
   echo "GramineSodiumTCP,SET,${sodium_set}"
@@ -275,6 +299,7 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
 } > "${compare_csv}"
 
 echo "[+] Done."
+echo "    ${plain_log}"
 echo "    ${native_log}"
 echo "    ${sodium_log}"
 echo "    ${ring_log}"

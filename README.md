@@ -208,6 +208,7 @@ FORCE_RECREATE=1 bash scripts/host_quickstart.sh
 
 ### One command: recreate VMs + Gramine benchmarks
 This rebuilds VM1/VM2 from the base image and runs:
+- Native Redis over TCP (no Gramine; VM2 -> VM1 via `cxl0` internal NIC)
 - Gramine + native Redis over TCP (VM2 -> VM1 via `cxl0` internal NIC)
 - Gramine + native Redis over libsodium-encrypted TCP (VM2 -> VM1 via user-space tunnel)
 - Gramine + ring-enabled Redis over BAR2 (VM2 uses `cxl_ring_direct`)
@@ -216,11 +217,11 @@ This rebuilds VM1/VM2 from the base image and runs:
 bash scripts/host_recreate_and_bench_gramine.sh
 ```
 Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
-The compare CSV includes `GramineNativeTCP`, `GramineSodiumTCP`, and `GramineRing` labels.
+The compare CSV includes `NativeTCP`, `GramineNativeTCP`, `GramineSodiumTCP`, and `GramineRing` labels.
 
 ## SGX hardware: Gramine SGX compare (no VMs)
 This workflow runs on an SGX-capable *host OS* (not inside QEMU guests): it starts
-Redis under `gramine-sgx` and benchmarks (native TCP vs libsodium-encrypted TCP vs ring shared-memory).
+Redis under `gramine-sgx` and benchmarks (host native TCP vs Gramine SGX TCP vs libsodium-encrypted TCP vs ring shared-memory).
 
 Prereqs:
 - CPU flags include `aes` and `sgx`
@@ -237,12 +238,13 @@ One command:
 sudo -E bash scripts/host_bench_gramine_sgx.sh
 ```
 Outputs are written to `results/` as timestamped `sgx_*.log` / `sgx_*.csv`.
-The compare CSV includes `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, and `GramineSGXRing` labels.
+The compare CSV includes `HostNativeTCP`, `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, and `GramineSGXRing` labels.
 
 ## SGX hardware: Gramine SGX inside guests (VMs + ivshmem)
 This workflow keeps the two-VM + ivshmem setup, but runs Redis under `gramine-sgx`
 *inside VM1*. This requires **SGX virtualization** support in the host KVM/QEMU
 stack; otherwise the guest won't have `/dev/sgx_enclave`.
+Benchmarks include VM native TCP, Gramine SGX TCP, libsodium-encrypted TCP, and ring shared-memory.
 
 Host prereqs:
 - `/dev/kvm` available (nested virt enabled if running inside a cloud VM)
@@ -254,7 +256,7 @@ One command:
 sudo -E bash scripts/host_recreate_and_bench_gramine_sgxvm.sh
 ```
 Outputs are written to `results/` as timestamped `sgxvm_*.log` / `sgxvm_*.csv`.
-The compare CSV includes `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, and `GramineSGXVMRing` labels.
+The compare CSV includes `SGXVMNativeTCP`, `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, and `GramineSGXVMRing` labels.
 
 ## Quick shared-memory sanity check
 VM1:

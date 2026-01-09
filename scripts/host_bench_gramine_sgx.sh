@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compare native Redis (TCP/RESP), libsodium-encrypted TCP (user-space tunnel),
-# and ring Redis (shared-memory, no RESP) under Gramine SGX on an SGX-capable *host*.
+# Compare native Redis (no Gramine), native Redis (TCP/RESP) under Gramine SGX,
+# libsodium-encrypted TCP (user-space tunnel), and ring Redis (shared-memory, no RESP).
 #
 # This script does NOT use QEMU VMs. It is meant for machines where SGX works
 # on the host OS (i.e., `/dev/sgx_enclave` exists and AESM is running).
@@ -15,6 +15,7 @@ set -euo pipefail
 #   CLIENTS      : redis-benchmark concurrency (default: 4)
 #   THREADS      : redis-benchmark threads (default: 4)
 #   PIPELINE     : redis-benchmark pipeline depth (-P) (default: 256)
+#   PLAIN_PORT   : TCP port for native Redis without Gramine (default: 15379)
 #   NATIVE_PORT  : TCP port for native Redis in SGX (default: 16379)
 #   RING_PORT    : TCP port for ring Redis in SGX (optional; default: 17379)
 #   RING_PATH    : shared-memory backing file (default: /dev/shm/cxl_shared.raw)
@@ -42,6 +43,7 @@ CLIENTS="${CLIENTS:-4}"
 THREADS="${THREADS:-4}"
 PIPELINE="${PIPELINE:-256}"
 
+PLAIN_PORT="${PLAIN_PORT:-15379}"
 NATIVE_PORT="${NATIVE_PORT:-16379}"
 RING_PORT="${RING_PORT:-17379}"
 
@@ -191,6 +193,9 @@ need_cmd() {
     redis-cli|redis-benchmark)
       echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y redis-tools" >&2
       ;;
+    redis-server)
+      echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y redis-server" >&2
+      ;;
     tmux)
       echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y tmux" >&2
       ;;
@@ -278,6 +283,7 @@ check_prereqs() {
   need_cmd tmux
   need_cmd make
   need_cmd gcc
+  need_cmd redis-server
   need_cmd redis-cli
   need_cmd redis-benchmark
   need_cmd gramine-manifest
@@ -289,12 +295,20 @@ check_prereqs() {
 }
 
 cleanup_tmux() {
+  tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true
   tmux kill-session -t redis_native_sgx >/dev/null 2>&1 || true
   tmux kill-session -t redis_ring_sgx >/dev/null 2>&1 || true
+  tmux kill-session -t sodium_server >/dev/null 2>&1 || true
+  tmux kill-session -t sodium_client >/dev/null 2>&1 || true
 }
 
 cleanup_tmux
 
+if port_in_use "${PLAIN_PORT}"; then
+  echo "[!] PLAIN_PORT already in use: ${PLAIN_PORT}" >&2
+  echo "    Set PLAIN_PORT=<free-port> and rerun." >&2
+  exit 1
+fi
 if port_in_use "${NATIVE_PORT}"; then
   echo "[!] NATIVE_PORT already in use: ${NATIVE_PORT}" >&2
   echo "    Set NATIVE_PORT=<free-port> and rerun." >&2
@@ -370,13 +384,29 @@ echo "[*] Building Gramine manifests + SGX artifacts ..."
 )
 
 ts="$(date +%Y%m%d_%H%M%S)"
+plain_log="${RESULTS_DIR}/sgx_plain_tcp_${ts}.log"
 native_log="${RESULTS_DIR}/sgx_native_tcp_${ts}.log"
 sodium_log="${RESULTS_DIR}/sgx_sodium_tcp_${ts}.log"
 ring_log="${RESULTS_DIR}/sgx_ring_${ts}.log"
 ring_csv="${RESULTS_DIR}/sgx_ring_${ts}.csv"
 compare_csv="${RESULTS_DIR}/sgx_compare_${ts}.csv"
 
-echo "[*] Benchmark 1/3: native Redis under Gramine SGX (TCP)"
+echo "[*] Benchmark 1/4: native Redis (no Gramine) (TCP)"
+tmux new-session -d -s redis_plain_tcp "redis-server '${ROOT}/gramine/redis.conf' --bind 127.0.0.1 --port '${PLAIN_PORT}' >/tmp/redis_plain_tcp.log 2>&1"
+for _ in $(seq 1 120); do
+  redis-cli -p "${PLAIN_PORT}" ping >/dev/null 2>&1 && break
+  sleep 0.25
+done
+if ! redis-cli -p "${PLAIN_PORT}" ping >/dev/null 2>&1; then
+  echo "[!] redis-server (plain) not ready on port ${PLAIN_PORT}" >&2
+  tail -n 200 /tmp/redis_plain_tcp.log >&2 || true
+  exit 1
+fi
+redis-benchmark -h 127.0.0.1 -p "${PLAIN_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${plain_log}"
+redis-cli -p "${PLAIN_PORT}" shutdown nosave >/dev/null 2>&1 || true
+tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true
+
+echo "[*] Benchmark 2/4: native Redis under Gramine SGX (TCP)"
 tmux new-session -d -s redis_native_sgx "cd '${ROOT}/gramine' && gramine-sgx ./redis-native /repo/gramine/redis.conf --port '${NATIVE_PORT}' >/tmp/redis_native_sgx.log 2>&1"
 for _ in $(seq 1 120); do
   redis-cli -p "${NATIVE_PORT}" ping >/dev/null 2>&1 && break
@@ -390,7 +420,7 @@ fi
 
 redis-benchmark -h 127.0.0.1 -p "${NATIVE_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${native_log}"
 
-echo "[*] Benchmark 2/3: native Redis over libsodium-encrypted TCP (tunnel)"
+echo "[*] Benchmark 3/4: native Redis over libsodium-encrypted TCP (tunnel)"
 tmux kill-session -t sodium_server >/dev/null 2>&1 || true
 tmux kill-session -t sodium_client >/dev/null 2>&1 || true
 
@@ -416,7 +446,7 @@ tmux kill-session -t sodium_server >/dev/null 2>&1 || true
 redis-cli -p "${NATIVE_PORT}" shutdown nosave >/dev/null 2>&1 || true
 tmux kill-session -t redis_native_sgx >/dev/null 2>&1 || true
 
-echo "[*] Benchmark 3/3: ring Redis under Gramine SGX (shared memory)"
+echo "[*] Benchmark 4/4: ring Redis under Gramine SGX (shared memory)"
 tmux new-session -d -s redis_ring_sgx "cd '${ROOT}/gramine' && gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx.log 2>&1"
 
 for _ in $(seq 1 200); do
@@ -439,6 +469,8 @@ cat "/tmp/${ring_label}.csv" > "${ring_csv}"
 
 tmux kill-session -t redis_ring_sgx >/dev/null 2>&1 || true
 
+plain_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${plain_log}" || true)"
+plain_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${plain_log}" || true)"
 native_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
 native_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
 sodium_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
@@ -448,6 +480,8 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
 
 {
   echo "label,op,throughput_rps"
+  echo "HostNativeTCP,SET,${plain_set}"
+  echo "HostNativeTCP,GET,${plain_get}"
   echo "GramineSGXNativeTCP,SET,${native_set}"
   echo "GramineSGXNativeTCP,GET,${native_get}"
   echo "GramineSGXSodiumTCP,SET,${sodium_set}"
@@ -457,6 +491,7 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
 } > "${compare_csv}"
 
 echo "[+] Done."
+echo "    ${plain_log}"
 echo "    ${native_log}"
 echo "    ${sodium_log}"
 echo "    ${ring_log}"
