@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compare native Redis (TCP/RESP) vs ring Redis (shared-memory, no RESP) under
-# Gramine SGX on an SGX-capable *host*.
+# Compare native Redis (TCP/RESP), libsodium-encrypted TCP (user-space tunnel),
+# and ring Redis (shared-memory, no RESP) under Gramine SGX on an SGX-capable *host*.
 #
 # This script does NOT use QEMU VMs. It is meant for machines where SGX works
 # on the host OS (i.e., `/dev/sgx_enclave` exists and AESM is running).
@@ -23,7 +23,11 @@ set -euo pipefail
 #   MAX_INFLIGHT : ring client inflight limit (default: 512)
 #   SGX_TOKEN_MODE: auto|require|skip (default: auto). "auto" tries to fetch a launch token if tooling exists.
 #   INSTALL_GRAMINE: 1 to auto-install Gramine via apt when missing (default: 1)
+#   INSTALL_LIBSODIUM: 1 to auto-install libsodium-dev via apt when missing (default: 1)
 #   GRAMINE_CODENAME: override distro codename for Gramine repo (default: lsb_release/os-release)
+#   SODIUM_KEY_HEX: pre-shared key for libsodium tunnel (hex64, default: deterministic test key)
+#   SODIUM_PORT  : tunnel server listen port on loopback (default: 18379)
+#   SODIUM_LOCAL_PORT: tunnel client listen port on loopback (default: 18479)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
@@ -47,7 +51,12 @@ RING_COUNT="${RING_COUNT:-4}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
 SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
 INSTALL_GRAMINE="${INSTALL_GRAMINE:-1}"
+INSTALL_LIBSODIUM="${INSTALL_LIBSODIUM:-1}"
 GRAMINE_CODENAME="${GRAMINE_CODENAME:-}"
+
+SODIUM_KEY_HEX="${SODIUM_KEY_HEX:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
+SODIUM_PORT="${SODIUM_PORT:-18379}"
+SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-18479}"
 
 apt_retry_lock() {
   local desc="$1"
@@ -159,6 +168,19 @@ install_gramine_apt() {
   apt_retry_lock "apt-get install gramine" apt-get install -y gramine
 }
 
+install_libsodium_apt() {
+  if [[ -f /usr/include/sodium.h ]]; then
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "[!] libsodium headers not found (/usr/include/sodium.h) and apt-get is unavailable; install libsodium-dev manually." >&2
+    return 1
+  fi
+  echo "[*] Installing libsodium-dev (apt) ..."
+  apt_retry_lock "apt-get update (libsodium)" apt-get update
+  apt_retry_lock "apt-get install libsodium-dev" apt-get install -y libsodium-dev
+}
+
 need_cmd() {
   local cmd="$1"
   if command -v "${cmd}" >/dev/null 2>&1; then
@@ -175,8 +197,13 @@ need_cmd() {
     ss)
       echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y iproute2" >&2
       ;;
-    gramine-manifest|gramine-sgx|gramine-sgx-sign|gramine-sgx-get-token)
+    gramine-manifest|gramine-sgx|gramine-sgx-sign)
       echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y gramine" >&2
+      ;;
+    gramine-sgx-get-token)
+      echo "    Note: recent Gramine packages may not ship this tool; on many FLC systems a launch token isn't needed." >&2
+      echo "    If you don't need a token: set SGX_TOKEN_MODE=skip." >&2
+      echo "    Otherwise: use a Gramine build/version that provides gramine-sgx-get-token." >&2
       ;;
   esac
   return 1
@@ -244,6 +271,9 @@ check_prereqs() {
   if [[ "${INSTALL_GRAMINE}" == "1" ]]; then
     install_gramine_apt
   fi
+  if [[ "${INSTALL_LIBSODIUM}" == "1" ]]; then
+    install_libsodium_apt
+  fi
   need_cmd ss
   need_cmd tmux
   need_cmd make
@@ -275,6 +305,16 @@ if port_in_use "${RING_PORT}"; then
   echo "    Set RING_PORT=<free-port> and rerun." >&2
   exit 1
 fi
+if port_in_use "${SODIUM_PORT}"; then
+  echo "[!] SODIUM_PORT already in use: ${SODIUM_PORT}" >&2
+  echo "    Set SODIUM_PORT=<free-port> and rerun." >&2
+  exit 1
+fi
+if port_in_use "${SODIUM_LOCAL_PORT}"; then
+  echo "[!] SODIUM_LOCAL_PORT already in use: ${SODIUM_LOCAL_PORT}" >&2
+  echo "    Set SODIUM_LOCAL_PORT=<free-port> and rerun." >&2
+  exit 1
+fi
 
 check_prereqs
 
@@ -288,6 +328,9 @@ make -C "${ROOT}/redis/src" -j"$(nproc)" MALLOC=libc USE_LTO=no CFLAGS='-O2 -fno
 
 echo "[*] Building ring client (/tmp/cxl_ring_direct) ..."
 gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct "${ROOT}/ring_client/cxl_ring_direct.c"
+
+echo "[*] Building libsodium tunnel (/tmp/cxl_sodium_tunnel) ..."
+make -C "${ROOT}/sodium_tunnel" BIN=/tmp/cxl_sodium_tunnel
 
 echo "[*] Building Gramine manifests + SGX artifacts ..."
 (
@@ -319,18 +362,21 @@ echo "[*] Building Gramine manifests + SGX artifacts ..."
         echo "[!] Missing command: gramine-sgx-get-token (required by SGX_TOKEN_MODE=require)." >&2
         exit 1
       fi
-      echo "[!] Missing command: gramine-sgx-get-token; skipping token fetch (SGX_TOKEN_MODE=${SGX_TOKEN_MODE})." >&2
+      echo "[*] gramine-sgx-get-token not found; skipping token fetch (SGX_TOKEN_MODE=${SGX_TOKEN_MODE})." >&2
+      echo "    Note: many SGX platforms (FLC) don't need launch tokens, and recent Gramine packages may not ship this tool." >&2
+      echo "    If you keep seeing this and want to silence it: SGX_TOKEN_MODE=skip" >&2
     fi
   fi
 )
 
 ts="$(date +%Y%m%d_%H%M%S)"
 native_log="${RESULTS_DIR}/sgx_native_tcp_${ts}.log"
+sodium_log="${RESULTS_DIR}/sgx_sodium_tcp_${ts}.log"
 ring_log="${RESULTS_DIR}/sgx_ring_${ts}.log"
 ring_csv="${RESULTS_DIR}/sgx_ring_${ts}.csv"
 compare_csv="${RESULTS_DIR}/sgx_compare_${ts}.csv"
 
-echo "[*] Benchmark 1/2: native Redis under Gramine SGX (TCP)"
+echo "[*] Benchmark 1/3: native Redis under Gramine SGX (TCP)"
 tmux new-session -d -s redis_native_sgx "cd '${ROOT}/gramine' && gramine-sgx ./redis-native /repo/gramine/redis.conf --port '${NATIVE_PORT}' >/tmp/redis_native_sgx.log 2>&1"
 for _ in $(seq 1 120); do
   redis-cli -p "${NATIVE_PORT}" ping >/dev/null 2>&1 && break
@@ -343,10 +389,34 @@ if ! redis-cli -p "${NATIVE_PORT}" ping >/dev/null 2>&1; then
 fi
 
 redis-benchmark -h 127.0.0.1 -p "${NATIVE_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${native_log}"
+
+echo "[*] Benchmark 2/3: native Redis over libsodium-encrypted TCP (tunnel)"
+tmux kill-session -t sodium_server >/dev/null 2>&1 || true
+tmux kill-session -t sodium_client >/dev/null 2>&1 || true
+
+tmux new-session -d -s sodium_server "/tmp/cxl_sodium_tunnel --mode server --listen 127.0.0.1:${SODIUM_PORT} --backend 127.0.0.1:${NATIVE_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_server_${ts}.log 2>&1"
+tmux new-session -d -s sodium_client "/tmp/cxl_sodium_tunnel --mode client --listen 127.0.0.1:${SODIUM_LOCAL_PORT} --connect 127.0.0.1:${SODIUM_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_client_${ts}.log 2>&1"
+
+for _ in $(seq 1 120); do
+  redis-cli -h 127.0.0.1 -p "${SODIUM_LOCAL_PORT}" ping >/dev/null 2>&1 && break
+  sleep 0.25
+done
+if ! redis-cli -h 127.0.0.1 -p "${SODIUM_LOCAL_PORT}" ping >/dev/null 2>&1; then
+  echo "[!] libsodium tunnel not ready on ${SODIUM_LOCAL_PORT}" >&2
+  tail -n 200 /tmp/sodium_client_"${ts}".log >&2 || true
+  tail -n 200 /tmp/sodium_server_"${ts}".log >&2 || true
+  exit 1
+fi
+
+redis-benchmark -h 127.0.0.1 -p "${SODIUM_LOCAL_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${sodium_log}"
+
+tmux kill-session -t sodium_client >/dev/null 2>&1 || true
+tmux kill-session -t sodium_server >/dev/null 2>&1 || true
+
 redis-cli -p "${NATIVE_PORT}" shutdown nosave >/dev/null 2>&1 || true
 tmux kill-session -t redis_native_sgx >/dev/null 2>&1 || true
 
-echo "[*] Benchmark 2/2: ring Redis under Gramine SGX (shared memory)"
+echo "[*] Benchmark 3/3: ring Redis under Gramine SGX (shared memory)"
 tmux new-session -d -s redis_ring_sgx "cd '${ROOT}/gramine' && gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx.log 2>&1"
 
 for _ in $(seq 1 200); do
@@ -371,6 +441,8 @@ tmux kill-session -t redis_ring_sgx >/dev/null 2>&1 || true
 
 native_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
 native_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
+sodium_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
+sodium_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
 ring_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_csv}" || true)"
 ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
 
@@ -378,12 +450,15 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
   echo "label,op,throughput_rps"
   echo "GramineSGXNativeTCP,SET,${native_set}"
   echo "GramineSGXNativeTCP,GET,${native_get}"
+  echo "GramineSGXSodiumTCP,SET,${sodium_set}"
+  echo "GramineSGXSodiumTCP,GET,${sodium_get}"
   echo "GramineSGXRing,SET,${ring_set}"
   echo "GramineSGXRing,GET,${ring_get}"
 } > "${compare_csv}"
 
 echo "[+] Done."
 echo "    ${native_log}"
+echo "    ${sodium_log}"
 echo "    ${ring_log}"
 echo "    ${ring_csv}"
 echo "    ${compare_csv}"

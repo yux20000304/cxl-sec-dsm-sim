@@ -2,9 +2,10 @@
 set -euo pipefail
 
 # Recreate VM1/VM2 from a fresh Ubuntu cloud image (prefer 24.04 "noble"),
-# then run two Gramine benchmarks:
+# then run three Gramine benchmarks:
 # 1) Native Redis under Gramine over TCP (direct VM-to-VM via internal NIC).
-# 2) Ring-enabled Redis under Gramine over BAR2 (shared ivshmem).
+# 2) Native Redis over libsodium-encrypted TCP (user-space tunnel).
+# 3) Ring-enabled Redis under Gramine over BAR2 (shared ivshmem).
 #
 # This script is intended to be run on the host with sudo because QEMU/KVM is
 # started as root in this repo's default setup.
@@ -23,6 +24,9 @@ set -euo pipefail
 #   RING_MAP_SIZE: bytes to mmap for BAR2 (default: 134217728 = 128MB)
 #   RING_PATH    : BAR2 resource file (default: /sys/bus/pci/devices/0000:00:02.0/resource2)
 #   MAX_INFLIGHT : ring client inflight limit (default: 512)
+#   SODIUM_KEY_HEX: pre-shared key for libsodium tunnel (hex64, default: deterministic test key)
+#   SODIUM_PORT  : vm1 tunnel listen port on cxl0 (default: 6380)
+#   SODIUM_LOCAL_PORT: vm2 local tunnel listen port (default: 6380)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
@@ -45,6 +49,10 @@ VMNET_VM1_IP="${VMNET_VM1_IP:-192.168.100.1}"
 RING_MAP_SIZE="${RING_MAP_SIZE:-134217728}" # 128MB
 RING_PATH="${RING_PATH:-/sys/bus/pci/devices/0000:00:02.0/resource2}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
+
+SODIUM_KEY_HEX="${SODIUM_KEY_HEX:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
+SODIUM_PORT="${SODIUM_PORT:-6380}"
+SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
 
 BASE_IMG="${BASE_IMG:-}"
 
@@ -146,10 +154,10 @@ ssh_vm2 "${mount_hostshare}"
 
 echo "[*] Installing dependencies in guests ..."
 ssh_retry_lock ssh_vm1 "vm1 apt-get update" "sudo env DEBIAN_FRONTEND=noninteractive apt-get update"
-ssh_retry_lock ssh_vm1 "vm1 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config ca-certificates curl lsb-release redis-server redis-tools net-tools tmux"
+ssh_retry_lock ssh_vm1 "vm1 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential pkg-config ca-certificates curl lsb-release redis-server redis-tools net-tools tmux libsodium-dev"
 
 ssh_retry_lock ssh_vm2 "vm2 apt-get update" "sudo env DEBIAN_FRONTEND=noninteractive apt-get update"
-ssh_retry_lock ssh_vm2 "vm2 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl lsb-release redis-tools net-tools"
+ssh_retry_lock ssh_vm2 "vm2 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl lsb-release redis-tools net-tools tmux libsodium-dev"
 
 echo "[*] Installing Gramine in vm1 (direct mode; no SGX hardware required) ..."
 ssh_vm1 '
@@ -172,8 +180,13 @@ ssh_vm1 "cd /mnt/hostshare/gramine && sudo make clean && sudo make links native 
 echo "[*] Building ring client in vm2 (/tmp/cxl_ring_direct) ..."
 ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c"
 
+echo "[*] Building libsodium tunnel in guests (/tmp/cxl_sodium_tunnel) ..."
+ssh_vm1 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
+ssh_vm2 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
+
 ts="$(date +%Y%m%d_%H%M%S)"
 native_log="${RESULTS_DIR}/gramine_native_tcp_${ts}.log"
+sodium_log="${RESULTS_DIR}/gramine_sodium_tcp_${ts}.log"
 ring_log="${RESULTS_DIR}/gramine_ring_${ts}.log"
 ring_csv="${RESULTS_DIR}/gramine_ring_${ts}.csv"
 compare_csv="${RESULTS_DIR}/gramine_compare_${ts}.csv"
@@ -182,7 +195,7 @@ echo "[*] Internal VM network (cxl0):"
 ssh_vm1 "ip -brief addr show cxl0 2>/dev/null || true"
 ssh_vm2 "ip -brief addr show cxl0 2>/dev/null || true"
 
-echo "[*] Benchmark 1/2: native Redis under Gramine (TCP via cxl0)"
+echo "[*] Benchmark 1/3: native Redis under Gramine (TCP via cxl0)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
@@ -202,10 +215,31 @@ ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/
 
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${native_log}"
 
+echo "[*] Benchmark 2/3: native Redis over libsodium-encrypted TCP (tunnel)"
+ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
+ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
+
+ssh_vm1 "tmux new-session -d -s sodium_server \"/tmp/cxl_sodium_tunnel --mode server --listen 0.0.0.0:${SODIUM_PORT} --backend 127.0.0.1:6379 --key ${SODIUM_KEY_HEX} >/tmp/sodium_server_${ts}.log 2>&1\""
+ssh_vm2 "tmux new-session -d -s sodium_client \"/tmp/cxl_sodium_tunnel --mode client --listen 127.0.0.1:${SODIUM_LOCAL_PORT} --connect ${VMNET_VM1_IP}:${SODIUM_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_client_${ts}.log 2>&1\""
+
+if ! ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
+  echo "[!] libsodium tunnel not ready. Dumping diagnostics..." >&2
+  ssh_vm2 "tail -n 200 /tmp/sodium_client_${ts}.log 2>/dev/null || true" >&2
+  ssh_vm1 "tail -n 200 /tmp/sodium_server_${ts}.log 2>/dev/null || true" >&2
+  ssh_vm1 "ss -lntp 2>/dev/null | grep -E ':${SODIUM_PORT}\\b' || true" >&2
+  ssh_vm2 "ss -lntp 2>/dev/null | grep -E ':${SODIUM_LOCAL_PORT}\\b' || true" >&2
+  exit 1
+fi
+
+ssh_vm2 "redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${sodium_log}"
+
+ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
+ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
+
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_native_gramine >/dev/null 2>&1 || true"
 
-echo "[*] Benchmark 2/2: ring Redis under Gramine (BAR2 shared memory)"
+echo "[*] Benchmark 3/3: ring Redis under Gramine (BAR2 shared memory)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_gramine >/dev/null 2>&1 || true"
@@ -225,6 +259,8 @@ ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 
 native_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
 native_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
+sodium_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
+sodium_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
 ring_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_csv}" || true)"
 ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
 
@@ -232,12 +268,15 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
   echo "label,op,throughput_rps"
   echo "GramineNativeTCP,SET,${native_set}"
   echo "GramineNativeTCP,GET,${native_get}"
+  echo "GramineSodiumTCP,SET,${sodium_set}"
+  echo "GramineSodiumTCP,GET,${sodium_get}"
   echo "GramineRing,SET,${ring_set}"
   echo "GramineRing,GET,${ring_get}"
 } > "${compare_csv}"
 
 echo "[+] Done."
 echo "    ${native_log}"
+echo "    ${sodium_log}"
 echo "    ${ring_log}"
 echo "    ${ring_csv}"
 echo "    ${compare_csv}"

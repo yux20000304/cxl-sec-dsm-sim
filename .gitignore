@@ -14,6 +14,7 @@ gramine/redis-ring
 
 ring_client/cxl_ring_client
 ring_client/cxl_ring_direct
+sodium_tunnel/cxl_sodium_tunnel
 *.img
 *.qcow2
 *.raw

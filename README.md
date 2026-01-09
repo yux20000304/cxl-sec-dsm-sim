@@ -14,6 +14,7 @@ Highlights
 - `gramine/` – Gramine manifest templates and build rules for Redis.
 - `kvm/` – Phase 4 hints for KVM/EPT permission checks (no kernel build here).
 - `ring_client/` – C direct client (binary ring, no RESP).
+- `sodium_tunnel/` – libsodium encrypted TCP tunnel (software encryption baseline for native Redis).
 - `redis/src/cxl_ring.c` – Redis-side ring driver (binary GET/SET).
 - `results/` – saved benchmark logs/CSVs.
 
@@ -208,31 +209,35 @@ FORCE_RECREATE=1 bash scripts/host_quickstart.sh
 ### One command: recreate VMs + Gramine benchmarks
 This rebuilds VM1/VM2 from the base image and runs:
 - Gramine + native Redis over TCP (VM2 -> VM1 via `cxl0` internal NIC)
+- Gramine + native Redis over libsodium-encrypted TCP (VM2 -> VM1 via user-space tunnel)
 - Gramine + ring-enabled Redis over BAR2 (VM2 uses `cxl_ring_direct`)
 
 ```bash
 bash scripts/host_recreate_and_bench_gramine.sh
 ```
 Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
+The compare CSV includes `GramineNativeTCP`, `GramineSodiumTCP`, and `GramineRing` labels.
 
 ## SGX hardware: Gramine SGX compare (no VMs)
 This workflow runs on an SGX-capable *host OS* (not inside QEMU guests): it starts
-Redis under `gramine-sgx` and benchmarks (native TCP vs ring shared-memory).
+Redis under `gramine-sgx` and benchmarks (native TCP vs libsodium-encrypted TCP vs ring shared-memory).
 
 Prereqs:
 - CPU flags include `aes` and `sgx`
 - SGX device nodes exist (typically `/dev/sgx_enclave`)
 - AESM is running (`aesmd`)
-- Gramine is installed (`gramine-sgx`, `gramine-sgx-sign`, `gramine-sgx-get-token`) or let `scripts/host_bench_gramine_sgx.sh` install it on Ubuntu (`INSTALL_GRAMINE=1`)
+- Gramine is installed (`gramine-sgx`, `gramine-sgx-sign`; `gramine-sgx-get-token` optional) or let `scripts/host_bench_gramine_sgx.sh` install it on Ubuntu (`INSTALL_GRAMINE=1`)
+- libsodium headers are available (`libsodium-dev`) or let `scripts/host_bench_gramine_sgx.sh` install them (`INSTALL_LIBSODIUM=1`)
 - Redis tools are installed (`redis-cli`, `redis-benchmark`, usually via `redis-tools`)
 Notes:
-- Some platforms use SGX Launch Control (FLC) and don't need a launch token. If your Gramine package doesn't ship `gramine-sgx-get-token`, run with `SGX_TOKEN_MODE=skip`.
+- Some platforms use SGX Launch Control (FLC) and don't need a launch token. Recent Gramine packages may not ship `gramine-sgx-get-token`; if you see a warning about it, run with `SGX_TOKEN_MODE=skip`.
 
 One command:
 ```bash
 sudo -E bash scripts/host_bench_gramine_sgx.sh
 ```
 Outputs are written to `results/` as timestamped `sgx_*.log` / `sgx_*.csv`.
+The compare CSV includes `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, and `GramineSGXRing` labels.
 
 ## SGX hardware: Gramine SGX inside guests (VMs + ivshmem)
 This workflow keeps the two-VM + ivshmem setup, but runs Redis under `gramine-sgx`
@@ -249,6 +254,7 @@ One command:
 sudo -E bash scripts/host_recreate_and_bench_gramine_sgxvm.sh
 ```
 Outputs are written to `results/` as timestamped `sgxvm_*.log` / `sgxvm_*.csv`.
+The compare CSV includes `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, and `GramineSGXVMRing` labels.
 
 ## Quick shared-memory sanity check
 VM1:
