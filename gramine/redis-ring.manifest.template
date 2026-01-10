@@ -29,6 +29,15 @@ loader.env.CXL_RING_PATH = "{{ ring_path }}"
 loader.env.CXL_RING_COUNT = "{{ cxl_ring_count | default('4') }}"
 loader.env.CXL_RING_MAP_SIZE = "{{ cxl_ring_map_size | default('134217728') }}"
 
+# Secure ring (ACL + software crypto):
+# Pass through runtime configuration from the host process when launching
+# `gramine-direct`/`gramine-sgx`, e.g.:
+#   CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:19001 CXL_SEC_NODE_ID=1 gramine-sgx ./redis-ring ...
+loader.env.CXL_SEC_ENABLE = { passthrough = true }
+loader.env.CXL_SEC_MGR = { passthrough = true }
+loader.env.CXL_SEC_NODE_ID = { passthrough = true }
+loader.env.CXL_SEC_TIMEOUT_MS = { passthrough = true }
+
 fs.mounts = [
   # Repo root (parent dir of this `gramine/` folder).
   { uri = "file:..", path = "/repo" },
