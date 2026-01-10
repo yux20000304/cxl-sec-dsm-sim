@@ -531,12 +531,17 @@ tmux kill-session -t redis_native_sgx >/dev/null 2>&1 || true
 echo "[*] Benchmark 4/5: ring Redis under Gramine SGX (shared memory)"
 tmux new-session -d -s redis_ring_sgx "cd '${ROOT}/gramine' && ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx.log 2>&1"
 
+ring_ready_out="/tmp/cxl_ring_ready_${ts}.log"
 for _ in $(seq 1 200); do
-  ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1 && break
+  if ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --ping-timeout-ms 1000 --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_ready_out}" 2>&1; then
+    break
+  fi
   sleep 0.25
 done
-if ! ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1; then
+if ! ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --ping-timeout-ms 1000 --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_ready_out}" 2>&1; then
   echo "[!] ring transport not ready (SGX). Dumping diagnostics..." >&2
+  echo "[!] Last cxl_ring_direct output (ring ready check):" >&2
+  tail -n 50 "${ring_ready_out}" >&2 || true
   tail -n 200 /tmp/redis_ring_sgx.log >&2 || true
   exit 1
 fi
@@ -555,14 +560,21 @@ echo "[*] Benchmark 5/5: secure ring Redis under Gramine SGX (ACL + software cry
 tmux new-session -d -s cxl_sec_mgr "${BENCH_NUMA_PREFIX}/tmp/cxl_sec_mgr --ring '${RING_PATH}' --listen 127.0.0.1:${SEC_MGR_PORT} --map-size '${RING_MAP_SIZE}' >/tmp/cxl_sec_mgr_${ts}.log 2>&1"
 tmux new-session -d -s redis_ring_sgx_secure "cd '${ROOT}/gramine' && CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx_secure.log 2>&1"
 
+ring_secure_ready_out="/tmp/cxl_ring_secure_ready_${ts}.log"
 for _ in $(seq 1 200); do
-  ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
-    --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1 && break
+  if ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
+    --sec-timeout-ms 3000 --ping-timeout-ms 3000 \
+    --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_secure_ready_out}" 2>&1; then
+    break
+  fi
   sleep 0.25
 done
 if ! ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
-  --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1; then
+  --sec-timeout-ms 3000 --ping-timeout-ms 3000 \
+  --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_secure_ready_out}" 2>&1; then
   echo "[!] secure ring transport not ready (SGX). Dumping diagnostics..." >&2
+  echo "[!] Last cxl_ring_direct output (secure ring ready check):" >&2
+  tail -n 50 "${ring_secure_ready_out}" >&2 || true
   tail -n 200 /tmp/redis_ring_sgx_secure.log >&2 || true
   tail -n 200 /tmp/cxl_sec_mgr_"${ts}".log >&2 || true
   exit 1

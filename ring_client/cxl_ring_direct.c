@@ -567,7 +567,9 @@ static int drain_one(unsigned char *mm, const struct ring_info *ri, struct stage
     uint32_t cid, len;
     uint16_t type;
     unsigned char *pl;
-    if (!ring_pop_safe(mm, ri, &cid, &type, &pl, &len)) return 0;
+    int r = ring_pop_safe(mm, ri, &cid, &type, &pl, &len);
+    if (r == 0) return 0;
+    if (r < 0) return -1;
     if (type != MSG_DATA || len < 3) return 1;
     if (stage && stage->collect_latency) {
         uint64_t t0 = 0;
@@ -582,8 +584,13 @@ static int drain_one(unsigned char *mm, const struct ring_info *ri, struct stage
 
 static void drain_many(unsigned char *mm, const struct ring_info *ri, int *outstanding, int target, struct stage_ctx *stage) {
     while (*outstanding > target && running) {
-        if (drain_one(mm, ri, stage)) {
+        int r = drain_one(mm, ri, stage);
+        if (r > 0) {
             (*outstanding)--;
+        } else if (r < 0) {
+            fprintf(stderr, "[!] ring_pop error while draining responses\n");
+            running = 0;
+            return;
         } else {
             struct timespec ts = {0, 500000};
             nanosleep(&ts, NULL);
@@ -607,17 +614,37 @@ static void run_bench_internal(unsigned char *mm, const struct ring_info *ri, in
     clock_gettime(CLOCK_MONOTONIC, &ts1);
     if (!quiet) fprintf(stderr, "[bench tid=%d] pushing %d SET (pipeline=%d)\n", tid, n, pipeline);
     for (int i = 0; i < n; i++) {
+        if (!running) break;
         if (pipeline) drain_many(mm, ri, &inflight, max_inflight, &set_stage);
-        while (!push_set(mm, ri, cid_set, i)) {
+        int pushed = 0;
+        while (running) {
+            int pr = push_set(mm, ri, cid_set, i);
+            if (pr > 0) {
+                pushed = 1;
+                break;
+            }
+            if (pr < 0) {
+                fprintf(stderr, "[!] push_set failed (ring write error)\n");
+                running = 0;
+                break;
+            }
             struct timespec ts = {0, 500000};
             nanosleep(&ts, NULL);
             if (collect_cost) set_stage.cs.sleep_ns += 500000;
             set_stage.cs.push_retries++;
         }
+        if (!running || !pushed) break;
         if (collect_latency) tsq_push(&set_stage.q, nowns());
         if (pipeline) inflight++;
         if (!pipeline) {
-            while (!drain_one(mm, ri, &set_stage)) {
+            while (running) {
+                int dr = drain_one(mm, ri, &set_stage);
+                if (dr > 0) break;
+                if (dr < 0) {
+                    fprintf(stderr, "[!] ring_pop failed while waiting for SET response\n");
+                    running = 0;
+                    break;
+                }
                 struct timespec ts = {0, 500000};
                 nanosleep(&ts, NULL);
                 if (collect_cost) set_stage.cs.sleep_ns += 500000;
@@ -629,17 +656,37 @@ static void run_bench_internal(unsigned char *mm, const struct ring_info *ri, in
 
     if (!quiet) fprintf(stderr, "[bench tid=%d] pushing %d GET\n", tid, n);
     for (int i = 0; i < n; i++) {
+        if (!running) break;
         if (pipeline) drain_many(mm, ri, &inflight, max_inflight, &get_stage);
-        while (!push_get(mm, ri, cid_get, i)) {
+        int pushed = 0;
+        while (running) {
+            int pr = push_get(mm, ri, cid_get, i);
+            if (pr > 0) {
+                pushed = 1;
+                break;
+            }
+            if (pr < 0) {
+                fprintf(stderr, "[!] push_get failed (ring write error)\n");
+                running = 0;
+                break;
+            }
             struct timespec ts = {0, 500000};
             nanosleep(&ts, NULL);
             if (collect_cost) get_stage.cs.sleep_ns += 500000;
             get_stage.cs.push_retries++;
         }
+        if (!running || !pushed) break;
         if (collect_latency) tsq_push(&get_stage.q, nowns());
         if (pipeline) inflight++;
         if (!pipeline) {
-            while (!drain_one(mm, ri, &get_stage)) {
+            while (running) {
+                int dr = drain_one(mm, ri, &get_stage);
+                if (dr > 0) break;
+                if (dr < 0) {
+                    fprintf(stderr, "[!] ring_pop failed while waiting for GET response\n");
+                    running = 0;
+                    break;
+                }
                 struct timespec ts = {0, 500000};
                 nanosleep(&ts, NULL);
                 if (collect_cost) get_stage.cs.sleep_ns += 500000;
@@ -857,6 +904,7 @@ int main(int argc, char **argv) {
     int secure = 0;
     const char *sec_mgr = getenv("CXL_SEC_MGR");
     unsigned sec_timeout_ms = 10000;
+    unsigned ping_timeout_ms = 0;
 
     const char *sec_node_env = getenv("CXL_SEC_NODE_ID");
     uint32_t sec_node = sec_node_env ? (uint32_t)strtoul(sec_node_env, NULL, 0) : 0;
@@ -877,10 +925,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--sec-mgr") && i + 1 < argc) sec_mgr = argv[++i];
         else if (!strcmp(argv[i], "--sec-node-id") && i + 1 < argc) sec_node = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--sec-timeout-ms") && i + 1 < argc) sec_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--ping-timeout-ms") && i + 1 < argc) ping_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("Usage: %s [--path <ring>] [--map-size <bytes>] [--bench N] [--pipeline] [--threads N]\n"
                    "          [--max-inflight N] [--latency] [--cost] [--csv <path>] [--label <name>]\n"
-                   "          [--secure --sec-mgr <ip:port> --sec-node-id <n>]\n",
+                   "          [--secure --sec-mgr <ip:port> --sec-node-id <n>]\n"
+                   "          [--ping-timeout-ms <ms>] (ping mode only; 0=wait forever)\n",
                    argv[0]);
             return 0;
         }
@@ -947,20 +997,60 @@ int main(int argc, char **argv) {
             (void)sec_request_access((uint64_t)lo.rings[i].req_off, 1);
             (void)sec_request_access((uint64_t)lo.rings[i].resp_off, 1);
         }
+        fprintf(stderr, "[*] secure ring: enabled (mgr=%s node_id=%u principal=%llu)\n",
+                sec_mgr,
+                sec_node_id,
+                (unsigned long long)sec_principal);
     }
 
     if (bench_n > 0) {
         run_bench(mm, &lo, bench_n, pipeline, threads, max_inflight, collect_latency, collect_cost, csv_path, label);
     } else {
-        /* simple GET ping */
-        push_get(mm, &lo.rings[ring_idx], 99, 0);
+        /* simple GET ping (for readiness checks) */
+        uint64_t start_ns = nowns();
+        int pushed = 0;
+        int ok = 0;
         while (running) {
-            if (drain_one(mm, &lo.rings[ring_idx], NULL)) {
-                printf("PING done\n");
-                break;
+            if (!pushed) {
+                int pr = push_get(mm, &lo.rings[ring_idx], 99, 0);
+                if (pr > 0) {
+                    pushed = 1;
+                } else if (pr < 0) {
+                    fprintf(stderr, "[!] push_get failed (ring write error)\n");
+                    break;
+                }
             }
+
+            if (pushed) {
+                int dr = drain_one(mm, &lo.rings[ring_idx], NULL);
+                if (dr > 0) {
+                    ok = 1;
+                    break;
+                }
+                if (dr < 0) {
+                    fprintf(stderr, "[!] ring_pop failed while waiting for ping response\n");
+                    break;
+                }
+            }
+
+            if (ping_timeout_ms > 0) {
+                uint64_t now_ns = nowns();
+                uint64_t waited_ms = (now_ns - start_ns) / 1000000ULL;
+                if (waited_ms >= ping_timeout_ms) {
+                    fprintf(stderr, "[!] ping timeout after %u ms\n", ping_timeout_ms);
+                    break;
+                }
+            }
+
             struct timespec ts = {0, 1000000};
             nanosleep(&ts, NULL);
+        }
+        if (ok) printf("PING done\n");
+        else {
+            munmap(mm, map_size);
+            close(fd);
+            if (sec_fd >= 0) close(sec_fd);
+            return 1;
         }
     }
 
