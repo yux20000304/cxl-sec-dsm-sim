@@ -2,11 +2,12 @@
 set -euo pipefail
 
 # Recreate VM1/VM2 from a fresh Ubuntu cloud image, enable SGX virtualization in VM1,
-# then run four benchmarks with Redis running under Gramine SGX *inside the guest*:
+# then run five benchmarks with Redis running under Gramine SGX *inside the guest*:
 # 1) Native Redis (no Gramine) over TCP (VM2 -> VM1 over internal NIC).
 # 2) Native Redis (TCP/RESP) under gramine-sgx (VM2 -> VM1 over internal NIC).
 # 3) Native Redis under gramine-sgx over libsodium-encrypted TCP (VM2 -> VM1 via user-space tunnel).
 # 4) Ring-enabled Redis under gramine-sgx (VM2 -> VM1 over shared ivshmem BAR2).
+# 5) Secure ring Redis under gramine-sgx (ACL + software crypto in shared memory).
 #
 # Requirements on host:
 # - SGX-capable hardware with SGX enabled in BIOS.
@@ -30,6 +31,7 @@ set -euo pipefail
 #   SODIUM_KEY_HEX : pre-shared key for libsodium tunnel (hex64, default: deterministic test key)
 #   SODIUM_PORT    : vm1 tunnel listen port on cxl0 (default: 6380)
 #   SODIUM_LOCAL_PORT: vm2 local tunnel listen port (default: 6380)
+#   SEC_MGR_PORT   : TCP port for cxl_sec_mgr inside vm1 (default: 19001)
 #
 # SGX-in-guest knobs:
 #   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: 256M)
@@ -59,6 +61,7 @@ MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
 SODIUM_KEY_HEX="${SODIUM_KEY_HEX:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
 SODIUM_PORT="${SODIUM_PORT:-6380}"
 SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
+SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
 
 VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-256M}"
 SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
@@ -207,11 +210,14 @@ if [[ "${token_rc}" -ne 0 ]]; then
 fi
 
 echo "[*] Building ring client in vm2 (/tmp/cxl_ring_direct) ..."
-ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c"
+ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c -lsodium"
 
 echo "[*] Building libsodium tunnel in guests (/tmp/cxl_sodium_tunnel) ..."
 ssh_vm1 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
 ssh_vm2 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
+
+echo "[*] Building cxl_sec_mgr in vm1 (/tmp/cxl_sec_mgr) ..."
+ssh_vm1 "make -C /mnt/hostshare/cxl_sec_mgr BIN=/tmp/cxl_sec_mgr"
 
 ts="$(date +%Y%m%d_%H%M%S)"
 plain_dir_vm1="/tmp/cxl-sec-dsm-sim-redis-plain-${ts}"
@@ -220,13 +226,15 @@ native_log="${RESULTS_DIR}/sgxvm_native_tcp_${ts}.log"
 sodium_log="${RESULTS_DIR}/sgxvm_sodium_tcp_${ts}.log"
 ring_log="${RESULTS_DIR}/sgxvm_ring_${ts}.log"
 ring_csv="${RESULTS_DIR}/sgxvm_ring_${ts}.csv"
+ring_secure_log="${RESULTS_DIR}/sgxvm_ring_secure_${ts}.log"
+ring_secure_csv="${RESULTS_DIR}/sgxvm_ring_secure_${ts}.csv"
 compare_csv="${RESULTS_DIR}/sgxvm_compare_${ts}.csv"
 
 echo "[*] Internal VM network (cxl0):"
 ssh_vm1 "ip -brief addr show cxl0 2>/dev/null || true"
 ssh_vm2 "ip -brief addr show cxl0 2>/dev/null || true"
 
-echo "[*] Benchmark 1/4: native Redis (no Gramine) (TCP via cxl0)"
+echo "[*] Benchmark 1/5: native Redis (no Gramine) (TCP via cxl0)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
@@ -240,7 +248,7 @@ ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_plain_sgxvm >/dev/null 2>&1 || true"
 ssh_vm1 "rm -rf '${plain_dir_vm1}' >/dev/null 2>&1 || true"
 
-echo "[*] Benchmark 2/4: native Redis under Gramine SGX (TCP via cxl0)"
+echo "[*] Benchmark 2/5: native Redis under Gramine SGX (TCP via cxl0)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
@@ -251,7 +259,7 @@ ssh_vm1 "for i in \$(seq 1 200); do redis-cli -p 6379 ping >/dev/null 2>&1 && ex
 ssh_vm2 "for i in \$(seq 1 200); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${native_log}"
 
-echo "[*] Benchmark 3/4: native Redis over libsodium-encrypted TCP (tunnel)"
+echo "[*] Benchmark 3/5: native Redis over libsodium-encrypted TCP (tunnel)"
 ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
 ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
 
@@ -273,7 +281,7 @@ ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_native_sgxvm >/dev/null 2>&1 || true"
 
-echo "[*] Benchmark 4/4: ring Redis under Gramine SGX (BAR2 shared memory)"
+echo "[*] Benchmark 4/5: ring Redis under Gramine SGX (BAR2 shared memory)"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_sgxvm >/dev/null 2>&1 || true"
 ssh_vm1 "tmux new-session -d -s redis_ring_sgxvm \"cd /mnt/hostshare/gramine && sudo gramine-sgx ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_sgxvm.log 2>&1\""
@@ -288,6 +296,24 @@ ssh_vm2 "cat /tmp/${ring_label}.csv" > "${ring_csv}"
 ssh_vm1 "tmux kill-session -t redis_ring_sgxvm >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 
+echo "[*] Benchmark 5/5: secure ring Redis under Gramine SGX (ACL + software crypto)"
+ssh_vm1 "tmux kill-session -t cxl_sec_mgr >/dev/null 2>&1 || true"
+ssh_vm1 "tmux kill-session -t redis_ring_sgxvm_secure >/dev/null 2>&1 || true"
+
+ssh_vm1 "tmux new-session -d -s cxl_sec_mgr \"sudo /tmp/cxl_sec_mgr --ring ${RING_PATH} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} >/tmp/cxl_sec_mgr_${ts}.log 2>&1\""
+ssh_vm1 "tmux new-session -d -s redis_ring_sgxvm_secure \"cd /mnt/hostshare/gramine && sudo env CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 gramine-sgx ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_sgxvm_secure.log 2>&1\""
+
+ssh_vm2 "for i in \$(seq 1 200); do sudo timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'secure ring not ready' >&2; exit 1"
+
+ring_secure_label="sgxvm_ring_secure_${ts}"
+ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
+ssh_vm2 "cd /tmp && sudo /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
+ssh_vm2 "cat /tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
+
+ssh_vm1 "tmux kill-session -t redis_ring_sgxvm_secure >/dev/null 2>&1 || true"
+ssh_vm1 "tmux kill-session -t cxl_sec_mgr >/dev/null 2>&1 || true"
+ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
+
 plain_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${plain_log}" || true)"
 plain_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${plain_log}" || true)"
 native_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
@@ -296,6 +322,8 @@ sodium_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{
 sodium_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
 ring_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_csv}" || true)"
 ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
+ring_secure_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_secure_csv}" || true)"
+ring_secure_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_secure_csv}" || true)"
 
 {
   echo "label,op,throughput_rps"
@@ -307,6 +335,8 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
   echo "GramineSGXVMSodiumTCP,GET,${sodium_get}"
   echo "GramineSGXVMRing,SET,${ring_set}"
   echo "GramineSGXVMRing,GET,${ring_get}"
+  echo "GramineSGXVMRingSecure,SET,${ring_secure_set}"
+  echo "GramineSGXVMRingSecure,GET,${ring_secure_get}"
 } > "${compare_csv}"
 
 echo "[+] Done."
@@ -315,4 +345,6 @@ echo "    ${native_log}"
 echo "    ${sodium_log}"
 echo "    ${ring_log}"
 echo "    ${ring_csv}"
+echo "    ${ring_secure_log}"
+echo "    ${ring_secure_csv}"
 echo "    ${compare_csv}"

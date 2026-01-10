@@ -6,6 +6,7 @@ Highlights
 - Two VMs share an ivshmem backing file (default `/tmp/cxl_shared.raw`), both can mmap PCI BAR2 directly.
 - Redis runs with a binary ring protocol (version=2, slot=4096B, rings=4, map=1GB). Client writes/reads shared memory; no TCP sockets on the hot path.
 - Benchmarks proven with 200k/500k requests, 4 threads, pipeline + client-side inflight throttling.
+- Optional secure-ring variant: address-range ACL table + software encrypt/decrypt (libsodium) managed by `cxl_sec_mgr`.
 
 ## Repo layout
 - `infra/` – host scripts: create shared backing, cloud-init seeds, launch dual VMs.
@@ -14,6 +15,7 @@ Highlights
 - `gramine/` – Gramine manifest templates and build rules for Redis.
 - `kvm/` – Phase 4 hints for KVM/EPT permission checks (no kernel build here).
 - `ring_client/` – C direct client (binary ring, no RESP).
+- `cxl_sec_mgr/` – ACL/key table manager process for secure ring mode.
 - `sodium_tunnel/` – libsodium encrypted TCP tunnel (software encryption baseline for native Redis).
 - `redis/src/cxl_ring.c` – Redis-side ring driver (binary GET/SET).
 - `results/` – saved benchmark logs/CSVs.
@@ -130,7 +132,7 @@ Expect log: `cxl ring: enabled ... rings=4 slots_per_ring=26624`.
 ```bash
 ssh -p 2223 ubuntu@127.0.0.1
 cd /mnt/hostshare/ring_client
-gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c
+gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c -lsodium
 ```
 
 ### Benchmark examples
@@ -191,6 +193,7 @@ Result: SET/GET ≈ 199,800 req/s.
   - Version 2 client, slot=4096, map=1GB default.
   - `--threads` spreads across rings; `--pipeline` batches; `--max-inflight` caps outstanding to avoid ring overflow.
   - `--latency/--cost/--csv/--label` capture metrics with minimal code overhead (off by default).
+  - `--secure` enables ACL+crypto over the shared-memory payload (requires `--sec-mgr ip:port` + `--sec-node-id N`).
 
 ## One-command host bootstrap
 If you already have a cloud image (BASE_IMG) and host deps installed:
@@ -212,16 +215,17 @@ This rebuilds VM1/VM2 from the base image and runs:
 - Gramine + native Redis over TCP (VM2 -> VM1 via `cxl0` internal NIC)
 - Gramine + native Redis over libsodium-encrypted TCP (VM2 -> VM1 via user-space tunnel)
 - Gramine + ring-enabled Redis over BAR2 (VM2 uses `cxl_ring_direct`)
+- Gramine + secure ring Redis over BAR2 (VM2 uses `cxl_ring_direct --secure`, ACL managed by `cxl_sec_mgr`)
 
 ```bash
 bash scripts/host_recreate_and_bench_gramine.sh
 ```
 Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
-The compare CSV includes `NativeTCP`, `GramineNativeTCP`, `GramineSodiumTCP`, and `GramineRing` labels.
+The compare CSV includes `NativeTCP`, `GramineNativeTCP`, `GramineSodiumTCP`, `GramineRing`, and `GramineRingSecure` labels.
 
 ## SGX hardware: Gramine SGX compare (no VMs)
 This workflow runs on an SGX-capable *host OS* (not inside QEMU guests): it starts
-Redis under `gramine-sgx` and benchmarks (host native TCP vs Gramine SGX TCP vs libsodium-encrypted TCP vs ring shared-memory).
+Redis under `gramine-sgx` and benchmarks (host native TCP vs Gramine SGX TCP vs libsodium-encrypted TCP vs ring shared-memory vs secure ring).
 
 Prereqs:
 - CPU flags include `aes` and `sgx`
@@ -229,6 +233,7 @@ Prereqs:
 - AESM is running (`aesmd`)
 - Gramine is installed (`gramine-sgx`, `gramine-sgx-sign`; `gramine-sgx-get-token` optional) or let `scripts/host_bench_gramine_sgx.sh` install it on Ubuntu (`INSTALL_GRAMINE=1`)
 - libsodium headers are available (`libsodium-dev`) or let `scripts/host_bench_gramine_sgx.sh` install them (`INSTALL_LIBSODIUM=1`)
+- `numactl` is installed (optional; only needed for NUMA pinning) or let `scripts/host_bench_gramine_sgx.sh` install it (`INSTALL_NUMACTL=1`)
 - Redis tools are installed (`redis-cli`, `redis-benchmark`, usually via `redis-tools`)
 Notes:
 - Some platforms use SGX Launch Control (FLC) and don't need a launch token. Recent Gramine packages may not ship `gramine-sgx-get-token`; if you see a warning about it, run with `SGX_TOKEN_MODE=skip`.
@@ -237,14 +242,18 @@ One command:
 ```bash
 sudo -E bash scripts/host_bench_gramine_sgx.sh
 ```
+Optional NUMA pinning (simulate “remote” CXL memory on the host):
+```bash
+BENCH_CPU_NODE=0 CXL_MEM_NODE=1 sudo -E bash scripts/host_bench_gramine_sgx.sh
+```
 Outputs are written to `results/` as timestamped `sgx_*.log` / `sgx_*.csv`.
-The compare CSV includes `HostNativeTCP`, `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, and `GramineSGXRing` labels.
+The compare CSV includes `HostNativeTCP`, `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, `GramineSGXRing`, and `GramineSGXRingSecure` labels.
 
 ## SGX hardware: Gramine SGX inside guests (VMs + ivshmem)
 This workflow keeps the two-VM + ivshmem setup, but runs Redis under `gramine-sgx`
 *inside VM1*. This requires **SGX virtualization** support in the host KVM/QEMU
 stack; otherwise the guest won't have `/dev/sgx_enclave`.
-Benchmarks include VM native TCP, Gramine SGX TCP, libsodium-encrypted TCP, and ring shared-memory.
+Benchmarks include VM native TCP, Gramine SGX TCP, libsodium-encrypted TCP, ring shared-memory, and secure ring.
 
 Host prereqs:
 - `/dev/kvm` available (nested virt enabled if running inside a cloud VM)
@@ -256,7 +265,7 @@ One command:
 sudo -E bash scripts/host_recreate_and_bench_gramine_sgxvm.sh
 ```
 Outputs are written to `results/` as timestamped `sgxvm_*.log` / `sgxvm_*.csv`.
-The compare CSV includes `SGXVMNativeTCP`, `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, and `GramineSGXVMRing` labels.
+The compare CSV includes `SGXVMNativeTCP`, `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, `GramineSGXVMRing`, and `GramineSGXVMRingSecure` labels.
 
 ## Quick shared-memory sanity check
 VM1:

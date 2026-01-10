@@ -1,14 +1,20 @@
 #define _GNU_SOURCE
+#include <arpa/inet.h>
+#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sodium.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -32,10 +38,65 @@
 #define STATUS_MISS 1
 #define STATUS_ERR 2
 
+#define CXL_SEC_TABLE_OFF 512
+#define CXL_SEC_MAGIC "CXLSEC1\0"
+#define CXL_SEC_VERSION 1
+#define CXL_SEC_MAX_ENTRIES 16
+#define CXL_SEC_MAX_PRINCIPALS 16
+
+#define SEC_PROTO_MAGIC 0x43534543u /* 'CSEC' */
+#define SEC_PROTO_VERSION 1
+#define SEC_REQ_ACCESS 1
+
+#define SEC_STATUS_OK 0
+#define SEC_STATUS_BAD_REQ 1
+#define SEC_STATUS_NOT_READY 2
+#define SEC_STATUS_NO_REGION 3
+#define SEC_STATUS_TABLE_FULL 4
+
+typedef struct {
+    uint64_t start_off;
+    uint64_t end_off;
+    unsigned char key[crypto_stream_chacha20_ietf_KEYBYTES];
+    uint32_t principal_count;
+    uint32_t reserved;
+    uint64_t principals[CXL_SEC_MAX_PRINCIPALS];
+} CxlSecEntry;
+
+typedef struct {
+    char magic[8];
+    uint32_t version;
+    uint32_t entry_count;
+    CxlSecEntry entries[CXL_SEC_MAX_ENTRIES];
+} CxlSecTable;
+
+struct sec_req {
+    uint32_t magic_be;
+    uint16_t version_be;
+    uint16_t type_be;
+    uint64_t principal_be;
+    uint64_t offset_be;
+    uint32_t length_be;
+    uint32_t reserved_be;
+};
+
+struct sec_resp {
+    uint32_t magic_be;
+    uint16_t version_be;
+    uint16_t status_be;
+    uint32_t reserved_be;
+};
+
 /* Only grab a lock when >1 thread shares the same ring (protect head/tail). */
 static int use_lock = 0;
 static pthread_mutex_t req_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t resp_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int sec_enabled = 0;
+static int sec_fd = -1;
+static uint32_t sec_node_id = 0;
+static uint64_t sec_principal = 0;
+static pthread_mutex_t sec_mgr_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static volatile int running = 1;
 static void handle_sig(int sig) { (void)sig; running = 0; }
@@ -44,6 +105,7 @@ struct ring_info {
     size_t req_off, req_sz;
     size_t resp_off, resp_sz;
     uint32_t slots;
+    uint32_t ring_idx;
 };
 
 struct layout {
@@ -99,6 +161,188 @@ static inline uint64_t nowns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void sleep_ms(unsigned ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000U;
+    ts.tv_nsec = (long)(ms % 1000U) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+}
+
+static int parse_hostport(const char *s, char **host_out, char **port_out) {
+    const char *colon = strrchr(s, ':');
+    if (!colon || colon == s || *(colon + 1) == '\0') return -1;
+    size_t host_len = (size_t)(colon - s);
+    char *host = (char *)calloc(host_len + 1, 1);
+    char *port = strdup(colon + 1);
+    if (!host || !port) {
+        free(host);
+        free(port);
+        return -1;
+    }
+    memcpy(host, s, host_len);
+    host[host_len] = '\0';
+    *host_out = host;
+    *port_out = port;
+    return 0;
+}
+
+static int socket_connect(const char *host, const char *port) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *res = NULL;
+    int rc = getaddrinfo(host, port, &hints, &res);
+    if (rc != 0) {
+        fprintf(stderr, "[!] getaddrinfo(connect %s:%s): %s\n", host, port, gai_strerror(rc));
+        return -1;
+    }
+
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+
+    freeaddrinfo(res);
+    return fd;
+}
+
+static ssize_t read_full(int fd, void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, (unsigned char *)buf + off, n - off);
+        if (r == 0) return (ssize_t)off;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)r;
+    }
+    return (ssize_t)off;
+}
+
+static int write_full(int fd, const void *buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, (const unsigned char *)buf + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+static CxlSecTable *sec_table(unsigned char *mm) {
+    return (CxlSecTable *)(mm + CXL_SEC_TABLE_OFF);
+}
+
+static const CxlSecEntry *sec_find_entry(unsigned char *mm, uint64_t off, uint64_t len) {
+    if (!mm || len == 0) return NULL;
+    uint64_t end = off + len;
+    if (end < off) return NULL;
+    CxlSecTable *t = sec_table(mm);
+    if (memcmp(t->magic, CXL_SEC_MAGIC, 8) != 0 || t->version != CXL_SEC_VERSION) return NULL;
+    uint32_t n = t->entry_count;
+    if (n > CXL_SEC_MAX_ENTRIES) n = CXL_SEC_MAX_ENTRIES;
+    for (uint32_t i = 0; i < n; i++) {
+        const CxlSecEntry *e = &t->entries[i];
+        if (off >= e->start_off && end <= e->end_off) return e;
+    }
+    return NULL;
+}
+
+static int sec_entry_has_principal(const CxlSecEntry *e, uint64_t principal) {
+    if (!e) return 0;
+    uint32_t n = e->principal_count;
+    if (n > CXL_SEC_MAX_PRINCIPALS) n = CXL_SEC_MAX_PRINCIPALS;
+    for (uint32_t i = 0; i < n; i++) {
+        if (e->principals[i] == principal) return 1;
+    }
+    return 0;
+}
+
+static int sec_connect_mgr(const char *addr) {
+    char *host = NULL, *port = NULL;
+    if (parse_hostport(addr, &host, &port) != 0) return -1;
+    int fd = socket_connect(host, port);
+    free(host);
+    free(port);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return fd;
+}
+
+static int sec_wait_table_ready(unsigned char *mm, unsigned timeout_ms) {
+    unsigned waited = 0;
+    while (waited < timeout_ms) {
+        CxlSecTable *t = sec_table(mm);
+        if (memcmp(t->magic, CXL_SEC_MAGIC, 8) == 0 && t->version == CXL_SEC_VERSION) return 0;
+        sleep_ms(10);
+        waited += 10;
+    }
+    return -1;
+}
+
+static int sec_request_access(uint64_t off, uint32_t len) {
+    if (sec_fd < 0) return -1;
+    struct sec_req req;
+    memset(&req, 0, sizeof(req));
+    req.magic_be = htonl(SEC_PROTO_MAGIC);
+    req.version_be = htons(SEC_PROTO_VERSION);
+    req.type_be = htons(SEC_REQ_ACCESS);
+    req.principal_be = htobe64(sec_principal);
+    req.offset_be = htobe64(off);
+    req.length_be = htonl(len);
+
+    pthread_mutex_lock(&sec_mgr_lock);
+    int ok = 0;
+    if (write_full(sec_fd, &req, sizeof(req)) != 0) ok = -1;
+    struct sec_resp resp;
+    if (ok == 0) {
+        ssize_t r = read_full(sec_fd, &resp, sizeof(resp));
+        if (r != (ssize_t)sizeof(resp)) ok = -1;
+        else {
+            uint32_t magic = ntohl(resp.magic_be);
+            uint16_t ver = ntohs(resp.version_be);
+            uint16_t status = ntohs(resp.status_be);
+            if (magic != SEC_PROTO_MAGIC || ver != SEC_PROTO_VERSION || status != SEC_STATUS_OK) ok = -1;
+        }
+    }
+    pthread_mutex_unlock(&sec_mgr_lock);
+    return ok;
+}
+
+static int sec_ensure_access(unsigned char *mm, uint64_t off, uint64_t len) {
+    if (!sec_enabled) return 0;
+    for (int tries = 0; tries < 3; tries++) {
+        const CxlSecEntry *e = sec_find_entry(mm, off, len);
+        if (!e) return -1;
+        if (sec_entry_has_principal(e, sec_principal)) return 0;
+        if (sec_request_access(off, (uint32_t)(len > 0xffffffffu ? 0xffffffffu : len)) != 0) return -1;
+        sleep_ms(1);
+    }
+    return -1;
+}
+
+static void sec_crypt(unsigned char *buf, size_t len, uint8_t direction, uint8_t ring_idx, uint64_t seq,
+                      const unsigned char key[crypto_stream_chacha20_ietf_KEYBYTES]) {
+    unsigned char nonce[crypto_stream_chacha20_ietf_NONCEBYTES];
+    memset(nonce, 0, sizeof(nonce));
+    nonce[0] = direction;
+    nonce[1] = ring_idx;
+    memcpy(nonce + 4, &seq, sizeof(seq));
+    crypto_stream_chacha20_ietf_xor(buf, buf, (unsigned long long)len, nonce, key);
 }
 
 static void tsq_init(struct ts_queue *q, int cap) {
@@ -210,6 +454,7 @@ static int load_layout(unsigned char *mm, struct layout *lo) {
         lo->rings[i].resp_off = (size_t)resp_off;
         lo->rings[i].resp_sz = (size_t)resp_sz;
         lo->rings[i].slots = (req_sz > 16) ? (req_sz - 16) / SLOT_SIZE : 1;
+        lo->rings[i].ring_idx = i;
     }
     return 0;
 }
@@ -230,6 +475,14 @@ static int ring_push(unsigned char *mm, const struct ring_info *ri, uint32_t cid
     memcpy(mm + slot_off + 12, &reserved, 4);
     memcpy(mm + slot_off + 16, payload, len);
     if (SLOT_SIZE > 16 + len) memset(mm + slot_off + 16 + len, 0, SLOT_SIZE - 16 - len);
+    if (sec_enabled) {
+        uint64_t payload_off = (uint64_t)(slot_off + 16);
+        size_t crypt_len = SLOT_SIZE - 16;
+        if (sec_ensure_access(mm, payload_off, crypt_len) != 0) return -1;
+        const CxlSecEntry *e = sec_find_entry(mm, payload_off, crypt_len);
+        if (!e || !sec_entry_has_principal(e, sec_principal)) return -1;
+        sec_crypt(mm + payload_off, crypt_len, 1 /* REQ */, (uint8_t)ri->ring_idx, head, e->key);
+    }
     head++;
     memcpy(mm + ri->req_off, &head, 8);
     return 1;
@@ -245,6 +498,14 @@ static int ring_pop(unsigned char *mm, const struct ring_info *ri, uint32_t *cid
     memcpy(cid, mm + slot_off, 4);
     memcpy(type, mm + slot_off + 4, 2);
     memcpy(len, mm + slot_off + 8, 4);
+    if (sec_enabled) {
+        uint64_t payload_off = (uint64_t)(slot_off + 16);
+        size_t crypt_len = SLOT_SIZE - 16;
+        if (sec_ensure_access(mm, payload_off, crypt_len) != 0) return -1;
+        const CxlSecEntry *e = sec_find_entry(mm, payload_off, crypt_len);
+        if (!e || !sec_entry_has_principal(e, sec_principal)) return -1;
+        sec_crypt(mm + payload_off, crypt_len, 2 /* RESP */, (uint8_t)ri->ring_idx, tail, e->key);
+    }
     if (*len > SLOT_SIZE - 16) *len = SLOT_SIZE - 16;
     *payload = mm + slot_off + 16;
     tail++;
@@ -593,6 +854,12 @@ int main(int argc, char **argv) {
     int collect_cost = 0;
     const char *csv_path = "results/ring_metrics.csv";
     const char *label = "ring";
+    int secure = 0;
+    const char *sec_mgr = getenv("CXL_SEC_MGR");
+    unsigned sec_timeout_ms = 10000;
+
+    const char *sec_node_env = getenv("CXL_SEC_NODE_ID");
+    uint32_t sec_node = sec_node_env ? (uint32_t)strtoul(sec_node_env, NULL, 0) : 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--path") && i + 1 < argc) path = argv[++i];
@@ -606,6 +873,17 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cost")) collect_cost = 1;
         else if (!strcmp(argv[i], "--csv") && i + 1 < argc) csv_path = argv[++i];
         else if (!strcmp(argv[i], "--label") && i + 1 < argc) label = argv[++i];
+        else if (!strcmp(argv[i], "--secure")) secure = 1;
+        else if (!strcmp(argv[i], "--sec-mgr") && i + 1 < argc) sec_mgr = argv[++i];
+        else if (!strcmp(argv[i], "--sec-node-id") && i + 1 < argc) sec_node = (uint32_t)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--sec-timeout-ms") && i + 1 < argc) sec_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            printf("Usage: %s [--path <ring>] [--map-size <bytes>] [--bench N] [--pipeline] [--threads N]\n"
+                   "          [--max-inflight N] [--latency] [--cost] [--csv <path>] [--label <name>]\n"
+                   "          [--secure --sec-mgr <ip:port> --sec-node-id <n>]\n",
+                   argv[0]);
+            return 0;
+        }
     }
 
     signal(SIGINT, handle_sig);
@@ -630,8 +908,46 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (ring_idx < 0 || ring_idx >= (int)lo.ring_count) ring_idx = 0;
-    printf("[*] ring direct: path=%s map=%zu ring_count=%u using_ring=%d slots=%u\n",
-           path, map_size, lo.ring_count, ring_idx, lo.rings[ring_idx].slots);
+    printf("[*] ring direct: path=%s map=%zu ring_count=%u using_ring=%d slots=%u secure=%d\n",
+           path, map_size, lo.ring_count, ring_idx, lo.rings[ring_idx].slots, secure);
+
+    if (secure) {
+        if (!sec_mgr || !sec_mgr[0]) {
+            fprintf(stderr, "[!] --secure requires --sec-mgr <ip:port> (or set CXL_SEC_MGR)\n");
+            munmap(mm, map_size);
+            close(fd);
+            return 1;
+        }
+        if (sodium_init() < 0) {
+            fprintf(stderr, "[!] sodium_init failed\n");
+            munmap(mm, map_size);
+            close(fd);
+            return 1;
+        }
+        sec_enabled = 1;
+        sec_node_id = sec_node;
+        sec_principal = ((uint64_t)sec_node_id << 32) | (uint32_t)getpid();
+        sec_fd = sec_connect_mgr(sec_mgr);
+        if (sec_fd < 0) {
+            fprintf(stderr, "[!] failed to connect sec mgr: %s\n", sec_mgr);
+            munmap(mm, map_size);
+            close(fd);
+            return 1;
+        }
+        if (sec_wait_table_ready(mm, sec_timeout_ms) != 0) {
+            fprintf(stderr, "[!] timeout waiting for sec table (offset=%u)\n", (unsigned)CXL_SEC_TABLE_OFF);
+            close(sec_fd);
+            sec_fd = -1;
+            munmap(mm, map_size);
+            close(fd);
+            return 1;
+        }
+        /* Pre-grant access for all req/resp regions to avoid concurrent first-touch across threads. */
+        for (uint32_t i = 0; i < lo.ring_count; i++) {
+            (void)sec_request_access((uint64_t)lo.rings[i].req_off, 1);
+            (void)sec_request_access((uint64_t)lo.rings[i].resp_off, 1);
+        }
+    }
 
     if (bench_n > 0) {
         run_bench(mm, &lo, bench_n, pipeline, threads, max_inflight, collect_latency, collect_cost, csv_path, label);
@@ -650,5 +966,6 @@ int main(int argc, char **argv) {
 
     munmap(mm, map_size);
     close(fd);
+    if (sec_fd >= 0) close(sec_fd);
     return 0;
 }

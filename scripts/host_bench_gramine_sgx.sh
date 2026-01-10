@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Compare native Redis (no Gramine), native Redis (TCP/RESP) under Gramine SGX,
-# libsodium-encrypted TCP (user-space tunnel), and ring Redis (shared-memory, no RESP).
+# libsodium-encrypted TCP (user-space tunnel), ring Redis (shared-memory, no RESP),
+# and secure ring Redis (ACL table + software crypto in shared memory).
 #
 # This script does NOT use QEMU VMs. It is meant for machines where SGX works
 # on the host OS (i.e., `/dev/sgx_enclave` exists and AESM is running).
@@ -29,6 +30,10 @@ set -euo pipefail
 #   SODIUM_KEY_HEX: pre-shared key for libsodium tunnel (hex64, default: deterministic test key)
 #   SODIUM_PORT  : tunnel server listen port on loopback (default: 18379)
 #   SODIUM_LOCAL_PORT: tunnel client listen port on loopback (default: 18479)
+#   SEC_MGR_PORT : TCP port for cxl_sec_mgr (default: 19001)
+#   BENCH_CPU_NODE: optional host NUMA node to pin benchmark processes (cpu+mem), e.g. 0
+#   CXL_MEM_NODE : optional host NUMA node to allocate the ring backing pages on (simulate “remote” CXL memory), e.g. 1
+#   INSTALL_NUMACTL: 1 to auto-install numactl via apt when needed (default: 1)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
@@ -54,11 +59,26 @@ MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
 SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
 INSTALL_GRAMINE="${INSTALL_GRAMINE:-1}"
 INSTALL_LIBSODIUM="${INSTALL_LIBSODIUM:-1}"
+INSTALL_NUMACTL="${INSTALL_NUMACTL:-1}"
 GRAMINE_CODENAME="${GRAMINE_CODENAME:-}"
 
 SODIUM_KEY_HEX="${SODIUM_KEY_HEX:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
 SODIUM_PORT="${SODIUM_PORT:-18379}"
 SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-18479}"
+SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
+
+BENCH_CPU_NODE="${BENCH_CPU_NODE:-}"
+CXL_MEM_NODE="${CXL_MEM_NODE:-}"
+
+BENCH_NUMA_PREFIX=""
+if [[ -n "${BENCH_CPU_NODE}" ]]; then
+  BENCH_NUMA_PREFIX="numactl --cpunodebind=${BENCH_CPU_NODE} --membind=${BENCH_CPU_NODE} "
+fi
+
+CXL_ALLOC_NUMA_PREFIX=""
+if [[ -n "${CXL_MEM_NODE}" ]]; then
+  CXL_ALLOC_NUMA_PREFIX="numactl --cpunodebind=${CXL_MEM_NODE} --membind=${CXL_MEM_NODE} "
+fi
 
 apt_retry_lock() {
   local desc="$1"
@@ -183,6 +203,19 @@ install_libsodium_apt() {
   apt_retry_lock "apt-get install libsodium-dev" apt-get install -y libsodium-dev
 }
 
+install_numactl_apt() {
+  if command -v numactl >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "[!] numactl not found and apt-get is unavailable; install numactl manually." >&2
+    return 1
+  fi
+  echo "[*] Installing numactl (apt) ..."
+  apt_retry_lock "apt-get update (numactl)" apt-get update
+  apt_retry_lock "apt-get install numactl" apt-get install -y numactl
+}
+
 need_cmd() {
   local cmd="$1"
   if command -v "${cmd}" >/dev/null 2>&1; then
@@ -202,6 +235,9 @@ need_cmd() {
     ss)
       echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y iproute2" >&2
       ;;
+    numactl)
+      echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y numactl" >&2
+      ;;
     gramine-manifest|gramine-sgx|gramine-sgx-sign)
       echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y gramine" >&2
       ;;
@@ -212,6 +248,21 @@ need_cmd() {
       ;;
   esac
   return 1
+}
+
+check_numa_node_exists() {
+  local node="$1"
+  local var="$2"
+  if [[ -z "${node}" ]]; then
+    return 0
+  fi
+  if [[ ! -d "/sys/devices/system/node/node${node}" ]]; then
+    echo "[!] ${var}=${node} but /sys/devices/system/node/node${node} not found." >&2
+    echo "    Available nodes:" >&2
+    ls -d /sys/devices/system/node/node* 2>/dev/null >&2 || true
+    return 1
+  fi
+  return 0
 }
 
 check_sgx_host() {
@@ -273,6 +324,14 @@ port_in_use() {
 
 check_prereqs() {
   check_sgx_host
+  if [[ -n "${BENCH_CPU_NODE}" || -n "${CXL_MEM_NODE}" ]]; then
+    if [[ "${INSTALL_NUMACTL}" == "1" ]]; then
+      install_numactl_apt
+    fi
+    need_cmd numactl
+    check_numa_node_exists "${BENCH_CPU_NODE}" "BENCH_CPU_NODE"
+    check_numa_node_exists "${CXL_MEM_NODE}" "CXL_MEM_NODE"
+  fi
   if [[ "${INSTALL_GRAMINE}" == "1" ]]; then
     install_gramine_apt
   fi
@@ -298,6 +357,8 @@ cleanup_tmux() {
   tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true
   tmux kill-session -t redis_native_sgx >/dev/null 2>&1 || true
   tmux kill-session -t redis_ring_sgx >/dev/null 2>&1 || true
+  tmux kill-session -t redis_ring_sgx_secure >/dev/null 2>&1 || true
+  tmux kill-session -t cxl_sec_mgr >/dev/null 2>&1 || true
   tmux kill-session -t sodium_server >/dev/null 2>&1 || true
   tmux kill-session -t sodium_client >/dev/null 2>&1 || true
 }
@@ -329,6 +390,11 @@ if port_in_use "${SODIUM_LOCAL_PORT}"; then
   echo "    Set SODIUM_LOCAL_PORT=<free-port> and rerun." >&2
   exit 1
 fi
+if port_in_use "${SEC_MGR_PORT}"; then
+  echo "[!] SEC_MGR_PORT already in use: ${SEC_MGR_PORT}" >&2
+  echo "    Set SEC_MGR_PORT=<free-port> and rerun." >&2
+  exit 1
+fi
 
 check_prereqs
 
@@ -341,7 +407,18 @@ echo "[*] Building Redis (ring version) ..."
 make -C "${ROOT}/redis/src" -j"$(nproc)" MALLOC=libc USE_LTO=no CFLAGS='-O2 -fno-lto' LDFLAGS='-fno-lto'
 
 echo "[*] Building ring client (/tmp/cxl_ring_direct) ..."
-gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct "${ROOT}/ring_client/cxl_ring_direct.c"
+gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct "${ROOT}/ring_client/cxl_ring_direct.c" -lsodium
+
+echo "[*] Building cxl_prefault (/tmp/cxl_prefault) ..."
+gcc -O2 -Wall -Wextra -std=gnu11 -o /tmp/cxl_prefault "${ROOT}/scripts/cxl_prefault.c"
+
+if [[ -n "${CXL_MEM_NODE}" ]]; then
+  echo "[*] NUMA: pre-faulting ring backing file on node ${CXL_MEM_NODE} (simulate remote CXL memory) ..."
+  ${CXL_ALLOC_NUMA_PREFIX}/tmp/cxl_prefault "${RING_PATH}" "${RING_MAP_SIZE}"
+fi
+
+echo "[*] Building cxl_sec_mgr (/tmp/cxl_sec_mgr) ..."
+make -C "${ROOT}/cxl_sec_mgr" BIN=/tmp/cxl_sec_mgr
 
 echo "[*] Building libsodium tunnel (/tmp/cxl_sodium_tunnel) ..."
 make -C "${ROOT}/sodium_tunnel" BIN=/tmp/cxl_sodium_tunnel
@@ -390,11 +467,13 @@ native_log="${RESULTS_DIR}/sgx_native_tcp_${ts}.log"
 sodium_log="${RESULTS_DIR}/sgx_sodium_tcp_${ts}.log"
 ring_log="${RESULTS_DIR}/sgx_ring_${ts}.log"
 ring_csv="${RESULTS_DIR}/sgx_ring_${ts}.csv"
+ring_secure_log="${RESULTS_DIR}/sgx_ring_secure_${ts}.log"
+ring_secure_csv="${RESULTS_DIR}/sgx_ring_secure_${ts}.csv"
 compare_csv="${RESULTS_DIR}/sgx_compare_${ts}.csv"
 
-echo "[*] Benchmark 1/4: native Redis (no Gramine) (TCP)"
+echo "[*] Benchmark 1/5: native Redis (no Gramine) (TCP)"
 rm -f "${plain_dir}/dump.rdb" >/dev/null 2>&1 || true
-tmux new-session -d -s redis_plain_tcp "redis-server '${ROOT}/gramine/redis.conf' --bind 127.0.0.1 --port '${PLAIN_PORT}' --dir '${plain_dir}' --dbfilename dump.rdb >/tmp/redis_plain_tcp.log 2>&1"
+tmux new-session -d -s redis_plain_tcp "${BENCH_NUMA_PREFIX}redis-server '${ROOT}/gramine/redis.conf' --bind 127.0.0.1 --port '${PLAIN_PORT}' --dir '${plain_dir}' --dbfilename dump.rdb >/tmp/redis_plain_tcp.log 2>&1"
 for _ in $(seq 1 120); do
   redis-cli -p "${PLAIN_PORT}" ping >/dev/null 2>&1 && break
   sleep 0.25
@@ -404,13 +483,13 @@ if ! redis-cli -p "${PLAIN_PORT}" ping >/dev/null 2>&1; then
   tail -n 200 /tmp/redis_plain_tcp.log >&2 || true
   exit 1
 fi
-redis-benchmark -h 127.0.0.1 -p "${PLAIN_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${plain_log}"
+${BENCH_NUMA_PREFIX}redis-benchmark -h 127.0.0.1 -p "${PLAIN_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${plain_log}"
 redis-cli -p "${PLAIN_PORT}" shutdown nosave >/dev/null 2>&1 || true
 tmux kill-session -t redis_plain_tcp >/dev/null 2>&1 || true
 rm -rf "${plain_dir}" >/dev/null 2>&1 || true
 
-echo "[*] Benchmark 2/4: native Redis under Gramine SGX (TCP)"
-tmux new-session -d -s redis_native_sgx "cd '${ROOT}/gramine' && gramine-sgx ./redis-native /repo/gramine/redis.conf --port '${NATIVE_PORT}' >/tmp/redis_native_sgx.log 2>&1"
+echo "[*] Benchmark 2/5: native Redis under Gramine SGX (TCP)"
+tmux new-session -d -s redis_native_sgx "cd '${ROOT}/gramine' && ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-native /repo/gramine/redis.conf --port '${NATIVE_PORT}' >/tmp/redis_native_sgx.log 2>&1"
 for _ in $(seq 1 120); do
   redis-cli -p "${NATIVE_PORT}" ping >/dev/null 2>&1 && break
   sleep 0.25
@@ -421,14 +500,14 @@ if ! redis-cli -p "${NATIVE_PORT}" ping >/dev/null 2>&1; then
   exit 1
 fi
 
-redis-benchmark -h 127.0.0.1 -p "${NATIVE_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${native_log}"
+${BENCH_NUMA_PREFIX}redis-benchmark -h 127.0.0.1 -p "${NATIVE_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${native_log}"
 
-echo "[*] Benchmark 3/4: native Redis over libsodium-encrypted TCP (tunnel)"
+echo "[*] Benchmark 3/5: native Redis over libsodium-encrypted TCP (tunnel)"
 tmux kill-session -t sodium_server >/dev/null 2>&1 || true
 tmux kill-session -t sodium_client >/dev/null 2>&1 || true
 
-tmux new-session -d -s sodium_server "/tmp/cxl_sodium_tunnel --mode server --listen 127.0.0.1:${SODIUM_PORT} --backend 127.0.0.1:${NATIVE_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_server_${ts}.log 2>&1"
-tmux new-session -d -s sodium_client "/tmp/cxl_sodium_tunnel --mode client --listen 127.0.0.1:${SODIUM_LOCAL_PORT} --connect 127.0.0.1:${SODIUM_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_client_${ts}.log 2>&1"
+tmux new-session -d -s sodium_server "${BENCH_NUMA_PREFIX}/tmp/cxl_sodium_tunnel --mode server --listen 127.0.0.1:${SODIUM_PORT} --backend 127.0.0.1:${NATIVE_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_server_${ts}.log 2>&1"
+tmux new-session -d -s sodium_client "${BENCH_NUMA_PREFIX}/tmp/cxl_sodium_tunnel --mode client --listen 127.0.0.1:${SODIUM_LOCAL_PORT} --connect 127.0.0.1:${SODIUM_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_client_${ts}.log 2>&1"
 
 for _ in $(seq 1 120); do
   redis-cli -h 127.0.0.1 -p "${SODIUM_LOCAL_PORT}" ping >/dev/null 2>&1 && break
@@ -441,7 +520,7 @@ if ! redis-cli -h 127.0.0.1 -p "${SODIUM_LOCAL_PORT}" ping >/dev/null 2>&1; then
   exit 1
 fi
 
-redis-benchmark -h 127.0.0.1 -p "${SODIUM_LOCAL_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${sodium_log}"
+${BENCH_NUMA_PREFIX}redis-benchmark -h 127.0.0.1 -p "${SODIUM_LOCAL_PORT}" -t set,get -n "${REQ_N}" -c "${CLIENTS}" --threads "${THREADS}" -P "${PIPELINE}" | tee "${sodium_log}"
 
 tmux kill-session -t sodium_client >/dev/null 2>&1 || true
 tmux kill-session -t sodium_server >/dev/null 2>&1 || true
@@ -449,14 +528,14 @@ tmux kill-session -t sodium_server >/dev/null 2>&1 || true
 redis-cli -p "${NATIVE_PORT}" shutdown nosave >/dev/null 2>&1 || true
 tmux kill-session -t redis_native_sgx >/dev/null 2>&1 || true
 
-echo "[*] Benchmark 4/4: ring Redis under Gramine SGX (shared memory)"
-tmux new-session -d -s redis_ring_sgx "cd '${ROOT}/gramine' && gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx.log 2>&1"
+echo "[*] Benchmark 4/5: ring Redis under Gramine SGX (shared memory)"
+tmux new-session -d -s redis_ring_sgx "cd '${ROOT}/gramine' && ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx.log 2>&1"
 
 for _ in $(seq 1 200); do
-  timeout 2 /tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1 && break
+  ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1 && break
   sleep 0.25
 done
-if ! timeout 2 /tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1; then
+if ! ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1; then
   echo "[!] ring transport not ready (SGX). Dumping diagnostics..." >&2
   tail -n 200 /tmp/redis_ring_sgx.log >&2 || true
   exit 1
@@ -465,12 +544,41 @@ fi
 ring_label="sgx_ring_${ts}"
 ring_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
 cd /tmp
-/tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" \
+${BENCH_NUMA_PREFIX}/tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" \
   --bench "${ring_n_per_thread}" --pipeline --threads "${THREADS}" --max-inflight "${MAX_INFLIGHT}" \
   --latency --cost --csv "/tmp/${ring_label}.csv" --label "${ring_label}" | tee "${ring_log}"
 cat "/tmp/${ring_label}.csv" > "${ring_csv}"
 
 tmux kill-session -t redis_ring_sgx >/dev/null 2>&1 || true
+
+echo "[*] Benchmark 5/5: secure ring Redis under Gramine SGX (ACL + software crypto)"
+tmux new-session -d -s cxl_sec_mgr "${BENCH_NUMA_PREFIX}/tmp/cxl_sec_mgr --ring '${RING_PATH}' --listen 127.0.0.1:${SEC_MGR_PORT} --map-size '${RING_MAP_SIZE}' >/tmp/cxl_sec_mgr_${ts}.log 2>&1"
+tmux new-session -d -s redis_ring_sgx_secure "cd '${ROOT}/gramine' && CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx_secure.log 2>&1"
+
+for _ in $(seq 1 200); do
+  ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
+    --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1 && break
+  sleep 0.25
+done
+if ! ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
+  --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >/dev/null 2>&1; then
+  echo "[!] secure ring transport not ready (SGX). Dumping diagnostics..." >&2
+  tail -n 200 /tmp/redis_ring_sgx_secure.log >&2 || true
+  tail -n 200 /tmp/cxl_sec_mgr_"${ts}".log >&2 || true
+  exit 1
+fi
+
+ring_secure_label="sgx_ring_secure_${ts}"
+ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
+cd /tmp
+${BENCH_NUMA_PREFIX}/tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
+  --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" \
+  --bench "${ring_secure_n_per_thread}" --pipeline --threads "${THREADS}" --max-inflight "${MAX_INFLIGHT}" \
+  --latency --cost --csv "/tmp/${ring_secure_label}.csv" --label "${ring_secure_label}" | tee "${ring_secure_log}"
+cat "/tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
+
+tmux kill-session -t redis_ring_sgx_secure >/dev/null 2>&1 || true
+tmux kill-session -t cxl_sec_mgr >/dev/null 2>&1 || true
 
 plain_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${plain_log}" || true)"
 plain_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${plain_log}" || true)"
@@ -480,6 +588,8 @@ sodium_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{
 sodium_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
 ring_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_csv}" || true)"
 ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
+ring_secure_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_secure_csv}" || true)"
+ring_secure_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_secure_csv}" || true)"
 
 {
   echo "label,op,throughput_rps"
@@ -491,6 +601,8 @@ ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
   echo "GramineSGXSodiumTCP,GET,${sodium_get}"
   echo "GramineSGXRing,SET,${ring_set}"
   echo "GramineSGXRing,GET,${ring_get}"
+  echo "GramineSGXRingSecure,SET,${ring_secure_set}"
+  echo "GramineSGXRingSecure,GET,${ring_secure_get}"
 } > "${compare_csv}"
 
 echo "[+] Done."
@@ -499,4 +611,6 @@ echo "    ${native_log}"
 echo "    ${sodium_log}"
 echo "    ${ring_log}"
 echo "    ${ring_csv}"
+echo "    ${ring_secure_log}"
+echo "    ${ring_secure_csv}"
 echo "    ${compare_csv}"
