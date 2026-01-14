@@ -92,6 +92,10 @@ static int use_lock = 0;
 static pthread_mutex_t req_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t resp_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* Optional: inject artificial latency on each shared-memory ring access. */
+static uint64_t shm_delay_ns = 0;
+static uint64_t shm_pause_iters_per_ns_x1024 = 0;
+
 static int sec_enabled = 0;
 static int sec_fd = -1;
 static uint32_t sec_node_id = 0;
@@ -161,6 +165,30 @@ static inline uint64_t nowns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void shm_delay_calibrate(void) {
+    if (shm_pause_iters_per_ns_x1024) return;
+    const uint64_t iters = 5000000ULL;
+    uint64_t start = nowns();
+    for (uint64_t i = 0; i < iters; i++) {
+        __asm__ __volatile__("pause");
+    }
+    uint64_t dt = nowns() - start;
+    if (dt == 0) dt = 1;
+    shm_pause_iters_per_ns_x1024 = (iters * 1024ULL) / dt;
+    if (shm_pause_iters_per_ns_x1024 == 0) shm_pause_iters_per_ns_x1024 = 1;
+}
+
+static inline void shm_delay(void) {
+    uint64_t ns = shm_delay_ns;
+    if (!ns) return;
+    if (!shm_pause_iters_per_ns_x1024) shm_delay_calibrate();
+    uint64_t iters = (ns * shm_pause_iters_per_ns_x1024 + 1023ULL) / 1024ULL;
+    if (iters == 0) iters = 1;
+    for (uint64_t i = 0; i < iters; i++) {
+        __asm__ __volatile__("pause");
+    }
 }
 
 static void sleep_ms(unsigned ms) {
@@ -460,6 +488,7 @@ static int load_layout(unsigned char *mm, struct layout *lo) {
 }
 
 static int ring_push(unsigned char *mm, const struct ring_info *ri, uint32_t cid, uint16_t type, const unsigned char *payload, uint32_t len) {
+    shm_delay();
     uint64_t head = 0, tail = 0;
     memcpy(&head, mm + ri->req_off, 8);
     memcpy(&tail, mm + ri->req_off + 8, 8);
@@ -489,6 +518,7 @@ static int ring_push(unsigned char *mm, const struct ring_info *ri, uint32_t cid
 }
 
 static int ring_pop(unsigned char *mm, const struct ring_info *ri, uint32_t *cid, uint16_t *type, unsigned char **payload, uint32_t *len) {
+    shm_delay();
     uint64_t head = 0, tail = 0;
     memcpy(&head, mm + ri->resp_off, 8);
     memcpy(&tail, mm + ri->resp_off + 8, 8);
@@ -906,6 +936,13 @@ int main(int argc, char **argv) {
     unsigned sec_timeout_ms = 10000;
     unsigned ping_timeout_ms = 0;
 
+    const char *delay_env = getenv("CXL_SHM_DELAY_NS");
+    if (delay_env && delay_env[0]) {
+        errno = 0;
+        unsigned long long v = strtoull(delay_env, NULL, 0);
+        if (errno == 0) shm_delay_ns = (uint64_t)v;
+    }
+
     const char *sec_node_env = getenv("CXL_SEC_NODE_ID");
     uint32_t sec_node = sec_node_env ? (uint32_t)strtoul(sec_node_env, NULL, 0) : 0;
 
@@ -958,8 +995,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (ring_idx < 0 || ring_idx >= (int)lo.ring_count) ring_idx = 0;
-    printf("[*] ring direct: path=%s map=%zu ring_count=%u using_ring=%d slots=%u secure=%d\n",
-           path, map_size, lo.ring_count, ring_idx, lo.rings[ring_idx].slots, secure);
+    printf("[*] ring direct: path=%s map=%zu ring_count=%u using_ring=%d slots=%u secure=%d shm_delay_ns=%llu\n",
+           path, map_size, lo.ring_count, ring_idx, lo.rings[ring_idx].slots, secure,
+           (unsigned long long)shm_delay_ns);
 
     if (secure) {
         if (!sec_mgr || !sec_mgr[0]) {

@@ -34,6 +34,8 @@ set -euo pipefail
 #   BENCH_CPU_NODE: optional host NUMA node to pin benchmark processes (cpu+mem), e.g. 0
 #   CXL_MEM_NODE : optional host NUMA node to allocate the ring backing pages on (simulate “remote” CXL memory), e.g. 1
 #   INSTALL_NUMACTL: 1 to auto-install numactl via apt when needed (default: 1)
+#   CXL_SHM_DELAY_NS: inject artificial latency on each shared-memory ring access (ns). If unset and host has <2 NUMA nodes, auto-defaults to CXL_SHM_DELAY_NS_DEFAULT.
+#   CXL_SHM_DELAY_NS_DEFAULT: default delay to use on 1-NUMA hosts when CXL_SHM_DELAY_NS is unset (default: 150).
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
@@ -69,6 +71,37 @@ SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
 
 BENCH_CPU_NODE="${BENCH_CPU_NODE:-}"
 CXL_MEM_NODE="${CXL_MEM_NODE:-}"
+
+CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS:-}"
+CXL_SHM_DELAY_NS_DEFAULT="${CXL_SHM_DELAY_NS_DEFAULT:-150}"
+
+host_numa_node_count() {
+  local n=0
+  for d in /sys/devices/system/node/node[0-9]*; do
+    [[ -d "${d}" ]] && n=$((n + 1))
+  done
+  if [[ "${n}" -le 0 ]]; then
+    n=1
+  fi
+  echo "${n}"
+}
+
+HOST_NUMA_NODES="$(host_numa_node_count)"
+if [[ "${HOST_NUMA_NODES}" -lt 2 ]]; then
+  if [[ -z "${CXL_SHM_DELAY_NS}" ]]; then
+    CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS_DEFAULT}"
+    echo "[*] Host has ${HOST_NUMA_NODES} NUMA node(s); enabling simulated CXL shared-memory latency: CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} (ns)."
+    echo "    Override: CXL_SHM_DELAY_NS=0 (disable) or set a custom ns value."
+  fi
+  if [[ -n "${BENCH_CPU_NODE}" && "${BENCH_CPU_NODE}" != "0" ]]; then
+    echo "[!] BENCH_CPU_NODE=${BENCH_CPU_NODE} but host has only ${HOST_NUMA_NODES} NUMA node(s); ignoring BENCH_CPU_NODE." >&2
+    BENCH_CPU_NODE=""
+  fi
+  if [[ -n "${CXL_MEM_NODE}" && "${CXL_MEM_NODE}" != "0" ]]; then
+    echo "[!] CXL_MEM_NODE=${CXL_MEM_NODE} but host has only ${HOST_NUMA_NODES} NUMA node(s); ignoring CXL_MEM_NODE." >&2
+    CXL_MEM_NODE=""
+  fi
+fi
 
 BENCH_NUMA_PREFIX=""
 if [[ -n "${BENCH_CPU_NODE}" ]]; then
@@ -529,16 +562,16 @@ redis-cli -p "${NATIVE_PORT}" shutdown nosave >/dev/null 2>&1 || true
 tmux kill-session -t redis_native_sgx >/dev/null 2>&1 || true
 
 echo "[*] Benchmark 4/5: ring Redis under Gramine SGX (shared memory)"
-tmux new-session -d -s redis_ring_sgx "cd '${ROOT}/gramine' && ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx.log 2>&1"
+tmux new-session -d -s redis_ring_sgx "cd '${ROOT}/gramine' && CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx.log 2>&1"
 
 ring_ready_out="/tmp/cxl_ring_ready_${ts}.log"
 for _ in $(seq 1 200); do
-  if ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --ping-timeout-ms 1000 --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_ready_out}" 2>&1; then
+  if CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --ping-timeout-ms 1000 --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_ready_out}" 2>&1; then
     break
   fi
   sleep 0.25
 done
-if ! ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --ping-timeout-ms 1000 --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_ready_out}" 2>&1; then
+if ! CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} ${BENCH_NUMA_PREFIX}timeout 2 /tmp/cxl_ring_direct --ping-timeout-ms 1000 --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_ready_out}" 2>&1; then
   echo "[!] ring transport not ready (SGX). Dumping diagnostics..." >&2
   echo "[!] Last cxl_ring_direct output (ring ready check):" >&2
   tail -n 50 "${ring_ready_out}" >&2 || true
@@ -549,7 +582,7 @@ fi
 ring_label="sgx_ring_${ts}"
 ring_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
 cd /tmp
-${BENCH_NUMA_PREFIX}/tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" \
+CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} ${BENCH_NUMA_PREFIX}/tmp/cxl_ring_direct --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" \
   --bench "${ring_n_per_thread}" --pipeline --threads "${THREADS}" --max-inflight "${MAX_INFLIGHT}" \
   --latency --cost --csv "/tmp/${ring_label}.csv" --label "${ring_label}" | tee "${ring_log}"
 cat "/tmp/${ring_label}.csv" > "${ring_csv}"
@@ -558,18 +591,18 @@ tmux kill-session -t redis_ring_sgx >/dev/null 2>&1 || true
 
 echo "[*] Benchmark 5/5: secure ring Redis under Gramine SGX (ACL + software crypto)"
 tmux new-session -d -s cxl_sec_mgr "${BENCH_NUMA_PREFIX}/tmp/cxl_sec_mgr --ring '${RING_PATH}' --listen 127.0.0.1:${SEC_MGR_PORT} --map-size '${RING_MAP_SIZE}' >/tmp/cxl_sec_mgr_${ts}.log 2>&1"
-tmux new-session -d -s redis_ring_sgx_secure "cd '${ROOT}/gramine' && CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx_secure.log 2>&1"
+tmux new-session -d -s redis_ring_sgx_secure "cd '${ROOT}/gramine' && CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 ${BENCH_NUMA_PREFIX}gramine-sgx ./redis-ring /repo/gramine/redis.conf --port '${RING_PORT}' >/tmp/redis_ring_sgx_secure.log 2>&1"
 
 ring_secure_ready_out="/tmp/cxl_ring_secure_ready_${ts}.log"
 for _ in $(seq 1 200); do
-  if ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
+  if CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
     --sec-timeout-ms 3000 --ping-timeout-ms 3000 \
     --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_secure_ready_out}" 2>&1; then
     break
   fi
   sleep 0.25
 done
-if ! ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
+if ! CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} ${BENCH_NUMA_PREFIX}timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
   --sec-timeout-ms 3000 --ping-timeout-ms 3000 \
   --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" >"${ring_secure_ready_out}" 2>&1; then
   echo "[!] secure ring transport not ready (SGX). Dumping diagnostics..." >&2
@@ -583,7 +616,7 @@ fi
 ring_secure_label="sgx_ring_secure_${ts}"
 ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
 cd /tmp
-${BENCH_NUMA_PREFIX}/tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
+CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} ${BENCH_NUMA_PREFIX}/tmp/cxl_ring_direct --secure --sec-mgr "127.0.0.1:${SEC_MGR_PORT}" --sec-node-id 2 \
   --path "${RING_PATH}" --map-size "${RING_MAP_SIZE}" \
   --bench "${ring_secure_n_per_thread}" --pipeline --threads "${THREADS}" --max-inflight "${MAX_INFLIGHT}" \
   --latency --cost --csv "/tmp/${ring_secure_label}.csv" --label "${ring_secure_label}" | tee "${ring_secure_log}"

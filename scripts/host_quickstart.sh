@@ -54,6 +54,19 @@ MIRROR_DIR="${MIRROR_DIR:-${ROOT}/../mirror}"
 DEFAULT_NOBLE_IMG="${MIRROR_DIR}/ubuntu-24.04-server-cloudimg-amd64.img"
 DEFAULT_JAMMY_IMG="${MIRROR_DIR}/jammy-server-cloudimg-amd64.img"
 
+default_vm_state_dir() {
+  if [[ -n "${VM_STATE_DIR:-}" ]]; then
+    echo "${VM_STATE_DIR}"
+  elif [[ "${EUID}" -eq 0 ]]; then
+    echo "/tmp"
+  else
+    echo "/tmp/cxl-sec-dsm-sim-${UID}"
+  fi
+}
+
+VM_STATE_DIR="$(default_vm_state_dir)"
+export VM_STATE_DIR
+
 download_file() {
   local url="$1"
   local out="$2"
@@ -128,7 +141,7 @@ echo "    base image: ${BASE_IMG}"
 
 vm_running=0
 for name in vm1 vm2; do
-  pidfile="/tmp/${name}.pid"
+  pidfile="${VM_STATE_DIR}/${name}.pid"
   if [[ -f "${pidfile}" ]]; then
     pid="$(cat "${pidfile}" 2>/dev/null || true)"
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
@@ -160,57 +173,57 @@ else
   fi
 fi
 
-if [[ "${need_recreate_disks}" == "1" || "${need_recreate_seeds}" == "1" ]]; then
-  if [[ "${vm_running}" == "1" ]]; then
-    if [[ "${STOP_EXISTING}" != "1" ]]; then
-      echo "[!] VMs appear to be running; stop them before recreating images." >&2
-      echo "    Hint: sudo kill -9 \$(cat /tmp/vm1.pid) \$(cat /tmp/vm2.pid)  # then rerun" >&2
-      echo "    Or:  sudo env STOP_EXISTING=1 FORCE_RECREATE=1 bash scripts/host_quickstart.sh" >&2
-      exit 1
-    fi
-
-    echo "[*] STOP_EXISTING=1: stopping running VMs (vm1/vm2)"
-    for name in vm1 vm2; do
-      pidfile="/tmp/${name}.pid"
-      if [[ -f "${pidfile}" && ! -r "${pidfile}" ]]; then
-        echo "[!] Cannot read ${pidfile}; please run this script with sudo." >&2
+  if [[ "${need_recreate_disks}" == "1" || "${need_recreate_seeds}" == "1" ]]; then
+    if [[ "${vm_running}" == "1" ]]; then
+      if [[ "${STOP_EXISTING}" != "1" ]]; then
+        echo "[!] VMs appear to be running; stop them before recreating images." >&2
+      echo "    Hint: sudo kill -9 \$(cat '${VM_STATE_DIR}/vm1.pid') \$(cat '${VM_STATE_DIR}/vm2.pid')  # then rerun" >&2
+      echo "    Or:  sudo env STOP_EXISTING=1 FORCE_RECREATE=1 VM_STATE_DIR='${VM_STATE_DIR}' bash scripts/host_quickstart.sh" >&2
         exit 1
       fi
+
+      echo "[*] STOP_EXISTING=1: stopping running VMs (vm1/vm2)"
+      for name in vm1 vm2; do
+      pidfile="${VM_STATE_DIR}/${name}.pid"
+        if [[ -f "${pidfile}" && ! -r "${pidfile}" ]]; then
+          echo "[!] Cannot read ${pidfile}; please run this script with sudo." >&2
+          exit 1
+        fi
     done
 
-    for name in vm1 vm2; do
-      pidfile="/tmp/${name}.pid"
-      pid="$(cat "${pidfile}" 2>/dev/null || true)"
-      if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-        echo "    SIGTERM ${name} pid=${pid}"
-        kill "${pid}" 2>/dev/null || true
+      for name in vm1 vm2; do
+      pidfile="${VM_STATE_DIR}/${name}.pid"
+        pid="$(cat "${pidfile}" 2>/dev/null || true)"
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+          echo "    SIGTERM ${name} pid=${pid}"
+          kill "${pid}" 2>/dev/null || true
       fi
     done
 
-    for _ in $(seq 1 20); do
-      still=0
-      for name in vm1 vm2; do
-        pidfile="/tmp/${name}.pid"
-        pid="$(cat "${pidfile}" 2>/dev/null || true)"
-        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-          still=1
-        fi
+      for _ in $(seq 1 20); do
+        still=0
+        for name in vm1 vm2; do
+        pidfile="${VM_STATE_DIR}/${name}.pid"
+          pid="$(cat "${pidfile}" 2>/dev/null || true)"
+          if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+            still=1
+          fi
       done
       [[ "${still}" == "0" ]] && break
       sleep 1
     done
 
-    for name in vm1 vm2; do
-      pidfile="/tmp/${name}.pid"
-      pid="$(cat "${pidfile}" 2>/dev/null || true)"
-      if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-        echo "    SIGKILL ${name} pid=${pid}"
-        kill -9 "${pid}" 2>/dev/null || true
-      fi
-    done
+      for name in vm1 vm2; do
+      pidfile="${VM_STATE_DIR}/${name}.pid"
+        pid="$(cat "${pidfile}" 2>/dev/null || true)"
+        if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+          echo "    SIGKILL ${name} pid=${pid}"
+          kill -9 "${pid}" 2>/dev/null || true
+        fi
+      done
 
-    rm -f /tmp/vm1.pid /tmp/vm2.pid /tmp/vm1.monitor /tmp/vm2.monitor || true
-  fi
+    rm -f "${VM_STATE_DIR}/vm1.pid" "${VM_STATE_DIR}/vm2.pid" "${VM_STATE_DIR}/vm1.monitor" "${VM_STATE_DIR}/vm2.monitor" || true
+    fi
   if [[ "${FORCE_RECREATE}" == "1" ]]; then
     echo "    FORCE_RECREATE=1: removing existing qcow2 + seed images"
   else

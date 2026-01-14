@@ -19,8 +19,8 @@ SHARED_PATH="${1:-/tmp/cxl_shared.raw}"
 SIZE="${2:-4G}"
 
 echo "[*] Creating shared CXL backing file at ${SHARED_PATH} (size ${SIZE})"
-sudo mkdir -p "$(dirname "${SHARED_PATH}")"
-sudo truncate -s "${SIZE}" "${SHARED_PATH}"
-sudo chmod 666 "${SHARED_PATH}"
+mkdir -p "$(dirname "${SHARED_PATH}")"
+truncate -s "${SIZE}" "${SHARED_PATH}"
+chmod 666 "${SHARED_PATH}" || true
 
 echo "[+] Done. You can point QEMU -object memory-backend-file,...,mem-path=${SHARED_PATH}"

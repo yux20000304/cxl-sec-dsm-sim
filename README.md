@@ -59,6 +59,13 @@ Optional NUMA pinning (simulate “remote” CXL memory):
 VM1_CPU_NODE=0 VM2_CPU_NODE=0 CXL_MEM_NODE=1 bash infra/run_vms.sh ...
 ```
 This pins vCPUs to node0 and allocates shared memory on node1.
+If your host exposes only a single NUMA node, you can still simulate “remote CXL”
+latency by injecting artificial delay on each shared-memory ring access:
+```bash
+CXL_SHM_DELAY_NS=150 bash scripts/host_recreate_and_bench_gramine.sh
+```
+(`CXL_SHM_DELAY_NS` is in nanoseconds; set to `0` to disable. The benchmark scripts
+auto-default it to `150` on 1-NUMA hosts if unset.)
 
 ### Mount host repo inside guests (convenience)
 ```bash
@@ -223,6 +230,30 @@ bash scripts/host_recreate_and_bench_gramine.sh
 Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
 The compare CSV includes `NativeTCP`, `GramineNativeTCP`, `GramineSodiumTCP`, `GramineRing`, and `GramineRingSecure` labels.
 
+## TDX hardware: TDX guests (VMs + ivshmem, no Gramine)
+This workflow keeps the two-VM + ivshmem setup, but runs both Redis variants directly
+inside **Intel TDX confidential guests**. TDX is a VM-level TEE, so Gramine is not
+required to run inside a TEE (though you *can* still run Gramine inside a TDX guest
+for additional isolation/debugging).
+
+Host prereqs:
+- `/dev/kvm` available (nested virt enabled if running inside a cloud VM)
+- QEMU supports TDX guests (`qemu-system-x86_64 -object help | grep tdx-guest`)
+- A TDVF/OVMF firmware file for `-bios` (Ubuntu: `sudo apt-get install -y ovmf`, then set `TDX_BIOS=/usr/share/OVMF/OVMF_CODE_4M.fd`)
+
+Notes:
+- The ivshmem-backed “shared CXL medium” is **shared memory** and is therefore not
+  protected by TDX (it must be shared with the host/device). Use this workflow to
+  validate functionality and measure performance, but do not treat the ring payload
+  as confidential unless you add application-level crypto/auth (see `TDXRingSecure`).
+
+One command:
+```bash
+sudo -E bash scripts/host_recreate_and_bench_tdx.sh
+```
+Outputs are written to `results/` as timestamped `tdx_*.log` / `tdx_*.csv`.
+The compare CSV includes `TDXNativeTCP`, `TDXRing`, and `TDXRingSecure` labels.
+
 ## SGX hardware: Gramine SGX compare (no VMs)
 This workflow runs on an SGX-capable *host OS* (not inside QEMU guests): it starts
 Redis under `gramine-sgx` and benchmarks (host native TCP vs Gramine SGX TCP vs libsodium-encrypted TCP vs ring shared-memory vs secure ring).
@@ -246,6 +277,8 @@ Optional NUMA pinning (simulate “remote” CXL memory on the host):
 ```bash
 BENCH_CPU_NODE=0 CXL_MEM_NODE=1 sudo -E bash scripts/host_bench_gramine_sgx.sh
 ```
+If the host has only a single NUMA node, the script auto-falls back to the
+software delay model above (`CXL_SHM_DELAY_NS`) instead of NUMA binding.
 Outputs are written to `results/` as timestamped `sgx_*.log` / `sgx_*.csv`.
 The compare CSV includes `HostNativeTCP`, `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, `GramineSGXRing`, and `GramineSGXRingSecure` labels.
 

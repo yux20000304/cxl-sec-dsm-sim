@@ -9,8 +9,8 @@ set -euo pipefail
 # 4) Ring-enabled Redis under Gramine over BAR2 (shared ivshmem).
 # 5) Secure ring Redis under Gramine (ACL + software crypto in shared memory).
 #
-# This script is intended to be run on the host with sudo because QEMU/KVM is
-# started as root in this repo's default setup.
+# This script can be run as a regular user (QEMU will fall back to TCG if KVM is
+# not accessible), but sudo/root is recommended for best performance (KVM).
 #
 # Usage:
 #   sudo bash scripts/host_recreate_and_bench_gramine.sh
@@ -30,14 +30,19 @@ set -euo pipefail
 #   SODIUM_PORT  : vm1 tunnel listen port on cxl0 (default: 6380)
 #   SODIUM_LOCAL_PORT: vm2 local tunnel listen port (default: 6380)
 #   SEC_MGR_PORT : TCP port for cxl_sec_mgr inside vm1 (default: 19001)
+#   CXL_SHM_DELAY_NS: inject artificial latency on each shared-memory ring access (ns). If unset and host has <2 NUMA nodes, auto-defaults to CXL_SHM_DELAY_NS_DEFAULT.
+#   CXL_SHM_DELAY_NS_DEFAULT: default delay to use on 1-NUMA hosts when CXL_SHM_DELAY_NS is unset (default: 150).
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
 mkdir -p "${RESULTS_DIR}"
 
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "[*] Re-exec with sudo..."
+if [[ "${EUID}" -ne 0 && "${FORCE_SUDO:-0}" == "1" ]]; then
+  echo "[*] FORCE_SUDO=1: re-exec with sudo..."
   exec sudo -E bash "$0" "$@"
+fi
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "[*] Host is not root; QEMU may run without KVM (slow). To use KVM, add your user to group 'kvm' or rerun with sudo." >&2
 fi
 
 VM1_SSH="${VM1_SSH:-2222}"
@@ -59,6 +64,27 @@ SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
 
 BASE_IMG="${BASE_IMG:-}"
+
+CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS:-}"
+CXL_SHM_DELAY_NS_DEFAULT="${CXL_SHM_DELAY_NS_DEFAULT:-150}"
+
+host_numa_node_count() {
+  local n=0
+  for d in /sys/devices/system/node/node[0-9]*; do
+    [[ -d "${d}" ]] && n=$((n + 1))
+  done
+  if [[ "${n}" -le 0 ]]; then
+    n=1
+  fi
+  echo "${n}"
+}
+
+HOST_NUMA_NODES="$(host_numa_node_count)"
+if [[ "${HOST_NUMA_NODES}" -lt 2 && -z "${CXL_SHM_DELAY_NS}" ]]; then
+  CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS_DEFAULT}"
+  echo "[*] Host has ${HOST_NUMA_NODES} NUMA node(s); enabling simulated CXL shared-memory latency: CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} (ns)."
+  echo "    Override: CXL_SHM_DELAY_NS=0 (disable) or set a custom ns value."
+fi
 
 tmpdir="$(mktemp -d /tmp/cxl-sec-dsm-sim-gramine.XXXXXX)"
 cleanup() { rm -rf "${tmpdir}"; }
@@ -232,11 +258,14 @@ ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_native_gramine >/dev/null 2>&1 || true"
 ssh_vm1 "tmux new-session -d -s redis_native_gramine \"cd /mnt/hostshare/gramine && gramine-direct ./redis-native /repo/gramine/redis.conf >/tmp/redis_native_gramine.log 2>&1\""
-if ! ssh_vm1 "for i in \$(seq 1 80); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
+if ! ssh_vm1 "for i in \$(seq 1 600); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
   echo "[!] redis-server not ready (vm1). Dumping diagnostics..." >&2
+  ssh_vm1 "head -n 120 /tmp/redis_native_gramine.log 2>/dev/null || true" >&2
   ssh_vm1 "tail -n 200 /tmp/redis_native_gramine.log 2>/dev/null || true" >&2
   ssh_vm1 "ss -lntp 2>/dev/null | grep -E ':6379\\b' || true" >&2
   ssh_vm1 "pgrep -a redis-server 2>/dev/null || true" >&2
+  ssh_vm1 "pgrep -a gramine-direct 2>/dev/null || true" >&2
+  ssh_vm1 "pgrep -a '/usr/lib/.*/gramine/.*/loader' 2>/dev/null || true" >&2
   ssh_vm1 "tmux capture-pane -pt redis_native_gramine -S -200 2>/dev/null || true" >&2
   exit 1
 fi
@@ -253,7 +282,7 @@ ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
 ssh_vm1 "tmux new-session -d -s sodium_server \"/tmp/cxl_sodium_tunnel --mode server --listen 0.0.0.0:${SODIUM_PORT} --backend 127.0.0.1:6379 --key ${SODIUM_KEY_HEX} >/tmp/sodium_server_${ts}.log 2>&1\""
 ssh_vm2 "tmux new-session -d -s sodium_client \"/tmp/cxl_sodium_tunnel --mode client --listen 127.0.0.1:${SODIUM_LOCAL_PORT} --connect ${VMNET_VM1_IP}:${SODIUM_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_client_${ts}.log 2>&1\""
 
-if ! ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
+if ! ssh_vm2 "for i in \$(seq 1 600); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
   echo "[!] libsodium tunnel not ready. Dumping diagnostics..." >&2
   ssh_vm2 "tail -n 200 /tmp/sodium_client_${ts}.log 2>/dev/null || true" >&2
   ssh_vm1 "tail -n 200 /tmp/sodium_server_${ts}.log 2>/dev/null || true" >&2
@@ -274,15 +303,15 @@ echo "[*] Benchmark 4/5: ring Redis under Gramine (BAR2 shared memory)"
 ssh_vm1 "sudo systemctl stop redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_gramine >/dev/null 2>&1 || true"
-ssh_vm1 "tmux new-session -d -s redis_ring_gramine \"cd /mnt/hostshare/gramine && sudo gramine-direct ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_gramine.log 2>&1\""
+ssh_vm1 "tmux new-session -d -s redis_ring_gramine \"cd /mnt/hostshare/gramine && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} gramine-direct ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_gramine.log 2>&1\""
 
 # Wait until the ring is usable by doing a small shared-memory ping from VM2.
-ssh_vm2 "for i in \$(seq 1 120); do sudo timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'ring not ready' >&2; exit 1"
+ssh_vm2 "for i in \$(seq 1 600); do sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'ring not ready' >&2; exit 1"
 
 ring_label="gramine_ring_${ts}"
 ring_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
 
-ssh_vm2 "cd /tmp && sudo /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
+ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
 ssh_vm2 "cat /tmp/${ring_label}.csv" > "${ring_csv}"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_gramine >/dev/null 2>&1 || true"
@@ -293,14 +322,14 @@ ssh_vm1 "tmux kill-session -t cxl_sec_mgr >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_gramine_secure >/dev/null 2>&1 || true"
 
 ssh_vm1 "tmux new-session -d -s cxl_sec_mgr \"sudo /tmp/cxl_sec_mgr --ring ${RING_PATH} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} >/tmp/cxl_sec_mgr_${ts}.log 2>&1\""
-ssh_vm1 "tmux new-session -d -s redis_ring_gramine_secure \"cd /mnt/hostshare/gramine && sudo env CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 gramine-direct ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_gramine_secure.log 2>&1\""
+ssh_vm1 "tmux new-session -d -s redis_ring_gramine_secure \"cd /mnt/hostshare/gramine && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 gramine-direct ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_gramine_secure.log 2>&1\""
 
-ssh_vm2 "for i in \$(seq 1 200); do sudo timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'secure ring not ready' >&2; exit 1"
+ssh_vm2 "for i in \$(seq 1 600); do sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'secure ring not ready' >&2; exit 1"
 
 ring_secure_label="gramine_ring_secure_${ts}"
 ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
 
-ssh_vm2 "cd /tmp && sudo /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
+ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
 ssh_vm2 "cat /tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
 
 ssh_vm1 "tmux kill-session -t redis_ring_gramine_secure >/dev/null 2>&1 || true"

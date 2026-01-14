@@ -31,6 +31,11 @@ Environment (optional SGX-in-guest):
   VM1_SGX_ENABLE / VM2_SGX_ENABLE override per-VM (default: VM_SGX_ENABLE).
   SGX_EPC_SIZE=256M EPC section size per enabled VM.
   VM1_SGX_EPC_SIZE / VM2_SGX_EPC_SIZE override per-VM EPC size.
+Environment (optional TDX-in-guest):
+  VM_TDX_ENABLE=1 enables Intel TDX confidential guests (requires KVM + TDX-enabled host + QEMU tdx-guest support).
+  VM1_TDX_ENABLE / VM2_TDX_ENABLE override per-VM (default: VM_TDX_ENABLE).
+  TDX_BIOS=/path/to/OVMF.fd sets the TDVF/OVMF firmware file (passed via `-bios`, required by TDX).
+  VM1_TDX_BIOS / VM2_TDX_BIOS override per-VM firmware path.
 Environment:
   VM1_CPU_NODE (bind qemu vCPUs to host NUMA node)
   VM2_CPU_NODE
@@ -98,6 +103,19 @@ if ! command -v "${QEMU_BIN}" >/dev/null 2>&1; then
   exit 1
 fi
 
+default_vm_state_dir() {
+  if [[ -n "${VM_STATE_DIR:-}" ]]; then
+    echo "${VM_STATE_DIR}"
+  elif [[ "${EUID}" -eq 0 ]]; then
+    echo "/tmp"
+  else
+    echo "/tmp/cxl-sec-dsm-sim-${UID}"
+  fi
+}
+
+VM_STATE_DIR="$(default_vm_state_dir)"
+mkdir -p "${VM_STATE_DIR}"
+
 VMNET_ENABLE="${VMNET_ENABLE:-1}"
 VMNET_HOST="${VMNET_HOST:-127.0.0.1}"
 VMNET_PORT="${VMNET_PORT:-0}"
@@ -143,12 +161,33 @@ if grep -q -m1 -w aes /proc/cpuinfo 2>/dev/null; then
   host_has_aes=1
 fi
 
+host_has_kvm=0
+host_has_kvm_access=0
+refresh_kvm_access() {
+  host_has_kvm=0
+  host_has_kvm_access=0
+  if [[ -c /dev/kvm ]]; then
+    host_has_kvm=1
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+      host_has_kvm_access=1
+    fi
+  fi
+}
+refresh_kvm_access
+
 VM_SGX_ENABLE="${VM_SGX_ENABLE:-0}"
 VM1_SGX_ENABLE="${VM1_SGX_ENABLE:-${VM_SGX_ENABLE}}"
 VM2_SGX_ENABLE="${VM2_SGX_ENABLE:-${VM_SGX_ENABLE}}"
 SGX_EPC_SIZE="${SGX_EPC_SIZE:-256M}"
 VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-${SGX_EPC_SIZE}}"
 VM2_SGX_EPC_SIZE="${VM2_SGX_EPC_SIZE:-${SGX_EPC_SIZE}}"
+
+VM_TDX_ENABLE="${VM_TDX_ENABLE:-0}"
+VM1_TDX_ENABLE="${VM1_TDX_ENABLE:-${VM_TDX_ENABLE}}"
+VM2_TDX_ENABLE="${VM2_TDX_ENABLE:-${VM_TDX_ENABLE}}"
+TDX_BIOS="${TDX_BIOS:-}"
+VM1_TDX_BIOS="${VM1_TDX_BIOS:-${TDX_BIOS}}"
+VM2_TDX_BIOS="${VM2_TDX_BIOS:-${TDX_BIOS}}"
 
 host_has_sgx=0
 if grep -q -m1 -w sgx /proc/cpuinfo 2>/dev/null; then
@@ -165,14 +204,89 @@ if "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'memory-backend-epc'; then
   qemu_has_sgx_epc=1
 fi
 
-if [[ "${VM1_SGX_ENABLE}" == "1" || "${VM2_SGX_ENABLE}" == "1" ]]; then
-  if [[ ! -c /dev/kvm && "${EUID}" -eq 0 ]]; then
+qemu_has_tdx=0
+if "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'tdx-guest'; then
+  qemu_has_tdx=1
+fi
+
+default_tdx_bios() {
+  local c
+  for c in \
+    /usr/share/OVMF/OVMF_CODE_4M.fd \
+    /usr/share/OVMF/OVMF_CODE.fd \
+    /usr/share/qemu/OVMF.fd \
+    /usr/share/OVMF/OVMF.fd; do
+    if [[ -f "${c}" ]]; then
+      echo "${c}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [[ "${VM1_TDX_ENABLE}" == "1" || "${VM2_TDX_ENABLE}" == "1" ]]; then
+  if [[ "${VM1_SGX_ENABLE}" == "1" || "${VM2_SGX_ENABLE}" == "1" ]]; then
+    echo "[!] Cannot enable both SGX-in-guest and TDX-in-guest at the same time." >&2
+    exit 1
+  fi
+
+  if [[ "${host_has_kvm}" != "1" && "${EUID}" -eq 0 ]]; then
     modprobe kvm >/dev/null 2>&1 || true
     modprobe kvm_intel >/dev/null 2>&1 || true
     modprobe kvm_amd >/dev/null 2>&1 || true
   fi
-  if [[ ! -c /dev/kvm ]]; then
-    echo "[!] VM_SGX_ENABLE=1 requires /dev/kvm (KVM acceleration)." >&2
+  refresh_kvm_access
+  if [[ "${host_has_kvm_access}" != "1" ]]; then
+    echo "[!] VM_TDX_ENABLE=1 requires /dev/kvm with RW access (KVM acceleration)." >&2
+    if [[ "${host_has_kvm}" == "1" ]]; then
+      echo "    /dev/kvm exists but is not accessible (add your user to group 'kvm' or run with sudo)." >&2
+    fi
+    if [[ "${host_has_vtx}" != "1" ]]; then
+      echo "    CPU virtualization flags (vmx/svm) are not visible; nested virtualization is likely disabled." >&2
+    fi
+    echo "    - Bare metal: enable VT-x/AMD-V in BIOS and load KVM modules (modprobe kvm_intel|kvm_amd)." >&2
+    echo "    - VM/cloud: enable nested virtualization in your hypervisor/provider." >&2
+    exit 1
+  fi
+  if [[ "${qemu_has_tdx}" != "1" ]]; then
+    echo "[!] QEMU does not support TDX guests (missing 'tdx-guest' object)." >&2
+    echo "    Check: ${QEMU_BIN} -object help | grep tdx-guest" >&2
+    exit 1
+  fi
+
+  if [[ -z "${VM1_TDX_BIOS}" || ! -f "${VM1_TDX_BIOS}" || -z "${VM2_TDX_BIOS}" || ! -f "${VM2_TDX_BIOS}" ]]; then
+    auto_bios="$(default_tdx_bios || true)"
+    if [[ "${VM1_TDX_ENABLE}" == "1" && ( -z "${VM1_TDX_BIOS}" || ! -f "${VM1_TDX_BIOS}" ) ]]; then
+      VM1_TDX_BIOS="${auto_bios}"
+    fi
+    if [[ "${VM2_TDX_ENABLE}" == "1" && ( -z "${VM2_TDX_BIOS}" || ! -f "${VM2_TDX_BIOS}" ) ]]; then
+      VM2_TDX_BIOS="${auto_bios}"
+    fi
+  fi
+  if [[ "${VM1_TDX_ENABLE}" == "1" && ( -z "${VM1_TDX_BIOS}" || ! -f "${VM1_TDX_BIOS}" ) ]]; then
+    echo "[!] VM1_TDX_BIOS is required and must exist when VM1_TDX_ENABLE=1." >&2
+    echo "    Tip (Ubuntu): sudo apt-get install -y ovmf" >&2
+    exit 1
+  fi
+  if [[ "${VM2_TDX_ENABLE}" == "1" && ( -z "${VM2_TDX_BIOS}" || ! -f "${VM2_TDX_BIOS}" ) ]]; then
+    echo "[!] VM2_TDX_BIOS is required and must exist when VM2_TDX_ENABLE=1." >&2
+    echo "    Tip (Ubuntu): sudo apt-get install -y ovmf" >&2
+    exit 1
+  fi
+
+  enable_kvm=( -enable-kvm -cpu host )
+elif [[ "${VM1_SGX_ENABLE}" == "1" || "${VM2_SGX_ENABLE}" == "1" ]]; then
+  if [[ "${host_has_kvm}" != "1" && "${EUID}" -eq 0 ]]; then
+    modprobe kvm >/dev/null 2>&1 || true
+    modprobe kvm_intel >/dev/null 2>&1 || true
+    modprobe kvm_amd >/dev/null 2>&1 || true
+  fi
+  refresh_kvm_access
+  if [[ "${host_has_kvm_access}" != "1" ]]; then
+    echo "[!] VM_SGX_ENABLE=1 requires /dev/kvm with RW access (KVM acceleration)." >&2
+    if [[ "${host_has_kvm}" == "1" ]]; then
+      echo "    /dev/kvm exists but is not accessible (add your user to group 'kvm' or run with sudo)." >&2
+    fi
     if [[ "${host_has_vtx}" != "1" ]]; then
       echo "    CPU virtualization flags (vmx/svm) are not visible; nested virtualization is likely disabled." >&2
     fi
@@ -196,7 +310,7 @@ if [[ "${VM1_SGX_ENABLE}" == "1" || "${VM2_SGX_ENABLE}" == "1" ]]; then
   fi
 
   enable_kvm=( -enable-kvm -cpu host )
-elif [[ -c /dev/kvm && "${host_has_aes}" == "1" ]]; then
+elif [[ "${host_has_kvm_access}" == "1" && "${host_has_aes}" == "1" ]]; then
   enable_kvm=( -enable-kvm -cpu host )
 else
   # No usable KVM path (either missing /dev/kvm, or host CPU doesn't expose AES).
@@ -209,8 +323,10 @@ else
     enable_kvm=( -cpu qemu64,+aes )
   fi
 
-  if [[ ! -c /dev/kvm ]]; then
+  if [[ "${host_has_kvm}" != "1" ]]; then
     echo "[!] /dev/kvm not found; running QEMU without KVM (TCG). Performance will be very slow." >&2
+  elif [[ "${host_has_kvm_access}" != "1" ]]; then
+    echo "[!] /dev/kvm exists but is not accessible; running QEMU without KVM (TCG). Performance will be very slow." >&2
   elif [[ "${host_has_aes}" != "1" ]]; then
     echo "[!] Host CPU doesn't expose AES-NI ('aes' flag). Gramine requires it; using TCG with emulated AES (slow)." >&2
   fi
@@ -219,6 +335,22 @@ fi
 VM1_CPU_NODE="${VM1_CPU_NODE:-}"
 VM2_CPU_NODE="${VM2_CPU_NODE:-}"
 CXL_MEM_NODE="${CXL_MEM_NODE:-}"
+
+sanitize_numa_node_var() {
+  local var_name="$1"
+  local node="${!var_name:-}"
+  if [[ -z "${node}" ]]; then
+    return 0
+  fi
+  if [[ ! -d "/sys/devices/system/node/node${node}" ]]; then
+    echo "[!] ${var_name}=${node} but /sys/devices/system/node/node${node} not found; ignoring ${var_name}." >&2
+    printf -v "${var_name}" '%s' ""
+  fi
+}
+
+sanitize_numa_node_var VM1_CPU_NODE
+sanitize_numa_node_var VM2_CPU_NODE
+sanitize_numa_node_var CXL_MEM_NODE
 
 bind_cmd() {
   local node="$1"; shift
@@ -231,6 +363,8 @@ bind_cmd() {
 
 run_vm() {
   local name="$1"; shift
+  local tdx_enable="$1"; shift
+  local tdx_bios="$1"; shift
   local sgx_enable="$1"; shift
   local sgx_epc_size="$1"; shift
   local ssh_port="$1"; shift
@@ -241,11 +375,38 @@ run_vm() {
   local mem_node="$1"; shift
   local cpu_node="$1"; shift
 
-  local monitor="/tmp/${name}.monitor"
-  local pidfile="/tmp/${name}.pid"
-  local log="/tmp/${name}.log"
+  local monitor="${VM_STATE_DIR}/${name}.monitor"
+  local pidfile="${VM_STATE_DIR}/${name}.pid"
+  local log="${VM_STATE_DIR}/${name}.log"
+
+  local existing_pid=""
+  if [[ -f "${pidfile}" ]]; then
+    existing_pid="$(cat "${pidfile}" 2>/dev/null || true)"
+  fi
+  if [[ -n "${existing_pid}" ]] && kill -0 "${existing_pid}" 2>/dev/null; then
+    echo "[!] ${name} appears to be running already (pid=${existing_pid})." >&2
+    echo "    Stop it first or set VM_STATE_DIR to a different directory." >&2
+    exit 1
+  fi
+  if ! rm -f "${pidfile}" "${monitor}" "${log}" 2>/dev/null; then
+    echo "[!] Cannot clean existing VM state files in VM_STATE_DIR=${VM_STATE_DIR}." >&2
+    echo "    Pick a writable directory, e.g.: VM_STATE_DIR=/tmp/cxl-sec-dsm-sim-${UID}" >&2
+    exit 1
+  fi
 
   local machine="q35"
+  local tdx_opts=()
+  if [[ "${tdx_enable}" == "1" ]]; then
+    # Intel TDX confidential guests (requires KVM+TDX+QEMU support).
+    # QEMU syntax reference: https://www.qemu.org/docs/master/system/i386/tdx.html
+    local tdx_id="tdx-${name}"
+    tdx_opts=(
+      -object "tdx-guest,id=${tdx_id}"
+      -bios "${tdx_bios}"
+    )
+    machine="q35,kernel-irqchip=split,confidential-guest-support=${tdx_id},smm=off"
+  fi
+
   local sgx_opts=()
   if [[ "${sgx_enable}" == "1" ]]; then
     # Provide a virtual EPC section to the guest. This requires host SGX + KVM SGX virtualization.
@@ -287,9 +448,10 @@ run_vm() {
   local cmd=(
     ${QEMU_BIN}
     -name "${name}"
-    -machine "${machine}"
     "${enable_kvm[@]}"
+    "${tdx_opts[@]}"
     "${sgx_opts[@]}"
+    -machine "${machine}"
     -display none
     -smp "${cpus}"
     -m "${mem}"
@@ -314,8 +476,8 @@ run_vm() {
   eval "${full_cmd}"
 }
 
-run_vm "vm1" "${VM1_SGX_ENABLE}" "${VM1_SGX_EPC_SIZE}" "${VM1_SSH_PORT}" "${VM1_DISK}" "${VM1_SEED}" "${VM1_MEM}" "${VM1_CPUS}" "${CXL_MEM_NODE}" "${VM1_CPU_NODE}"
-run_vm "vm2" "${VM2_SGX_ENABLE}" "${VM2_SGX_EPC_SIZE}" "${VM2_SSH_PORT}" "${VM2_DISK}" "${VM2_SEED}" "${VM2_MEM}" "${VM2_CPUS}" "${CXL_MEM_NODE}" "${VM2_CPU_NODE}"
+run_vm "vm1" "${VM1_TDX_ENABLE}" "${VM1_TDX_BIOS}" "${VM1_SGX_ENABLE}" "${VM1_SGX_EPC_SIZE}" "${VM1_SSH_PORT}" "${VM1_DISK}" "${VM1_SEED}" "${VM1_MEM}" "${VM1_CPUS}" "${CXL_MEM_NODE}" "${VM1_CPU_NODE}"
+run_vm "vm2" "${VM2_TDX_ENABLE}" "${VM2_TDX_BIOS}" "${VM2_SGX_ENABLE}" "${VM2_SGX_EPC_SIZE}" "${VM2_SSH_PORT}" "${VM2_DISK}" "${VM2_SEED}" "${VM2_MEM}" "${VM2_CPUS}" "${CXL_MEM_NODE}" "${VM2_CPU_NODE}"
 
 echo "[+] VMs started."
 echo "    VM1 ssh: ssh ubuntu@127.0.0.1 -p ${VM1_SSH_PORT}"

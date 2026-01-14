@@ -36,6 +36,10 @@ set -euo pipefail
 # SGX-in-guest knobs:
 #   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: 256M)
 #   SGX_TOKEN_MODE  : auto|require|skip (default: auto). "auto" tries to fetch token but continues if it fails.
+#
+# Shared-memory (CXL) latency simulation:
+#   CXL_SHM_DELAY_NS: inject artificial latency on each shared-memory ring access (ns). If unset and host has <2 NUMA nodes, auto-defaults to CXL_SHM_DELAY_NS_DEFAULT.
+#   CXL_SHM_DELAY_NS_DEFAULT: default delay to use on 1-NUMA hosts when CXL_SHM_DELAY_NS is unset (default: 150).
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
@@ -67,6 +71,27 @@ VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-256M}"
 SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
 
 BASE_IMG="${BASE_IMG:-}"
+
+CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS:-}"
+CXL_SHM_DELAY_NS_DEFAULT="${CXL_SHM_DELAY_NS_DEFAULT:-150}"
+
+host_numa_node_count() {
+  local n=0
+  for d in /sys/devices/system/node/node[0-9]*; do
+    [[ -d "${d}" ]] && n=$((n + 1))
+  done
+  if [[ "${n}" -le 0 ]]; then
+    n=1
+  fi
+  echo "${n}"
+}
+
+HOST_NUMA_NODES="$(host_numa_node_count)"
+if [[ "${HOST_NUMA_NODES}" -lt 2 && -z "${CXL_SHM_DELAY_NS}" ]]; then
+  CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS_DEFAULT}"
+  echo "[*] Host has ${HOST_NUMA_NODES} NUMA node(s); enabling simulated CXL shared-memory latency: CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} (ns)."
+  echo "    Override: CXL_SHM_DELAY_NS=0 (disable) or set a custom ns value."
+fi
 
 tmpdir="$(mktemp -d /tmp/cxl-sec-dsm-sim-sgxvm.XXXXXX)"
 cleanup() { rm -rf "${tmpdir}"; }
@@ -284,13 +309,13 @@ ssh_vm1 "tmux kill-session -t redis_native_sgxvm >/dev/null 2>&1 || true"
 echo "[*] Benchmark 4/5: ring Redis under Gramine SGX (BAR2 shared memory)"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_sgxvm >/dev/null 2>&1 || true"
-ssh_vm1 "tmux new-session -d -s redis_ring_sgxvm \"cd /mnt/hostshare/gramine && sudo gramine-sgx ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_sgxvm.log 2>&1\""
+ssh_vm1 "tmux new-session -d -s redis_ring_sgxvm \"cd /mnt/hostshare/gramine && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} gramine-sgx ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_sgxvm.log 2>&1\""
 
-ssh_vm2 "for i in \$(seq 1 200); do sudo timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'ring not ready' >&2; exit 1"
+ssh_vm2 "for i in \$(seq 1 200); do sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'ring not ready' >&2; exit 1"
 
 ring_label="sgxvm_ring_${ts}"
 ring_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
-ssh_vm2 "cd /tmp && sudo /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
+ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} /tmp/cxl_ring_direct --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
 ssh_vm2 "cat /tmp/${ring_label}.csv" > "${ring_csv}"
 
 ssh_vm1 "tmux kill-session -t redis_ring_sgxvm >/dev/null 2>&1 || true"
@@ -301,13 +326,13 @@ ssh_vm1 "tmux kill-session -t cxl_sec_mgr >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_sgxvm_secure >/dev/null 2>&1 || true"
 
 ssh_vm1 "tmux new-session -d -s cxl_sec_mgr \"sudo /tmp/cxl_sec_mgr --ring ${RING_PATH} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} >/tmp/cxl_sec_mgr_${ts}.log 2>&1\""
-ssh_vm1 "tmux new-session -d -s redis_ring_sgxvm_secure \"cd /mnt/hostshare/gramine && sudo env CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 gramine-sgx ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_sgxvm_secure.log 2>&1\""
+ssh_vm1 "tmux new-session -d -s redis_ring_sgxvm_secure \"cd /mnt/hostshare/gramine && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 gramine-sgx ./redis-ring /repo/gramine/redis.conf >/tmp/redis_ring_sgxvm_secure.log 2>&1\""
 
-ssh_vm2 "for i in \$(seq 1 200); do sudo timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'secure ring not ready' >&2; exit 1"
+ssh_vm2 "for i in \$(seq 1 200); do sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'secure ring not ready' >&2; exit 1"
 
 ring_secure_label="sgxvm_ring_secure_${ts}"
 ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
-ssh_vm2 "cd /tmp && sudo /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
+ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
 ssh_vm2 "cat /tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
 
 ssh_vm1 "tmux kill-session -t redis_ring_sgxvm_secure >/dev/null 2>&1 || true"
