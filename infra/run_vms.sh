@@ -31,6 +31,8 @@ Environment (optional SGX-in-guest):
   VM1_SGX_ENABLE / VM2_SGX_ENABLE override per-VM (default: VM_SGX_ENABLE).
   SGX_EPC_SIZE=256M EPC section size per enabled VM.
   VM1_SGX_EPC_SIZE / VM2_SGX_EPC_SIZE override per-VM EPC size.
+  SGX_EPC_PREALLOC=auto|on|off controls EPC preallocation (default: auto).
+  VM1_SGX_EPC_PREALLOC / VM2_SGX_EPC_PREALLOC override per-VM EPC preallocation.
 Environment (optional TDX-in-guest):
   VM_TDX_ENABLE=1 enables Intel TDX confidential guests (requires KVM + TDX-enabled host + QEMU tdx-guest support).
   VM1_TDX_ENABLE / VM2_TDX_ENABLE override per-VM (default: VM_TDX_ENABLE).
@@ -181,6 +183,9 @@ VM2_SGX_ENABLE="${VM2_SGX_ENABLE:-${VM_SGX_ENABLE}}"
 SGX_EPC_SIZE="${SGX_EPC_SIZE:-256M}"
 VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-${SGX_EPC_SIZE}}"
 VM2_SGX_EPC_SIZE="${VM2_SGX_EPC_SIZE:-${SGX_EPC_SIZE}}"
+SGX_EPC_PREALLOC="${SGX_EPC_PREALLOC:-auto}"
+VM1_SGX_EPC_PREALLOC="${VM1_SGX_EPC_PREALLOC:-${SGX_EPC_PREALLOC}}"
+VM2_SGX_EPC_PREALLOC="${VM2_SGX_EPC_PREALLOC:-${SGX_EPC_PREALLOC}}"
 
 VM_TDX_ENABLE="${VM_TDX_ENABLE:-0}"
 VM1_TDX_ENABLE="${VM1_TDX_ENABLE:-${VM_TDX_ENABLE}}"
@@ -352,14 +357,23 @@ sanitize_numa_node_var VM1_CPU_NODE
 sanitize_numa_node_var VM2_CPU_NODE
 sanitize_numa_node_var CXL_MEM_NODE
 
-bind_cmd() {
-  local node="$1"; shift
-  if [[ -n "${node}" ]]; then
-    echo "numactl --cpunodebind=${node} --membind=${node} $*"
-  else
-    echo "$*"
-  fi
+sanitize_sgx_epc_prealloc_var() {
+  local var_name="$1"
+  local val="${!var_name:-}"
+  case "${val}" in
+    auto|on|off) ;;
+    1|true) printf -v "${var_name}" '%s' "on" ;;
+    0|false) printf -v "${var_name}" '%s' "off" ;;
+    *)
+      echo "[!] ${var_name} must be one of auto|on|off (got: ${val})." >&2
+      exit 1
+      ;;
+  esac
 }
+
+sanitize_sgx_epc_prealloc_var SGX_EPC_PREALLOC
+sanitize_sgx_epc_prealloc_var VM1_SGX_EPC_PREALLOC
+sanitize_sgx_epc_prealloc_var VM2_SGX_EPC_PREALLOC
 
 run_vm() {
   local name="$1"; shift
@@ -367,6 +381,7 @@ run_vm() {
   local tdx_bios="$1"; shift
   local sgx_enable="$1"; shift
   local sgx_epc_size="$1"; shift
+  local sgx_epc_prealloc="$1"; shift
   local ssh_port="$1"; shift
   local disk="$1"; shift
   local seed="$1"; shift
@@ -409,10 +424,18 @@ run_vm() {
 
   local sgx_opts=()
   if [[ "${sgx_enable}" == "1" ]]; then
+    local prealloc="${sgx_epc_prealloc}"
+    if [[ "${prealloc}" != "auto" && "${prealloc}" != "on" && "${prealloc}" != "off" ]]; then
+      echo "[!] ${name}: invalid SGX EPC prealloc mode: ${prealloc} (expected auto|on|off)." >&2
+      return 1
+    fi
+    if [[ "${prealloc}" == "auto" ]]; then
+      prealloc="on"
+    fi
     # Provide a virtual EPC section to the guest. This requires host SGX + KVM SGX virtualization.
     # QEMU syntax reference: /usr/share/doc/qemu-system-common/system/i386/sgx.html
     sgx_opts=(
-      -object "memory-backend-epc,id=epc-${name},size=${sgx_epc_size},prealloc=on"
+      -object "memory-backend-epc,id=epc-${name},size=${sgx_epc_size},prealloc=${prealloc}"
     )
     machine="q35,sgx-epc.0.memdev=epc-${name},sgx-epc.0.node=0"
   fi
@@ -471,13 +494,75 @@ run_vm() {
   )
 
   echo "[*] Launching ${name} (SSH port ${ssh_port})"
-  local full_cmd
-  full_cmd=$(bind_cmd "${cpu_node}" "${cmd[@]}")
-  eval "${full_cmd}"
+
+  local full_cmd=()
+  if [[ -n "${cpu_node}" ]]; then
+    full_cmd+=( numactl --cpunodebind="${cpu_node}" --membind="${cpu_node}" )
+  fi
+  full_cmd+=( "${cmd[@]}" )
+
+  local out=""
+  local rc=0
+  set +e
+  out="$("${full_cmd[@]}" 2>&1)"
+  rc=$?
+  set -e
+  if [[ "${rc}" -eq 0 ]]; then
+    return 0
+  fi
+
+  if [[ "${sgx_enable}" == "1" && "${sgx_epc_prealloc}" == "auto" ]] && printf '%s' "${out}" | grep -q 'qemu_prealloc_mem: preallocating memory failed'; then
+    echo "[!] ${name}: EPC preallocation failed; retrying with SGX_EPC_PREALLOC=off." >&2
+    rm -f "${pidfile}" "${monitor}" "${log}" 2>/dev/null || true
+
+    sgx_opts=( -object "memory-backend-epc,id=epc-${name},size=${sgx_epc_size},prealloc=off" )
+    cmd=(
+      ${QEMU_BIN}
+      -name "${name}"
+      "${enable_kvm[@]}"
+      "${tdx_opts[@]}"
+      "${sgx_opts[@]}"
+      -machine "${machine}"
+      -display none
+      -smp "${cpus}"
+      -m "${mem}"
+      -overcommit mem-lock=off
+      ${cxl_opts}
+      -device ivshmem-plain,memdev=cxlmem-${name},id=ivshmem0
+      -drive if=virtio,file="${disk}",format=qcow2
+      -drive if=virtio,file="${seed}",format=raw
+      -netdev user,id=net0,hostfwd=tcp::${ssh_port}-:22
+      -device virtio-net-pci,netdev=net0
+      "${vmnet_opts[@]}"
+      -virtfs local,path="${HOSTSHARE}",mount_tag=hostshare,security_model=none,id=hostshare
+      -daemonize
+      -monitor unix:"${monitor}",server,nowait
+      -pidfile "${pidfile}"
+      -serial file:"${log}"
+    )
+
+    full_cmd=()
+    if [[ -n "${cpu_node}" ]]; then
+      full_cmd+=( numactl --cpunodebind="${cpu_node}" --membind="${cpu_node}" )
+    fi
+    full_cmd+=( "${cmd[@]}" )
+
+    set +e
+    out="$("${full_cmd[@]}" 2>&1)"
+    rc=$?
+    set -e
+    if [[ "${rc}" -ne 0 ]]; then
+      printf '%s\n' "${out}" >&2
+    fi
+    return "${rc}"
+  fi
+
+  printf '%s\n' "${out}" >&2
+  return "${rc}"
 }
 
-run_vm "vm1" "${VM1_TDX_ENABLE}" "${VM1_TDX_BIOS}" "${VM1_SGX_ENABLE}" "${VM1_SGX_EPC_SIZE}" "${VM1_SSH_PORT}" "${VM1_DISK}" "${VM1_SEED}" "${VM1_MEM}" "${VM1_CPUS}" "${CXL_MEM_NODE}" "${VM1_CPU_NODE}"
-run_vm "vm2" "${VM2_TDX_ENABLE}" "${VM2_TDX_BIOS}" "${VM2_SGX_ENABLE}" "${VM2_SGX_EPC_SIZE}" "${VM2_SSH_PORT}" "${VM2_DISK}" "${VM2_SEED}" "${VM2_MEM}" "${VM2_CPUS}" "${CXL_MEM_NODE}" "${VM2_CPU_NODE}"
+run_vm "vm1" "${VM1_TDX_ENABLE}" "${VM1_TDX_BIOS}" "${VM1_SGX_ENABLE}" "${VM1_SGX_EPC_SIZE}" "${VM1_SGX_EPC_PREALLOC}" "${VM1_SSH_PORT}" "${VM1_DISK}" "${VM1_SEED}" "${VM1_MEM}" "${VM1_CPUS}" "${CXL_MEM_NODE}" "${VM1_CPU_NODE}"
+run_vm "vm2" "${VM2_TDX_ENABLE}" "${VM2_TDX_BIOS}" "${VM2_SGX_ENABLE}" "${VM2_SGX_EPC_SIZE}" "${VM2_SGX_EPC_PREALLOC}" "${VM2_SSH_PORT}" "${VM2_DISK}" "${VM2_SEED}" "${VM2_MEM}" "${VM2_CPUS}" "${CXL_MEM_NODE}" "${VM2_CPU_NODE}"
 
 echo "[+] VMs started."
 echo "    VM1 ssh: ssh ubuntu@127.0.0.1 -p ${VM1_SSH_PORT}"

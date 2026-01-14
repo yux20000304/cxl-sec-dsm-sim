@@ -35,6 +35,7 @@ set -euo pipefail
 #
 # SGX-in-guest knobs:
 #   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: 256M)
+#   SGX_EPC_PREALLOC: auto|on|off EPC preallocation mode (default: auto; set off if QEMU fails with qemu_prealloc_mem).
 #   SGX_TOKEN_MODE  : auto|require|skip (default: auto). "auto" tries to fetch token but continues if it fails.
 #
 # Shared-memory (CXL) latency simulation:
