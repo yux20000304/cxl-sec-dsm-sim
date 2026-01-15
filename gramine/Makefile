@@ -9,12 +9,16 @@ CXL_RING_PATH ?= /sys/bus/pci/devices/0000:00:02.0/resource2
 CXL_RING_COUNT ?= 4
 CXL_RING_MAP_SIZE ?= 134217728
 
+# GAPBS defaults.
+GAPBS_KERNEL ?= bfs
+
 # 0 = use guest system libc (recommended for direct mode)
 # 1 = use Gramine runtime glibc (closer to SGX mode)
 USE_RUNTIME_GLIBC ?= 0
 
 MANIFEST_COMMON_DEFS = -Dsgx_size=$(SGX_SIZE) -Dsgx_threads=$(SGX_THREADS) -Dlog_level=$(LOG_LEVEL)
 MANIFEST_RING_DEFS = -Dcxl_ring_path="$(CXL_RING_PATH)" -Dcxl_ring_count="$(CXL_RING_COUNT)" -Dcxl_ring_map_size="$(CXL_RING_MAP_SIZE)"
+MANIFEST_GAPBS_DEFS = -Dgapbs_kernel="$(GAPBS_KERNEL)" -Dgapbs_cxl_path="$(CXL_RING_PATH)" -Dgapbs_cxl_map_size="$(CXL_RING_MAP_SIZE)"
 
 all: native ring
 
@@ -24,6 +28,14 @@ ring: redis-ring.manifest
 links:
 	ln -sfn /usr/bin/redis-server redis-native
 	ln -sfn ../redis/src/redis-server redis-ring
+	ln -sfn ../gapbs/$(GAPBS_KERNEL) gapbs-native
+	ln -sfn ../gapbs/$(GAPBS_KERNEL)-ring gapbs-ring
+
+gapbs-native.manifest: gapbs-native.manifest.template
+	USE_RUNTIME_GLIBC="$(USE_RUNTIME_GLIBC)" gramine-manifest $(MANIFEST_COMMON_DEFS) -Dgapbs_kernel="$(GAPBS_KERNEL)" $< $@
+
+gapbs-ring.manifest: gapbs-ring.manifest.template
+	USE_RUNTIME_GLIBC="$(USE_RUNTIME_GLIBC)" gramine-manifest $(MANIFEST_COMMON_DEFS) $(MANIFEST_GAPBS_DEFS) $< $@
 
 redis-native.manifest: redis-native.manifest.template redis.conf
 	USE_RUNTIME_GLIBC="$(USE_RUNTIME_GLIBC)" gramine-manifest $(MANIFEST_COMMON_DEFS) $< $@

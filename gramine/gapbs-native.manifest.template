@@ -1,0 +1,80 @@
+## Gramine manifest template: GAPBS (native).
+##
+## This runs a GAPBS kernel under Gramine. It is primarily intended for
+## `gramine-direct` (no SGX hardware required), but includes a minimal SGX
+## section for future experiments with `gramine-sgx`.
+##
+## Usage inside VM:
+##   cd /mnt/hostshare/gapbs && make          # build native GAPBS
+##   cd /mnt/hostshare/gramine
+##   make links gapbs-native.manifest GAPBS_KERNEL=bfs
+##   gramine-direct ./gapbs-native -g 16 -n 1
+
+{% set kernel = gapbs_kernel | default('bfs') %}
+
+libos.entrypoint = "/repo/gapbs/{{ kernel }}"
+
+loader.entrypoint = { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so" }
+loader.insecure__use_cmdline_argv = true
+loader.log_level = "{{ log_level | default('warning') }}"
+
+loader.env.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+loader.env.LD_LIBRARY_PATH = "/lib:/lib/x86_64-linux-gnu:/usr/lib:/usr/lib/x86_64-linux-gnu"
+
+# OpenMP configuration is often set via env vars.
+loader.env.OMP_NUM_THREADS = { passthrough = true }
+loader.env.OMP_PROC_BIND = { passthrough = true }
+loader.env.OMP_PLACES = { passthrough = true }
+loader.env.GOMP_CPU_AFFINITY = { passthrough = true }
+
+fs.mounts = [
+  # Repo root (parent dir of this `gramine/` folder).
+  { uri = "file:..", path = "/repo" },
+
+  # System directories.
+  { uri = "file:/usr",  path = "/usr" },
+  { uri = "file:/etc",  path = "/etc" },
+  { uri = "file:/tmp",  path = "/tmp" },
+  { uri = "file:/dev",  path = "/dev" },
+  { uri = "file:/home", path = "/home" },
+
+{% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
+  # Use Gramine runtime glibc (closer to SGX mode).
+  { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc", path = "/lib" },
+  { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc", path = "/lib64" },
+{% else %}
+  # Use guest system libc (often faster for direct mode).
+  { uri = "file:/lib",   path = "/lib" },
+  { uri = "file:/lib64", path = "/lib64" },
+{% endif %}
+]
+
+sgx.enclave_size = "{{ sgx_size | default('1024M') }}"
+sgx.max_threads = {{ sgx_threads | default(64) }}
+sgx.debug = true
+
+sgx.trusted_files = [
+  "file:/repo/gapbs/{{ kernel }}",
+  "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so",
+
+{% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
+  "file:/usr/lib/x86_64-linux-gnu/gramine/runtime/glibc/",
+{% else %}
+  "file:/lib/",
+  "file:/lib64/",
+  "file:/lib/x86_64-linux-gnu/",
+  "file:/usr/lib/x86_64-linux-gnu/",
+{% endif %}
+]
+
+sgx.allowed_files = [
+  "file:/repo/",
+  "file:/usr/",
+  "file:/etc/",
+  "file:/tmp/",
+  "file:/dev/",
+  "file:/home/",
+  "file:/lib/",
+  "file:/lib64/",
+]
+

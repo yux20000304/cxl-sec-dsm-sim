@@ -13,6 +13,7 @@ Highlights
 - `guest/` – guest-side helper scripts: bind ivshmem -> uio, basic install/start.
 - `shim/` – legacy Python shim (kept for reference; replaced by C direct path).
 - `gramine/` – Gramine manifest templates and build rules for Redis.
+- `gapbs/` – GAP Benchmark Suite (graph kernels); includes a `*-ring` build that copies CSR arrays into a shared-memory mmap region.
 - `kvm/` – Phase 4 hints for KVM/EPT permission checks (no kernel build here).
 - `ring_client/` – C direct client (binary ring, no RESP).
 - `cxl_sec_mgr/` – ACL/key table manager process for secure ring mode.
@@ -229,6 +230,25 @@ bash scripts/host_recreate_and_bench_gramine.sh
 ```
 Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
 The compare CSV includes `NativeTCP`, `GramineNativeTCP`, `GramineSodiumTCP`, `GramineRing`, and `GramineRingSecure` labels.
+
+### One command: recreate VMs + GAPBS benchmarks (native vs ring)
+This rebuilds VM1/VM2 and runs a GAPBS kernel in VM1:
+- native GAPBS (no Gramine)
+- native GAPBS under `gramine-direct`
+- `*-ring` GAPBS under `gramine-direct` using ivshmem BAR2 as `GAPBS_CXL_PATH`
+
+```bash
+sudo bash scripts/host_recreate_and_bench_gapbs_gramine.sh
+```
+Tune the workload with env vars, e.g.:
+```bash
+sudo GAPBS_KERNEL=bfs SCALE=18 TRIALS=3 OMP_THREADS=4 bash scripts/host_recreate_and_bench_gapbs_gramine.sh
+```
+
+### Local GAPBS benchmark (no VMs)
+```bash
+bash scripts/host_bench_gapbs_local.sh
+```
 
 ## TDX hardware: TDX guests (VMs + ivshmem, no Gramine)
 This workflow keeps the two-VM + ivshmem setup, but runs both Redis variants directly
