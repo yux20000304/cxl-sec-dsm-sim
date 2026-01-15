@@ -1,3 +1,7 @@
 [submodule "redis"]
 	path = redis
 	url = https://github.com/yux20000304/redis.git
+
+[submodule "gapbs"]
+	path = gapbs
+	url = https://github.com/yux20000304/gapbs.git
