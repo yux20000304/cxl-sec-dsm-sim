@@ -25,19 +25,24 @@ set -euo pipefail
 #   SKIP_RECREATE  : 1 to reuse existing SGX-enabled VMs (default: 0)
 #   SSH_KEY        : optional ssh private key path (used when SKIP_RECREATE=1)
 #   GAPBS_KERNEL   : bfs|cc|pr|... (default: bfs)
-#   SCALE          : -g scale for Kronecker graph (default: 18)
+#   SCALE          : -g scale for Kronecker graph (default: 22)
 #   DEGREE         : -k degree for synthetic graph (default: 16)
 #   TRIALS         : -n trials (default: 3)
 #   OMP_THREADS    : OMP_NUM_THREADS (default: 4)
 #   RING_PATH      : BAR2 sysfs resource file (default: /sys/bus/pci/devices/0000:00:02.0/resource2)
-#   RING_MAP_SIZE  : mmap size in bytes (default: 134217728 = 128MB)
+#   RING_MAP_SIZE  : mmap size in bytes (default: 2147483648 = 2GB)
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr inside vm1 (default: 19002)
 #
 # SGX-in-guest knobs:
-#   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: 256M)
-#   VM2_SGX_EPC_SIZE: EPC section size for VM2 (default: 256M)
+#   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: auto; splits host EPC in half)
+#   VM2_SGX_EPC_SIZE: EPC section size for VM2 (default: auto; splits host EPC in half)
 #   SGX_EPC_PREALLOC: auto|on|off EPC preallocation mode (default: auto)
 #   SGX_TOKEN_MODE  : auto|require|skip (default: auto)
+#
+# Gramine/SGX manifest knobs:
+#   SGX_SIZE       : manifest sgx.enclave_size (default: 2048M)
+#   SGX_THREADS    : manifest sgx.max_threads (default: 64)
+#   LOG_LEVEL      : Gramine log level (default: warning)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
@@ -54,17 +59,54 @@ VM1_SSH="${VM1_SSH:-2222}"
 VM2_SSH="${VM2_SSH:-2223}"
 
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
-SCALE="${SCALE:-18}"
+SCALE="${SCALE:-22}"
 DEGREE="${DEGREE:-16}"
 TRIALS="${TRIALS:-3}"
 OMP_THREADS="${OMP_THREADS:-4}"
 
 RING_PATH="${RING_PATH:-/sys/bus/pci/devices/0000:00:02.0/resource2}"
-RING_MAP_SIZE="${RING_MAP_SIZE:-134217728}"
+RING_MAP_SIZE="${RING_MAP_SIZE:-2147483648}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19002}"
 
-VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-256M}"
-VM2_SGX_EPC_SIZE="${VM2_SGX_EPC_SIZE:-256M}"
+SGX_SIZE="${SGX_SIZE:-2048M}"
+SGX_THREADS="${SGX_THREADS:-64}"
+LOG_LEVEL="${LOG_LEVEL:-warning}"
+
+host_epc_total_mib() {
+  local total=0
+  if [[ -d /sys/kernel/mm/sgx_epc ]]; then
+    local f
+    for f in /sys/kernel/mm/sgx_epc/*/size; do
+      [[ -r "${f}" ]] || continue
+      local b
+      b="$(cat "${f}" 2>/dev/null || true)"
+      if [[ "${b}" =~ ^[0-9]+$ ]]; then
+        total=$((total + b))
+      fi
+    done
+  fi
+  if [[ "${total}" -le 0 ]]; then
+    echo 0
+    return 0
+  fi
+  echo $((total / 1024 / 1024))
+}
+
+if [[ -z "${VM1_SGX_EPC_SIZE:-}" || -z "${VM2_SGX_EPC_SIZE:-}" ]]; then
+  host_epc_mib="$(host_epc_total_mib)"
+  if [[ "${host_epc_mib}" -gt 0 ]]; then
+    per_vm_mib=$((host_epc_mib / 2))
+    if [[ "${per_vm_mib}" -lt 64 ]]; then
+      per_vm_mib=64
+    fi
+    VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-${per_vm_mib}M}"
+    VM2_SGX_EPC_SIZE="${VM2_SGX_EPC_SIZE:-${per_vm_mib}M}"
+  else
+    VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-512M}"
+    VM2_SGX_EPC_SIZE="${VM2_SGX_EPC_SIZE:-512M}"
+  fi
+fi
+
 SGX_EPC_PREALLOC="${SGX_EPC_PREALLOC:-auto}"
 SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
 
@@ -228,8 +270,8 @@ echo "[*] Building cxl_sec_mgr in vm1 (/tmp/cxl_sec_mgr) ..."
 ssh_vm1 "cd /mnt/hostshare/cxl_sec_mgr && sudo -n make clean && sudo -n make -j2 && sudo -n cp -f cxl_sec_mgr /tmp/cxl_sec_mgr"
 
 echo "[*] Building Gramine manifests + SGX artifacts for GAPBS in vm1 ..."
-ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make links gapbs-native.manifest gapbs-ring.manifest gapbs-ring-secure.manifest GAPBS_KERNEL='${GAPBS_KERNEL}' CXL_RING_PATH='${RING_PATH}' CXL_RING_MAP_SIZE='${RING_MAP_SIZE}' USE_RUNTIME_GLIBC=1"
-ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make sgx-sign-gapbs USE_RUNTIME_GLIBC=1"
+ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make -B links gapbs-native.manifest gapbs-ring.manifest gapbs-ring-secure.manifest GAPBS_KERNEL='${GAPBS_KERNEL}' CXL_RING_PATH='${RING_PATH}' CXL_RING_MAP_SIZE='${RING_MAP_SIZE}' SGX_SIZE='${SGX_SIZE}' SGX_THREADS='${SGX_THREADS}' LOG_LEVEL='${LOG_LEVEL}' USE_RUNTIME_GLIBC=1"
+ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make sgx-sign-gapbs SGX_SIZE='${SGX_SIZE}' SGX_THREADS='${SGX_THREADS}' LOG_LEVEL='${LOG_LEVEL}' USE_RUNTIME_GLIBC=1"
 
 set +e
 token_out="$(ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make sgx-token-gapbs" 2>&1)"
@@ -453,26 +495,76 @@ sgx_crypto_vm2_teps="$(teps_from_edges_time "${sgx_crypto_vm2_edges}" "${sgx_cry
 sgx_secure_vm1_teps="$(teps_from_edges_time "${sgx_secure_vm1_edges}" "${sgx_secure_vm1_avg}")"
 sgx_secure_vm2_teps="$(teps_from_edges_time "${sgx_secure_vm2_edges}" "${sgx_secure_vm2_avg}")"
 
+pick_nonempty() {
+  local a="$1"
+  local b="$2"
+  if [[ -n "${a}" ]]; then
+    echo "${a}"
+  else
+    echo "${b}"
+  fi
+}
+
+avg2_float() {
+  local a="$1"
+  local b="$2"
+  awk -v aa="${a}" -v bb="${b}" 'BEGIN{
+    if (aa == "" || bb == "") { print ""; exit }
+    printf "%.5f", ((aa + bb) / 2.0)
+  }'
+}
+
+avg2_int() {
+  local a="$1"
+  local b="$2"
+  awk -v aa="${a}" -v bb="${b}" 'BEGIN{
+    if (aa == "" || bb == "") { print ""; exit }
+    printf "%.0f", ((aa + bb) / 2.0)
+  }'
+}
+
+native_avg_edges="$(pick_nonempty "${native_vm1_edges}" "${native_vm2_edges}")"
+plain_ring_avg_edges="$(pick_nonempty "${plain_ring_vm1_edges}" "${plain_ring_vm2_edges}")"
+sgx_ring_avg_edges="$(pick_nonempty "${sgx_ring_vm1_edges}" "${sgx_ring_vm2_edges}")"
+sgx_crypto_avg_edges="$(pick_nonempty "${sgx_crypto_vm1_edges}" "${sgx_crypto_vm2_edges}")"
+sgx_secure_avg_edges="$(pick_nonempty "${sgx_secure_vm1_edges}" "${sgx_secure_vm2_edges}")"
+
+native_avg_time="$(avg2_float "${native_vm1_avg}" "${native_vm2_avg}")"
+plain_ring_avg_time="$(avg2_float "${plain_ring_vm1_avg}" "${plain_ring_vm2_avg}")"
+sgx_ring_avg_time="$(avg2_float "${sgx_ring_vm1_avg}" "${sgx_ring_vm2_avg}")"
+sgx_crypto_avg_time="$(avg2_float "${sgx_crypto_vm1_avg}" "${sgx_crypto_vm2_avg}")"
+sgx_secure_avg_time="$(avg2_float "${sgx_secure_vm1_avg}" "${sgx_secure_vm2_avg}")"
+
+native_avg_teps="$(avg2_int "${native_vm1_teps}" "${native_vm2_teps}")"
+plain_ring_avg_teps="$(avg2_int "${plain_ring_vm1_teps}" "${plain_ring_vm2_teps}")"
+sgx_ring_avg_teps="$(avg2_int "${sgx_ring_vm1_teps}" "${sgx_ring_vm2_teps}")"
+sgx_crypto_avg_teps="$(avg2_int "${sgx_crypto_vm1_teps}" "${sgx_crypto_vm2_teps}")"
+sgx_secure_avg_teps="$(avg2_int "${sgx_secure_vm1_teps}" "${sgx_secure_vm2_teps}")"
+
 {
   echo "label,vm,kernel,scale,degree,trials,omp_threads,edge_traversals,avg_time_s,throughput_teps"
   echo "Native,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${native_vm1_edges},${native_vm1_avg},${native_vm1_teps}"
   echo "Native,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${native_vm2_edges},${native_vm2_avg},${native_vm2_teps}"
+  echo "Native,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${native_avg_edges},${native_avg_time},${native_avg_teps}"
   echo "MultihostRing,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_vm1_edges},${plain_ring_vm1_avg},${plain_ring_vm1_teps}"
   echo "MultihostRing,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_vm2_edges},${plain_ring_vm2_avg},${plain_ring_vm2_teps}"
+  echo "MultihostRing,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_avg_edges},${plain_ring_avg_time},${plain_ring_avg_teps}"
   echo "GramineSGXVMRing,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_ring_vm1_edges},${sgx_ring_vm1_avg},${sgx_ring_vm1_teps}"
   echo "GramineSGXVMRing,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_ring_vm2_edges},${sgx_ring_vm2_avg},${sgx_ring_vm2_teps}"
+  echo "GramineSGXVMRing,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_ring_avg_edges},${sgx_ring_avg_time},${sgx_ring_avg_teps}"
   echo "GramineSGXVMCrypto,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_crypto_vm1_edges},${sgx_crypto_vm1_avg},${sgx_crypto_vm1_teps}"
   echo "GramineSGXVMCrypto,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_crypto_vm2_edges},${sgx_crypto_vm2_avg},${sgx_crypto_vm2_teps}"
+  echo "GramineSGXVMCrypto,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_crypto_avg_edges},${sgx_crypto_avg_time},${sgx_crypto_avg_teps}"
   echo "GramineSGXVMSecure,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_secure_vm1_edges},${sgx_secure_vm1_avg},${sgx_secure_vm1_teps}"
   echo "GramineSGXVMSecure,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_secure_vm2_edges},${sgx_secure_vm2_avg},${sgx_secure_vm2_teps}"
+  echo "GramineSGXVMSecure,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_secure_avg_edges},${sgx_secure_avg_time},${sgx_secure_avg_teps}"
 } > "${compare_csv}"
 
 echo "[+] Done."
 echo "[+] Throughput (TEPS; higher is better):"
-echo "    Native(vm1/vm2)=${native_vm1_teps}/${native_vm2_teps}"
-echo "    MultihostRing(vm1/vm2)=${plain_ring_vm1_teps}/${plain_ring_vm2_teps}"
-echo "    GramineSGXVMRing(vm1/vm2)=${sgx_ring_vm1_teps}/${sgx_ring_vm2_teps}"
-echo "    GramineSGXVMCrypto(vm1/vm2)=${sgx_crypto_vm1_teps}/${sgx_crypto_vm2_teps}"
-echo "    GramineSGXVMSecure(vm1/vm2)=${sgx_secure_vm1_teps}/${sgx_secure_vm2_teps}"
+echo "    Native(vm1/vm2/avg)=${native_vm1_teps}/${native_vm2_teps}/${native_avg_teps}"
+echo "    MultihostRing(vm1/vm2/avg)=${plain_ring_vm1_teps}/${plain_ring_vm2_teps}/${plain_ring_avg_teps}"
+echo "    GramineSGXVMRing(vm1/vm2/avg)=${sgx_ring_vm1_teps}/${sgx_ring_vm2_teps}/${sgx_ring_avg_teps}"
+echo "    GramineSGXVMCrypto(vm1/vm2/avg)=${sgx_crypto_vm1_teps}/${sgx_crypto_vm2_teps}/${sgx_crypto_avg_teps}"
+echo "    GramineSGXVMSecure(vm1/vm2/avg)=${sgx_secure_vm1_teps}/${sgx_secure_vm2_teps}/${sgx_secure_avg_teps}"
 echo "    ${compare_csv}"
-

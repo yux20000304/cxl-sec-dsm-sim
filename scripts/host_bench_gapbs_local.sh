@@ -12,26 +12,26 @@ set -euo pipefail
 #
 # Tunables (env):
 #   GAPBS_KERNEL       : bfs|cc|pr|... (default: bfs)
-#   SCALE              : -g scale for Kronecker graph (default: 18)
+#   SCALE              : -g scale for Kronecker graph (default: 20)
 #   DEGREE             : -k degree (default: 16)
 #   TRIALS             : -n trials (default: 3)
 #   OMP_THREADS        : OMP_NUM_THREADS (default: 4)
 #   GAPBS_CXL_PATH     : shared memory backing (default: /dev/shm/gapbs_cxl_shared.raw)
-#   GAPBS_CXL_MAP_SIZE : bytes (or K/M/G suffix, default: 134217728)
+#   GAPBS_CXL_MAP_SIZE : bytes (or K/M/G suffix, default: 536870912)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
 mkdir -p "${RESULTS_DIR}"
 
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
-SCALE="${SCALE:-18}"
+SCALE="${SCALE:-20}"
 DEGREE="${DEGREE:-16}"
 TRIALS="${TRIALS:-3}"
 OMP_THREADS="${OMP_THREADS:-4}"
 
 export OMP_NUM_THREADS="${OMP_THREADS}"
 export GAPBS_CXL_PATH="${GAPBS_CXL_PATH:-/dev/shm/gapbs_cxl_shared.raw}"
-export GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-134217728}"
+export GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-536870912}"
 
 ts="$(date +%Y%m%d_%H%M%S)"
 native_log="${RESULTS_DIR}/gapbs_native_${GAPBS_KERNEL}_${ts}.log"
@@ -60,4 +60,3 @@ echo "[+] Done."
 echo "    ${native_log}"
 echo "    ${ring_log}"
 echo "    ${compare_csv}"
-

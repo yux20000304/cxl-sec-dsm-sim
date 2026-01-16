@@ -18,12 +18,12 @@ set -euo pipefail
 #
 # Tunables (env):
 #   GAPBS_KERNEL   : bfs|cc|pr|... (default: bfs)
-#   SCALE          : -g scale for Kronecker graph (default: 18)
+#   SCALE          : -g scale for Kronecker graph (default: 20)
 #   DEGREE         : -k degree for synthetic graph (default: 16)
 #   TRIALS         : -n trials (default: 3)
 #   OMP_THREADS    : OMP_NUM_THREADS (default: 4)
 #   RING_PATH      : shared-memory backing file (default: /dev/shm/gapbs_cxl_shared.raw)
-#   RING_MAP_SIZE  : mmap size in bytes (default: 134217728 = 128MB)
+#   RING_MAP_SIZE  : mmap size in bytes (default: 536870912 = 512MB)
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr (default: 19002)
 #
 # Gramine/SGX tunables:
@@ -45,13 +45,13 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
-SCALE="${SCALE:-18}"
+SCALE="${SCALE:-20}"
 DEGREE="${DEGREE:-16}"
 TRIALS="${TRIALS:-3}"
 OMP_THREADS="${OMP_THREADS:-4}"
 
 RING_PATH="${RING_PATH:-/dev/shm/gapbs_cxl_shared.raw}"
-RING_MAP_SIZE="${RING_MAP_SIZE:-134217728}"
+RING_MAP_SIZE="${RING_MAP_SIZE:-536870912}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19002}"
 
 SGX_SIZE="${SGX_SIZE:-1024M}"
@@ -239,7 +239,7 @@ make -C "${ROOT}/cxl_sec_mgr" clean
 make -C "${ROOT}/cxl_sec_mgr" -j"$(nproc)" BIN=/tmp/cxl_sec_mgr
 
 echo "[*] Building Gramine manifests + SGX artifacts for GAPBS ..."
-make -C "${ROOT}/gramine" links \
+make -C "${ROOT}/gramine" -B links \
   gapbs-native.manifest gapbs-ring.manifest gapbs-ring-secure.manifest \
   GAPBS_KERNEL="${GAPBS_KERNEL}" \
   CXL_RING_PATH="${RING_PATH}" CXL_RING_MAP_SIZE="${RING_MAP_SIZE}" \
@@ -506,26 +506,76 @@ sgx_crypto_h2_teps="$(teps_from_edges_time "${sgx_crypto_h2_edges}" "${sgx_crypt
 sgx_secure_h1_teps="$(teps_from_edges_time "${sgx_secure_h1_edges}" "${sgx_secure_h1_avg}")"
 sgx_secure_h2_teps="$(teps_from_edges_time "${sgx_secure_h2_edges}" "${sgx_secure_h2_avg}")"
 
+pick_nonempty() {
+  local a="$1"
+  local b="$2"
+  if [[ -n "${a}" ]]; then
+    echo "${a}"
+  else
+    echo "${b}"
+  fi
+}
+
+avg2_float() {
+  local a="$1"
+  local b="$2"
+  awk -v aa="${a}" -v bb="${b}" 'BEGIN{
+    if (aa == "" || bb == "") { print ""; exit }
+    printf "%.5f", ((aa + bb) / 2.0)
+  }'
+}
+
+avg2_int() {
+  local a="$1"
+  local b="$2"
+  awk -v aa="${a}" -v bb="${b}" 'BEGIN{
+    if (aa == "" || bb == "") { print ""; exit }
+    printf "%.0f", ((aa + bb) / 2.0)
+  }'
+}
+
+native_avg_edges="$(pick_nonempty "${native_h1_edges}" "${native_h2_edges}")"
+plain_ring_avg_edges="$(pick_nonempty "${plain_ring_h1_edges}" "${plain_ring_h2_edges}")"
+sgx_ring_avg_edges="$(pick_nonempty "${sgx_ring_h1_edges}" "${sgx_ring_h2_edges}")"
+sgx_crypto_avg_edges="$(pick_nonempty "${sgx_crypto_h1_edges}" "${sgx_crypto_h2_edges}")"
+sgx_secure_avg_edges="$(pick_nonempty "${sgx_secure_h1_edges}" "${sgx_secure_h2_edges}")"
+
+native_avg_time="$(avg2_float "${native_h1_avg}" "${native_h2_avg}")"
+plain_ring_avg_time="$(avg2_float "${plain_ring_h1_avg}" "${plain_ring_h2_avg}")"
+sgx_ring_avg_time="$(avg2_float "${sgx_ring_h1_avg}" "${sgx_ring_h2_avg}")"
+sgx_crypto_avg_time="$(avg2_float "${sgx_crypto_h1_avg}" "${sgx_crypto_h2_avg}")"
+sgx_secure_avg_time="$(avg2_float "${sgx_secure_h1_avg}" "${sgx_secure_h2_avg}")"
+
+native_avg_teps="$(avg2_int "${native_h1_teps}" "${native_h2_teps}")"
+plain_ring_avg_teps="$(avg2_int "${plain_ring_h1_teps}" "${plain_ring_h2_teps}")"
+sgx_ring_avg_teps="$(avg2_int "${sgx_ring_h1_teps}" "${sgx_ring_h2_teps}")"
+sgx_crypto_avg_teps="$(avg2_int "${sgx_crypto_h1_teps}" "${sgx_crypto_h2_teps}")"
+sgx_secure_avg_teps="$(avg2_int "${sgx_secure_h1_teps}" "${sgx_secure_h2_teps}")"
+
 {
   echo "label,vm,kernel,scale,degree,trials,omp_threads,edge_traversals,avg_time_s,throughput_teps"
   echo "Native,host1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${native_h1_edges},${native_h1_avg},${native_h1_teps}"
   echo "Native,host2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${native_h2_edges},${native_h2_avg},${native_h2_teps}"
+  echo "Native,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${native_avg_edges},${native_avg_time},${native_avg_teps}"
   echo "MultihostRing,host1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_h1_edges},${plain_ring_h1_avg},${plain_ring_h1_teps}"
   echo "MultihostRing,host2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_h2_edges},${plain_ring_h2_avg},${plain_ring_h2_teps}"
+  echo "MultihostRing,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_avg_edges},${plain_ring_avg_time},${plain_ring_avg_teps}"
   echo "GramineSGXMultihostRing,host1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_ring_h1_edges},${sgx_ring_h1_avg},${sgx_ring_h1_teps}"
   echo "GramineSGXMultihostRing,host2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_ring_h2_edges},${sgx_ring_h2_avg},${sgx_ring_h2_teps}"
+  echo "GramineSGXMultihostRing,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_ring_avg_edges},${sgx_ring_avg_time},${sgx_ring_avg_teps}"
   echo "GramineSGXMultihostCrypto,host1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_crypto_h1_edges},${sgx_crypto_h1_avg},${sgx_crypto_h1_teps}"
   echo "GramineSGXMultihostCrypto,host2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_crypto_h2_edges},${sgx_crypto_h2_avg},${sgx_crypto_h2_teps}"
+  echo "GramineSGXMultihostCrypto,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_crypto_avg_edges},${sgx_crypto_avg_time},${sgx_crypto_avg_teps}"
   echo "GramineSGXMultihostSecure,host1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_secure_h1_edges},${sgx_secure_h1_avg},${sgx_secure_h1_teps}"
   echo "GramineSGXMultihostSecure,host2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_secure_h2_edges},${sgx_secure_h2_avg},${sgx_secure_h2_teps}"
+  echo "GramineSGXMultihostSecure,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${sgx_secure_avg_edges},${sgx_secure_avg_time},${sgx_secure_avg_teps}"
 } > "${compare_csv}"
 
 echo "[+] Done."
 echo "[+] Throughput (TEPS; higher is better):"
-echo "    Native(host1/host2)=${native_h1_teps}/${native_h2_teps}"
-echo "    MultihostRing(host1/host2)=${plain_ring_h1_teps}/${plain_ring_h2_teps}"
-echo "    GramineSGXMultihostRing(host1/host2)=${sgx_ring_h1_teps}/${sgx_ring_h2_teps}"
-echo "    GramineSGXMultihostCrypto(host1/host2)=${sgx_crypto_h1_teps}/${sgx_crypto_h2_teps}"
-echo "    GramineSGXMultihostSecure(host1/host2)=${sgx_secure_h1_teps}/${sgx_secure_h2_teps}"
+echo "    Native(host1/host2/avg)=${native_h1_teps}/${native_h2_teps}/${native_avg_teps}"
+echo "    MultihostRing(host1/host2/avg)=${plain_ring_h1_teps}/${plain_ring_h2_teps}/${plain_ring_avg_teps}"
+echo "    GramineSGXMultihostRing(host1/host2/avg)=${sgx_ring_h1_teps}/${sgx_ring_h2_teps}/${sgx_ring_avg_teps}"
+echo "    GramineSGXMultihostCrypto(host1/host2/avg)=${sgx_crypto_h1_teps}/${sgx_crypto_h2_teps}/${sgx_crypto_avg_teps}"
+echo "    GramineSGXMultihostSecure(host1/host2/avg)=${sgx_secure_h1_teps}/${sgx_secure_h2_teps}/${sgx_secure_avg_teps}"
 echo "    ${compare_csv}"
-

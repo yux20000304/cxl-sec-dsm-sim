@@ -20,7 +20,7 @@ set -euo pipefail
 # Tunables (env):
 #   BASE_IMG       : ubuntu cloud image path (optional; if unset, host_quickstart downloads 24.04 by default)
 #   VM1_SSH/VM2_SSH: forwarded SSH ports (default: 2222/2223)
-#   REQ_N          : total requests for TCP benchmark (default: 200000)
+#   REQ_N          : total requests for TCP benchmark (default: 1000000)
 #   CLIENTS        : redis-benchmark concurrency (default: 4)
 #   THREADS        : thread count for both benches (default: 4)
 #   PIPELINE       : redis-benchmark pipeline depth (-P) (default: 256)
@@ -34,7 +34,7 @@ set -euo pipefail
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr inside vm1 (default: 19001)
 #
 # SGX-in-guest knobs:
-#   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: 256M)
+#   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: 512M; SGX2-friendly)
 #   SGX_EPC_PREALLOC: auto|on|off EPC preallocation mode (default: auto; set off if QEMU fails with qemu_prealloc_mem).
 #   SGX_TOKEN_MODE  : auto|require|skip (default: auto). "auto" tries to fetch token but continues if it fails.
 #
@@ -53,7 +53,7 @@ fi
 VM1_SSH="${VM1_SSH:-2222}"
 VM2_SSH="${VM2_SSH:-2223}"
 
-REQ_N="${REQ_N:-200000}"
+REQ_N="${REQ_N:-1000000}"
 CLIENTS="${CLIENTS:-4}"
 THREADS="${THREADS:-4}"
 PIPELINE="${PIPELINE:-256}"
@@ -68,7 +68,7 @@ SODIUM_PORT="${SODIUM_PORT:-6380}"
 SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
 
-VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-256M}"
+VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-512M}"
 SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
 
 BASE_IMG="${BASE_IMG:-}"

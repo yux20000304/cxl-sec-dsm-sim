@@ -21,12 +21,12 @@ set -euo pipefail
 #   SKIP_RECREATE  : 1 to reuse existing VMs (no host sudo needed)
 #   SSH_KEY        : optional ssh private key path (used when SKIP_RECREATE=1)
 #   GAPBS_KERNEL   : bfs|cc|pr|... (default: bfs)
-#   SCALE          : -g scale for Kronecker graph (default: 18)
+#   SCALE          : -g scale for Kronecker graph (default: 20)
 #   DEGREE         : -k degree for synthetic graph (default: 16)
 #   TRIALS         : -n trials (default: 3)
 #   OMP_THREADS    : OMP_NUM_THREADS (default: 4)
 #   RING_PATH      : BAR2 resource file (default: /sys/bus/pci/devices/0000:00:02.0/resource2)
-#   RING_MAP_SIZE  : mmap size in bytes (default: 134217728 = 128MB)
+#   RING_MAP_SIZE  : mmap size in bytes (default: 536870912 = 512MB)
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr (default: 19000)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,13 +44,13 @@ VM1_SSH="${VM1_SSH:-2222}"
 VM2_SSH="${VM2_SSH:-2223}"
 
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
-SCALE="${SCALE:-18}"
+SCALE="${SCALE:-20}"
 DEGREE="${DEGREE:-16}"
 TRIALS="${TRIALS:-3}"
 OMP_THREADS="${OMP_THREADS:-4}"
 
 RING_PATH="${RING_PATH:-/sys/bus/pci/devices/0000:00:02.0/resource2}"
-RING_MAP_SIZE="${RING_MAP_SIZE:-134217728}"
+RING_MAP_SIZE="${RING_MAP_SIZE:-536870912}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19000}"
 
 BASE_IMG="${BASE_IMG:-}"
@@ -201,7 +201,7 @@ echo "[*] Building cxl_sec_mgr in vm1 (/tmp/cxl_sec_mgr) ..."
 ssh_vm1 "cd /mnt/hostshare/cxl_sec_mgr && sudo -n make clean && sudo -n make -j2 && sudo -n cp -f cxl_sec_mgr /tmp/cxl_sec_mgr"
 
 echo "[*] Building Gramine manifests for GAPBS in vm1 ..."
-ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make links gapbs-native.manifest gapbs-ring.manifest gapbs-ring-secure.manifest GAPBS_KERNEL='${GAPBS_KERNEL}' CXL_RING_PATH='${RING_PATH}' CXL_RING_MAP_SIZE='${RING_MAP_SIZE}'"
+ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make -B links gapbs-native.manifest gapbs-ring.manifest gapbs-ring-secure.manifest GAPBS_KERNEL='${GAPBS_KERNEL}' CXL_RING_PATH='${RING_PATH}' CXL_RING_MAP_SIZE='${RING_MAP_SIZE}'"
 
 vm1_ip="$(ssh_vm1 "ip -4 -o addr show dev cxl0 | awk '{print \$4}' | cut -d/ -f1")"
 vm2_ip="$(ssh_vm2 "ip -4 -o addr show dev cxl0 | awk '{print \$4}' | cut -d/ -f1")"
@@ -403,27 +403,78 @@ gramine_crypto_vm2_teps="$(teps_from_edges_time "${gramine_crypto_vm2_edges}" "$
 gramine_secure_vm1_teps="$(teps_from_edges_time "${gramine_secure_vm1_edges}" "${gramine_secure_vm1_avg}")"
 gramine_secure_vm2_teps="$(teps_from_edges_time "${gramine_secure_vm2_edges}" "${gramine_secure_vm2_avg}")"
 
+pick_nonempty() {
+  local a="$1"
+  local b="$2"
+  if [[ -n "${a}" ]]; then
+    echo "${a}"
+  else
+    echo "${b}"
+  fi
+}
+
+avg2_float() {
+  local a="$1"
+  local b="$2"
+  awk -v aa="${a}" -v bb="${b}" 'BEGIN{
+    if (aa == "" || bb == "") { print ""; exit }
+    printf "%.5f", ((aa + bb) / 2.0)
+  }'
+}
+
+avg2_int() {
+  local a="$1"
+  local b="$2"
+  awk -v aa="${a}" -v bb="${b}" 'BEGIN{
+    if (aa == "" || bb == "") { print ""; exit }
+    printf "%.0f", ((aa + bb) / 2.0)
+  }'
+}
+
+plain_native_avg_edges="$(pick_nonempty "${plain_native_vm1_edges}" "${plain_native_vm2_edges}")"
+plain_ring_avg_edges="$(pick_nonempty "${plain_ring_vm1_edges}" "${plain_ring_vm2_edges}")"
+gramine_ring_avg_edges="$(pick_nonempty "${gramine_ring_vm1_edges}" "${gramine_ring_vm2_edges}")"
+gramine_crypto_avg_edges="$(pick_nonempty "${gramine_crypto_vm1_edges}" "${gramine_crypto_vm2_edges}")"
+gramine_secure_avg_edges="$(pick_nonempty "${gramine_secure_vm1_edges}" "${gramine_secure_vm2_edges}")"
+
+plain_native_avg_time="$(avg2_float "${plain_native_vm1_avg}" "${plain_native_vm2_avg}")"
+plain_ring_avg_time="$(avg2_float "${plain_ring_vm1_avg}" "${plain_ring_vm2_avg}")"
+gramine_ring_avg_time="$(avg2_float "${gramine_ring_vm1_avg}" "${gramine_ring_vm2_avg}")"
+gramine_crypto_avg_time="$(avg2_float "${gramine_crypto_vm1_avg}" "${gramine_crypto_vm2_avg}")"
+gramine_secure_avg_time="$(avg2_float "${gramine_secure_vm1_avg}" "${gramine_secure_vm2_avg}")"
+
+plain_native_avg_teps="$(avg2_int "${plain_native_vm1_teps}" "${plain_native_vm2_teps}")"
+plain_ring_avg_teps="$(avg2_int "${plain_ring_vm1_teps}" "${plain_ring_vm2_teps}")"
+gramine_ring_avg_teps="$(avg2_int "${gramine_ring_vm1_teps}" "${gramine_ring_vm2_teps}")"
+gramine_crypto_avg_teps="$(avg2_int "${gramine_crypto_vm1_teps}" "${gramine_crypto_vm2_teps}")"
+gramine_secure_avg_teps="$(avg2_int "${gramine_secure_vm1_teps}" "${gramine_secure_vm2_teps}")"
+
 {
   echo "label,vm,kernel,scale,degree,trials,omp_threads,edge_traversals,avg_time_s,throughput_teps"
   echo "Native,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_native_vm1_edges},${plain_native_vm1_avg},${plain_native_vm1_teps}"
   echo "Native,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_native_vm2_edges},${plain_native_vm2_avg},${plain_native_vm2_teps}"
+  echo "Native,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_native_avg_edges},${plain_native_avg_time},${plain_native_avg_teps}"
   echo "MultihostRing,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_vm1_edges},${plain_ring_vm1_avg},${plain_ring_vm1_teps}"
   echo "MultihostRing,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_vm2_edges},${plain_ring_vm2_avg},${plain_ring_vm2_teps}"
+  echo "MultihostRing,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${plain_ring_avg_edges},${plain_ring_avg_time},${plain_ring_avg_teps}"
   echo "GramineMultihostRing,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_ring_vm1_edges},${gramine_ring_vm1_avg},${gramine_ring_vm1_teps}"
   echo "GramineMultihostRing,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_ring_vm2_edges},${gramine_ring_vm2_avg},${gramine_ring_vm2_teps}"
+  echo "GramineMultihostRing,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_ring_avg_edges},${gramine_ring_avg_time},${gramine_ring_avg_teps}"
   echo "GramineMultihostCrypto,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_crypto_vm1_edges},${gramine_crypto_vm1_avg},${gramine_crypto_vm1_teps}"
   echo "GramineMultihostCrypto,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_crypto_vm2_edges},${gramine_crypto_vm2_avg},${gramine_crypto_vm2_teps}"
+  echo "GramineMultihostCrypto,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_crypto_avg_edges},${gramine_crypto_avg_time},${gramine_crypto_avg_teps}"
   echo "GramineMultihostSecure,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_secure_vm1_edges},${gramine_secure_vm1_avg},${gramine_secure_vm1_teps}"
   echo "GramineMultihostSecure,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_secure_vm2_edges},${gramine_secure_vm2_avg},${gramine_secure_vm2_teps}"
+  echo "GramineMultihostSecure,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gramine_secure_avg_edges},${gramine_secure_avg_time},${gramine_secure_avg_teps}"
 } > "${compare_csv}"
 
 echo "[+] Done."
 echo "[+] Throughput (TEPS; higher is better):"
-echo "    Native(vm1/vm2)=${plain_native_vm1_teps}/${plain_native_vm2_teps}"
-echo "    MultihostRing(vm1/vm2)=${plain_ring_vm1_teps}/${plain_ring_vm2_teps}"
-echo "    GramineMultihostRing(vm1/vm2)=${gramine_ring_vm1_teps}/${gramine_ring_vm2_teps}"
-echo "    GramineMultihostCrypto(vm1/vm2)=${gramine_crypto_vm1_teps}/${gramine_crypto_vm2_teps}"
-echo "    GramineMultihostSecure(vm1/vm2)=${gramine_secure_vm1_teps}/${gramine_secure_vm2_teps}"
+echo "    Native(vm1/vm2/avg)=${plain_native_vm1_teps}/${plain_native_vm2_teps}/${plain_native_avg_teps}"
+echo "    MultihostRing(vm1/vm2/avg)=${plain_ring_vm1_teps}/${plain_ring_vm2_teps}/${plain_ring_avg_teps}"
+echo "    GramineMultihostRing(vm1/vm2/avg)=${gramine_ring_vm1_teps}/${gramine_ring_vm2_teps}/${gramine_ring_avg_teps}"
+echo "    GramineMultihostCrypto(vm1/vm2/avg)=${gramine_crypto_vm1_teps}/${gramine_crypto_vm2_teps}/${gramine_crypto_avg_teps}"
+echo "    GramineMultihostSecure(vm1/vm2/avg)=${gramine_secure_vm1_teps}/${gramine_secure_vm2_teps}/${gramine_secure_avg_teps}"
 echo "    ${plain_native_vm1_log}"
 echo "    ${plain_native_vm2_log}"
 echo "    ${plain_ring_pub_log}"
