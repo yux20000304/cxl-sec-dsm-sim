@@ -32,6 +32,7 @@ set -euo pipefail
 #   RING_PATH      : BAR2 sysfs resource file (default: /sys/bus/pci/devices/0000:00:02.0/resource2)
 #   RING_MAP_SIZE  : mmap size in bytes (default: 2147483648 = 2GB)
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr inside vm1 (default: 19002)
+#   SEC_MGR_TIMEOUT_MS: cxl_sec_mgr wait timeout for graph header (default: 600000)
 #
 # SGX-in-guest knobs:
 #   VM1_SGX_EPC_SIZE: EPC section size for VM1 (default: auto; splits host EPC in half)
@@ -67,6 +68,7 @@ OMP_THREADS="${OMP_THREADS:-4}"
 RING_PATH="${RING_PATH:-/sys/bus/pci/devices/0000:00:02.0/resource2}"
 RING_MAP_SIZE="${RING_MAP_SIZE:-2147483648}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19002}"
+SEC_MGR_TIMEOUT_MS="${SEC_MGR_TIMEOUT_MS:-600000}"
 
 SGX_SIZE="${SGX_SIZE:-2048M}"
 SGX_THREADS="${SGX_THREADS:-64}"
@@ -399,20 +401,45 @@ echo "[*] Benchmark 5/5: GramineSGXVMSecure publish in vm1 (ACL/key table via cx
 ssh_vm1 "sudo -n python3 -c 'import mmap, os; fd=os.open(\"${RING_PATH}\", os.O_RDWR); m=mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE); m[:] = b\"\\0\"*4096; m.flush(); m.close(); os.close(fd)'"
 
 sec_mgr_remote="/tmp/gapbs_cxl_sec_mgr_${ts}.log"
-sec_mgr_pid="$(ssh_vm1 "sudo -n bash -lc 'nohup /tmp/cxl_sec_mgr --ring ${RING_PATH} --listen ${vm1_ip}:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} >${sec_mgr_remote} 2>&1 & echo \$!'")"
+sec_mgr_pid="$(ssh_vm1 "sudo -n bash -lc 'nohup /tmp/cxl_sec_mgr --ring ${RING_PATH} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} --timeout-ms ${SEC_MGR_TIMEOUT_MS} >${sec_mgr_remote} 2>&1 & echo \$!'")"
 
-ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_MGR='${vm1_ip}:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+echo "[*] Waiting for cxl_sec_mgr on vm1 to accept connections (port ${SEC_MGR_PORT}) ..."
+ssh_vm1 "sudo -n bash -lc '
+set -e
+pid=\"${sec_mgr_pid}\"
+port=\"${SEC_MGR_PORT}\"
+log=\"${sec_mgr_remote}\"
+for _ in $(seq 1 300); do
+  if ! kill -0 \"${pid}\" 2>/dev/null; then
+    echo \"[!] cxl_sec_mgr exited (pid=${pid})\" >&2
+    tail -n 200 \"${log}\" >&2 || true
+    exit 1
+  fi
+  if (echo > /dev/tcp/127.0.0.1/${port}) >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 0.1
+done
+echo \"[!] timeout waiting for cxl_sec_mgr on :${port}\" >&2
+tail -n 200 \"${log}\" >&2 || true
+exit 1
+'"
+
+sec_mgr_vm1="127.0.0.1:${SEC_MGR_PORT}"
+sec_mgr_vm2="${vm1_ip}:${SEC_MGR_PORT}"
+
+ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm1}' CXL_SEC_NODE_ID=1 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
   | tee "${sgx_secure_pub_log}"
 
 echo "[*] Benchmark 5/5: GramineSGXVMSecure attach+run in vm1+vm2 (concurrent)"
 (
-  ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_MGR='${vm1_ip}:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm1}' CXL_SEC_NODE_ID=1 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${sgx_secure_vm1_log}" 2>&1
 ) &
 pid_sgx_secure_vm1=$!
 
 (
-  ssh_vm2_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_MGR='${vm1_ip}:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=2 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm2_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm2}' CXL_SEC_NODE_ID=2 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${sgx_secure_vm2_log}" 2>&1
 ) &
 pid_sgx_secure_vm2=$!
