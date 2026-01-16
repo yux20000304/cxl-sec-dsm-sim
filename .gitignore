@@ -11,6 +11,9 @@ gramine/*.token
 gramine/*.pem
 gramine/redis-native
 gramine/redis-ring
+gramine/gapbs-native
+gramine/gapbs-ring
+gramine/gapbs-ring-secure
 
 ring_client/cxl_ring_client
 ring_client/cxl_ring_direct

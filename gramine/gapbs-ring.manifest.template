@@ -35,6 +35,16 @@ loader.env.GOMP_CPU_AFFINITY = { passthrough = true }
 # GAPBS shared memory knobs (used by the ring binaries).
 loader.env.GAPBS_CXL_PATH = "{{ cxl_path }}"
 loader.env.GAPBS_CXL_MAP_SIZE = "{{ cxl_map_size }}"
+loader.env.GAPBS_CXL_MODE = { passthrough = true }
+loader.env.GAPBS_CXL_PUBLISH_ONLY = { passthrough = true }
+
+# Secure shared memory (ACL + software crypto) configuration.
+loader.env.CXL_SEC_ENABLE = { passthrough = true }
+loader.env.CXL_SEC_MGR = { passthrough = true }
+loader.env.CXL_SEC_NODE_ID = { passthrough = true }
+loader.env.CXL_SEC_TIMEOUT_MS = { passthrough = true }
+loader.env.CXL_SEC_KEY_HEX = { passthrough = true }
+loader.env.CXL_SEC_COMMON_KEY_HEX = { passthrough = true }
 
 fs.mounts = [
   # Repo root (parent dir of this `gramine/` folder).
@@ -75,8 +85,8 @@ sgx.max_threads = {{ sgx_threads | default(64) }}
 sgx.debug = true
 
 sgx.trusted_files = [
-  "file:/repo/gapbs/{{ kernel }}-ring",
-  "file:/repo/gapbs/src/",  # includes the CXL helper headers
+  "file:../gapbs/{{ kernel }}-ring",
+  "file:../gapbs/src/",  # includes the CXL helper headers
   "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so",
 
 {% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
@@ -102,4 +112,3 @@ sgx.allowed_files = [
   "dev:/dev/shm/",
   "dev:{{ cxl_path }}",
 ]
-

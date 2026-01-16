@@ -23,6 +23,10 @@
 #define CXL_RING_VERSION 2
 #define CXL_RING_MAX_RINGS 8
 
+#define GAPBS_GRAPH_MAGIC 0x4C58434353425041ULL /* "APBSCCXL" (LE) */
+#define GAPBS_GRAPH_VERSION 1
+#define GAPBS_GRAPH_FLAG_HAS_INVERSE (1u << 1)
+
 #define CXL_SEC_TABLE_OFF 512
 #define CXL_SEC_MAGIC "CXLSEC1\0"
 #define CXL_SEC_VERSION 1
@@ -55,14 +59,12 @@ typedef struct {
     CxlSecEntry entries[CXL_SEC_MAX_ENTRIES];
 } CxlSecTable;
 
-struct ring_info {
-    uint64_t req_off, req_sz;
-    uint64_t resp_off, resp_sz;
-};
-
 struct layout {
-    uint32_t ring_count;
-    struct ring_info rings[CXL_RING_MAX_RINGS];
+    uint32_t region_count;
+    struct {
+        uint64_t start_off;
+        uint64_t end_off;
+    } regions[CXL_SEC_MAX_ENTRIES];
     uint64_t total_size;
 };
 
@@ -97,8 +99,9 @@ static void usage(const char *prog) {
             "  %s --ring <path> --listen <ip:port> [--map-size <bytes>] [--timeout-ms <ms>]\n"
             "\n"
             "Notes:\n"
-            "- Initializes a shared-memory ACL table at offset %u in the ring mapping.\n"
-            "- Table entries are address-range based (offsets in the ring mapping).\n"
+            "- Auto-detects the shared-memory layout (Redis ring or GAPBS graph).\n"
+            "- Initializes a shared-memory ACL table at offset %u in the mapping.\n"
+            "- Table entries are address-range based (offsets in the mapping).\n"
             "- Clients request access via a simple TCP protocol.\n",
             prog,
             (unsigned)CXL_SEC_TABLE_OFF);
@@ -195,29 +198,85 @@ static uint32_t load_u32(const unsigned char *p) {
 }
 
 static int load_layout(const unsigned char *mm, uint64_t total_size, struct layout *lo) {
-    if (memcmp(mm, CXL_RING_MAGIC, 8) != 0) return -1;
-    uint32_t ver = load_u32(mm + 8);
-    if (ver != CXL_RING_VERSION) return -1;
-    uint32_t ring_count = load_u32(mm + 12);
-    if (ring_count == 0 || ring_count > CXL_RING_MAX_RINGS) return -1;
+    /* Redis ring layout (CXLSHM1). */
+    if (memcmp(mm, CXL_RING_MAGIC, 8) == 0) {
+        uint32_t ver = load_u32(mm + 8);
+        if (ver != CXL_RING_VERSION) return -1;
+        uint32_t ring_count = load_u32(mm + 12);
+        if (ring_count == 0 || ring_count > CXL_RING_MAX_RINGS) return -1;
+        if (ring_count * 2 > CXL_SEC_MAX_ENTRIES) return -1;
 
-    /* Basic sanity on offsets and sizes. */
-    for (uint32_t i = 0; i < ring_count; i++) {
-        uint64_t req_off = load_u64(mm + 24 + i * 32);
-        uint64_t req_sz = load_u64(mm + 32 + i * 32);
-        uint64_t resp_off = load_u64(mm + 40 + i * 32);
-        uint64_t resp_sz = load_u64(mm + 48 + i * 32);
-        if (req_off == 0 || resp_off == 0) return -1;
-        if (req_sz < 4096 || resp_sz < 4096) return -1;
-        if (req_off + req_sz > total_size) return -1;
-        if (resp_off + resp_sz > total_size) return -1;
-        lo->rings[i].req_off = req_off;
-        lo->rings[i].req_sz = req_sz;
-        lo->rings[i].resp_off = resp_off;
-        lo->rings[i].resp_sz = resp_sz;
+        uint32_t region_count = 0;
+        for (uint32_t i = 0; i < ring_count; i++) {
+            uint64_t req_off = load_u64(mm + 24 + i * 32);
+            uint64_t req_sz = load_u64(mm + 32 + i * 32);
+            uint64_t resp_off = load_u64(mm + 40 + i * 32);
+            uint64_t resp_sz = load_u64(mm + 48 + i * 32);
+            if (req_off == 0 || resp_off == 0) return -1;
+            if (req_sz < 4096 || resp_sz < 4096) return -1;
+            if (req_off + req_sz > total_size) return -1;
+            if (resp_off + resp_sz > total_size) return -1;
+
+            lo->regions[region_count].start_off = req_off;
+            lo->regions[region_count].end_off = req_off + req_sz;
+            region_count++;
+            lo->regions[region_count].start_off = resp_off;
+            lo->regions[region_count].end_off = resp_off + resp_sz;
+            region_count++;
+        }
+
+        lo->region_count = region_count;
+        lo->total_size = total_size;
+        return 0;
     }
 
-    lo->ring_count = ring_count;
+    /* GAPBS graph layout (APBSCCXL). */
+    uint64_t magic = load_u64(mm + 0);
+    if (magic != GAPBS_GRAPH_MAGIC) return -1;
+    uint32_t ver = load_u32(mm + 8);
+    if (ver != GAPBS_GRAPH_VERSION) return -1;
+
+    uint32_t flags = load_u32(mm + 12);
+    uint64_t num_nodes = load_u64(mm + 16);
+    uint64_t num_edges_directed = load_u64(mm + 24);
+    uint32_t dest_bytes = load_u32(mm + 32);
+
+    uint64_t out_offsets_off = load_u64(mm + 40);
+    uint64_t out_neigh_off = load_u64(mm + 48);
+    uint64_t in_offsets_off = load_u64(mm + 56);
+    uint64_t in_neigh_off = load_u64(mm + 64);
+
+    if (dest_bytes == 0 || dest_bytes > 4096) return -1;
+    if (num_nodes > (UINT64_MAX / 8ULL) - 1ULL) return -1;
+    uint64_t offsets_bytes = (num_nodes + 1ULL) * 8ULL; /* SGOffset = int64_t */
+    if (num_edges_directed > UINT64_MAX / (uint64_t)dest_bytes) return -1;
+    uint64_t neigh_bytes = num_edges_directed * (uint64_t)dest_bytes;
+
+    if (out_offsets_off == 0 || out_neigh_off == 0) return -1;
+    if (out_offsets_off + offsets_bytes > total_size) return -1;
+    if (out_neigh_off + neigh_bytes > total_size) return -1;
+
+    uint32_t region_count = 0;
+    lo->regions[region_count].start_off = out_offsets_off;
+    lo->regions[region_count].end_off = out_offsets_off + offsets_bytes;
+    region_count++;
+    lo->regions[region_count].start_off = out_neigh_off;
+    lo->regions[region_count].end_off = out_neigh_off + neigh_bytes;
+    region_count++;
+
+    if ((flags & GAPBS_GRAPH_FLAG_HAS_INVERSE) && in_offsets_off && in_neigh_off) {
+        if (region_count + 2 > CXL_SEC_MAX_ENTRIES) return -1;
+        if (in_offsets_off + offsets_bytes > total_size) return -1;
+        if (in_neigh_off + neigh_bytes > total_size) return -1;
+        lo->regions[region_count].start_off = in_offsets_off;
+        lo->regions[region_count].end_off = in_offsets_off + offsets_bytes;
+        region_count++;
+        lo->regions[region_count].start_off = in_neigh_off;
+        lo->regions[region_count].end_off = in_neigh_off + neigh_bytes;
+        region_count++;
+    }
+
+    lo->region_count = region_count;
     lo->total_size = total_size;
     return 0;
 }
@@ -226,20 +285,14 @@ static void sec_table_init(CxlSecTable *t, const struct layout *lo) {
     CxlSecTable tmp;
     memset(&tmp, 0, sizeof(tmp));
     tmp.version = CXL_SEC_VERSION;
-    tmp.entry_count = lo->ring_count * 2;
+    tmp.entry_count = lo->region_count;
     if (tmp.entry_count > CXL_SEC_MAX_ENTRIES) tmp.entry_count = CXL_SEC_MAX_ENTRIES;
 
-    for (uint32_t i = 0; i < lo->ring_count && (i * 2 + 1) < tmp.entry_count; i++) {
-        CxlSecEntry *e_req = &tmp.entries[i * 2];
-        CxlSecEntry *e_resp = &tmp.entries[i * 2 + 1];
-
-        e_req->start_off = lo->rings[i].req_off;
-        e_req->end_off = lo->rings[i].req_off + lo->rings[i].req_sz;
-        randombytes_buf(e_req->key, sizeof(e_req->key));
-
-        e_resp->start_off = lo->rings[i].resp_off;
-        e_resp->end_off = lo->rings[i].resp_off + lo->rings[i].resp_sz;
-        randombytes_buf(e_resp->key, sizeof(e_resp->key));
+    for (uint32_t i = 0; i < tmp.entry_count; i++) {
+        CxlSecEntry *e = &tmp.entries[i];
+        e->start_off = lo->regions[i].start_off;
+        e->end_off = lo->regions[i].end_off;
+        randombytes_buf(e->key, sizeof(e->key));
     }
 
     /* Commit: copy everything first, then set magic last so readers can treat magic as readiness. */
@@ -451,8 +504,8 @@ int main(int argc, char **argv) {
         sleep_ms(10);
         waited += 10;
     }
-    if (lo.ring_count == 0) {
-        fprintf(stderr, "[!] timeout waiting for ring layout header (magic/version) in shared memory\n");
+    if (lo.region_count == 0) {
+        fprintf(stderr, "[!] timeout waiting for shared-memory layout header (magic/version)\n");
         close(lfd);
         munmap(mm, map_len);
         close(fd);

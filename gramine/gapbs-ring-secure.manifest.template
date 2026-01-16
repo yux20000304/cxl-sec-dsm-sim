@@ -1,18 +1,21 @@
-## Gramine manifest template: GAPBS (native).
+## Gramine manifest template: GAPBS (CXL shared-memory / "ring-secure" build).
 ##
-## This runs a GAPBS kernel under Gramine. It is primarily intended for
-## `gramine-direct` (no SGX hardware required), but includes a minimal SGX
-## section for future experiments with `gramine-sgx`.
+## This runs a GAPBS *-ring-secure binary under Gramine. It uses the same
+## shared-memory mapping requirements as the ring build (BAR2 mounted as
+## `untrusted_shm`), plus passes through the CXL security manager env vars.
 ##
 ## Usage inside VM:
-##   cd /mnt/hostshare/gapbs && make          # build native GAPBS
+##   cd /mnt/hostshare/gapbs && make ring-secure
 ##   cd /mnt/hostshare/gramine
-##   make links gapbs-native.manifest GAPBS_KERNEL=bfs
-##   gramine-direct ./gapbs-native -g 16 -n 1
+##   make links gapbs-ring-secure.manifest GAPBS_KERNEL=bfs
+##   sudo CXL_SEC_ENABLE=1 CXL_SEC_MGR=192.168.100.1:19000 CXL_SEC_NODE_ID=1 \
+##        GAPBS_CXL_MODE=attach gramine-direct ./gapbs-ring-secure -g 18 -n 1
 
 {% set kernel = gapbs_kernel | default('bfs') %}
+{% set cxl_path = gapbs_cxl_path | default('/sys/bus/pci/devices/0000:00:02.0/resource2') %}
+{% set cxl_map_size = gapbs_cxl_map_size | default('134217728') %}
 
-libos.entrypoint = "/repo/gapbs/{{ kernel }}"
+libos.entrypoint = "/repo/gapbs/{{ kernel }}-ring-secure"
 
 loader.entrypoint = { uri = "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so" }
 loader.insecure__use_cmdline_argv = true
@@ -27,6 +30,20 @@ loader.env.OMP_PROC_BIND = { passthrough = true }
 loader.env.OMP_PLACES = { passthrough = true }
 loader.env.GOMP_CPU_AFFINITY = { passthrough = true }
 
+# GAPBS shared memory knobs (used by the ring-secure binaries).
+loader.env.GAPBS_CXL_PATH = "{{ cxl_path }}"
+loader.env.GAPBS_CXL_MAP_SIZE = "{{ cxl_map_size }}"
+loader.env.GAPBS_CXL_MODE = { passthrough = true }
+loader.env.GAPBS_CXL_PUBLISH_ONLY = { passthrough = true }
+
+# Secure shared memory (ACL + software crypto) configuration.
+loader.env.CXL_SEC_ENABLE = { passthrough = true }
+loader.env.CXL_SEC_MGR = { passthrough = true }
+loader.env.CXL_SEC_NODE_ID = { passthrough = true }
+loader.env.CXL_SEC_TIMEOUT_MS = { passthrough = true }
+loader.env.CXL_SEC_KEY_HEX = { passthrough = true }
+loader.env.CXL_SEC_COMMON_KEY_HEX = { passthrough = true }
+
 fs.mounts = [
   # Repo root (parent dir of this `gramine/` folder).
   { uri = "file:..", path = "/repo" },
@@ -37,6 +54,18 @@ fs.mounts = [
   { uri = "file:/tmp",  path = "/tmp" },
   { uri = "file:/dev",  path = "/dev" },
   { uri = "file:/home", path = "/home" },
+
+  # Convenience: allow file-backed shared memory under /dev/shm.
+  { uri = "dev:/dev/shm", path = "/dev/shm", type = "untrusted_shm" },
+
+{% if cxl_path.startswith('/sys/') %}
+  # Sysfs BAR resources are exposed as "device-like" files.
+  { uri = "dev:{{ cxl_path }}", path = "{{ cxl_path }}", type = "untrusted_shm" },
+{% elif cxl_path.startswith('/dev/shm/') %}
+  # Covered by the `/dev/shm` untrusted_shm mount above.
+{% else %}
+  { uri = "dev:{{ cxl_path }}", path = "{{ cxl_path }}", type = "untrusted_shm" },
+{% endif %}
 
 {% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
   # Use Gramine runtime glibc (closer to SGX mode).
@@ -54,7 +83,8 @@ sgx.max_threads = {{ sgx_threads | default(64) }}
 sgx.debug = true
 
 sgx.trusted_files = [
-  "file:../gapbs/{{ kernel }}",
+  "file:../gapbs/{{ kernel }}-ring-secure",
+  "file:../gapbs/src/",
   "file:/usr/lib/x86_64-linux-gnu/gramine/libsysdb.so",
 
 {% if env.get('USE_RUNTIME_GLIBC', '0') == '1' %}
@@ -74,6 +104,9 @@ sgx.allowed_files = [
   "file:/tmp/",
   "file:/dev/",
   "file:/home/",
+  "file:/sys/",
   "file:/lib/",
   "file:/lib64/",
+  "dev:/dev/shm/",
+  "dev:{{ cxl_path }}",
 ]

@@ -13,7 +13,7 @@ Highlights
 - `guest/` – guest-side helper scripts: bind ivshmem -> uio, basic install/start.
 - `shim/` – legacy Python shim (kept for reference; replaced by C direct path).
 - `gramine/` – Gramine manifest templates and build rules for Redis.
-- `gapbs/` – GAP Benchmark Suite (graph kernels); includes a `*-ring` build that copies CSR arrays into a shared-memory mmap region.
+- `gapbs/` – GAP Benchmark Suite (graph kernels); includes `*-ring` (shared-memory CSR) and `*-ring-secure` (ACL + libsodium encrypt-at-rest) builds.
 - `kvm/` – Phase 4 hints for KVM/EPT permission checks (no kernel build here).
 - `ring_client/` – C direct client (binary ring, no RESP).
 - `cxl_sec_mgr/` – ACL/key table manager process for secure ring mode.
@@ -231,24 +231,27 @@ bash scripts/host_recreate_and_bench_gramine.sh
 Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
 The compare CSV includes `NativeTCP`, `GramineNativeTCP`, `GramineSodiumTCP`, `GramineRing`, and `GramineRingSecure` labels.
 
-### One command: recreate VMs + GAPBS benchmarks (native vs ring)
-This rebuilds VM1/VM2 and runs a GAPBS kernel in VM1:
-- native GAPBS (no Gramine)
-- native GAPBS under `gramine-direct`
-- `*-ring` GAPBS under `gramine-direct` using ivshmem BAR2 as `GAPBS_CXL_PATH`
-
-```bash
-sudo bash scripts/host_recreate_and_bench_gapbs_gramine.sh
-```
-Tune the workload with env vars, e.g.:
-```bash
-sudo GAPBS_KERNEL=bfs SCALE=18 TRIALS=3 OMP_THREADS=4 bash scripts/host_recreate_and_bench_gapbs_gramine.sh
-```
-
 ### Local GAPBS benchmark (no VMs)
 ```bash
 bash scripts/host_bench_gapbs_local.sh
 ```
+
+### One command: recreate VMs + GAPBS multi-host compare (5 versions)
+This rebuilds VM1/VM2 and runs a GAPBS kernel across the two VMs in five modes:
+- `Native`: plain GAPBS (no Gramine, no shared memory)
+- `MultihostRing`: shared-memory ring (no Gramine)
+- `GramineMultihostRing`: shared-memory ring under `gramine-direct`
+- `GramineMultihostCrypto`: shared-memory ring encrypted-at-rest via libsodium (per-VM key + common key; no manager)
+- `GramineMultihostSecure`: shared-memory ring with `cxl_sec_mgr` ACL/key table (permission-managed crypto)
+
+```bash
+sudo bash scripts/host_recreate_and_bench_gapbs_multihost.sh
+```
+If VM1/VM2 are already running, reuse them:
+```bash
+SKIP_RECREATE=1 bash scripts/host_recreate_and_bench_gapbs_multihost.sh
+```
+Outputs are written to `results/` as timestamped `gapbs_*` logs plus a compare CSV (includes `throughput_teps`).
 
 ## TDX hardware: TDX guests (VMs + ivshmem, no Gramine)
 This workflow keeps the two-VM + ivshmem setup, but runs both Redis variants directly
@@ -302,6 +305,15 @@ software delay model above (`CXL_SHM_DELAY_NS`) instead of NUMA binding.
 Outputs are written to `results/` as timestamped `sgx_*.log` / `sgx_*.csv`.
 The compare CSV includes `HostNativeTCP`, `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, `GramineSGXRing`, and `GramineSGXRingSecure` labels.
 
+### GAPBS under Gramine SGX (no VMs)
+This runs the GAPBS multi-host shared-memory matrix on a single SGX-capable host (two processes sharing a file-backed `/dev/shm` mapping).
+
+One command:
+```bash
+sudo -E bash scripts/host_bench_gapbs_gramine_sgx.sh
+```
+Outputs are written to `results/` as timestamped `gapbs_sgx_*` logs plus a compare CSV (`gapbs_compare_sgx_*.csv`).
+
 ## SGX hardware: Gramine SGX inside guests (VMs + ivshmem)
 This workflow keeps the two-VM + ivshmem setup, but runs Redis under `gramine-sgx`
 *inside VM1*. This requires **SGX virtualization** support in the host KVM/QEMU
@@ -319,6 +331,15 @@ sudo -E bash scripts/host_recreate_and_bench_gramine_sgxvm.sh
 ```
 Outputs are written to `results/` as timestamped `sgxvm_*.log` / `sgxvm_*.csv`.
 The compare CSV includes `SGXVMNativeTCP`, `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, `GramineSGXVMRing`, and `GramineSGXVMRingSecure` labels.
+
+### GAPBS under Gramine SGX inside guests (VMs + ivshmem)
+This runs the GAPBS multi-host shared-memory matrix with each VM running the GAPBS binaries under `gramine-sgx` (requires SGX virtualization for both guests).
+
+One command:
+```bash
+sudo -E bash scripts/host_recreate_and_bench_gapbs_gramine_sgxvm.sh
+```
+Outputs are written to `results/` as timestamped `gapbs_sgxvm_*` logs plus a compare CSV (`gapbs_sgxvm_compare_*.csv`).
 
 ## Quick shared-memory sanity check
 VM1:
