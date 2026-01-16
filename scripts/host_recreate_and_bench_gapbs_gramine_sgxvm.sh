@@ -401,27 +401,31 @@ echo "[*] Benchmark 5/5: GramineSGXVMSecure publish in vm1 (ACL/key table via cx
 ssh_vm1 "sudo -n python3 -c 'import mmap, os; fd=os.open(\"${RING_PATH}\", os.O_RDWR); m=mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE); m[:] = b\"\\0\"*4096; m.flush(); m.close(); os.close(fd)'"
 
 sec_mgr_remote="/tmp/gapbs_cxl_sec_mgr_${ts}.log"
-sec_mgr_pid="$(ssh_vm1 "sudo -n bash -lc 'nohup /tmp/cxl_sec_mgr --ring ${RING_PATH} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} --timeout-ms ${SEC_MGR_TIMEOUT_MS} >${sec_mgr_remote} 2>&1 & echo \$!'")"
+sec_mgr_pid="$(ssh_vm1 "sudo -n bash -lc 'nohup /tmp/cxl_sec_mgr --ring ${RING_PATH} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} --timeout-ms ${SEC_MGR_TIMEOUT_MS} >${sec_mgr_remote} 2>&1 & echo \$!'" | tr -d '\r')"
+if [[ -z "${sec_mgr_pid}" || ! "${sec_mgr_pid}" =~ ^[0-9]+$ ]]; then
+  echo "[!] Failed to start cxl_sec_mgr in vm1 (pid='${sec_mgr_pid}')." >&2
+  ssh_vm1 "sudo -n tail -n 200 '${sec_mgr_remote}'" >&2 || true
+  exit 1
+fi
 
 echo "[*] Waiting for cxl_sec_mgr on vm1 to accept connections (port ${SEC_MGR_PORT}) ..."
 ssh_vm1 "sudo -n bash -lc '
 set -e
-pid=\"${sec_mgr_pid}\"
-port=\"${SEC_MGR_PORT}\"
-log=\"${sec_mgr_remote}\"
-for _ in $(seq 1 300); do
-  if ! kill -0 \"${pid}\" 2>/dev/null; then
-    echo \"[!] cxl_sec_mgr exited (pid=${pid})\" >&2
-    tail -n 200 \"${log}\" >&2 || true
+for _ in {1..300}; do
+  if ! kill -0 \"${sec_mgr_pid}\" 2>/dev/null; then
+    echo \"[!] cxl_sec_mgr exited (pid=${sec_mgr_pid})\" >&2
+    tail -n 200 \"${sec_mgr_remote}\" >&2 || true
     exit 1
   fi
-  if (echo > /dev/tcp/127.0.0.1/${port}) >/dev/null 2>&1; then
-    exit 0
-  fi
+	  if command -v ss >/dev/null 2>&1; then
+	    ss -H -ltn sport = :${SEC_MGR_PORT} 2>/dev/null | grep -q . && exit 0
+	  elif (echo > /dev/tcp/127.0.0.1/${SEC_MGR_PORT}) >/dev/null 2>&1; then
+	    exit 0
+	  fi
   sleep 0.1
 done
-echo \"[!] timeout waiting for cxl_sec_mgr on :${port}\" >&2
-tail -n 200 \"${log}\" >&2 || true
+echo \"[!] timeout waiting for cxl_sec_mgr on :${SEC_MGR_PORT}\" >&2
+tail -n 200 \"${sec_mgr_remote}\" >&2 || true
 exit 1
 '"
 
