@@ -261,12 +261,15 @@ This repo supports two TEEs:
 Common knobs:
 - `CXL_SHM_DELAY_NS=<ns>` injects a per-access delay on shared-memory reads/writes (set `0` to disable). Useful when the host has only 1 NUMA node; the TEE scripts may auto-default it to `150` if unset.
 - `BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img` for VM-based workflows.
+- `QEMU_BIN=/path/to/qemu-system-x86_64` to use a custom QEMU build (useful for TDX hosts).
+- `INSTALL_HOST_DEPS=1` lets scripts auto-install missing host packages via apt-get (Ubuntu/Debian).
 
 ### TDX: 2 confidential VMs + ivshmem (Redis + GAPBS)
 Host prereqs (quick check):
 - `/dev/kvm` available
 - `qemu-system-x86_64 -object help | grep tdx-guest`
 - TDVF/OVMF firmware file for `-bios` (Ubuntu: `sudo apt-get install -y ovmf`, then set `TDX_BIOS=/usr/share/OVMF/OVMF_CODE_4M.fd`)
+If `tdx-guest` is missing, your distro QEMU build likely doesn't include TDX support; install a TDX-enabled QEMU and rerun with `QEMU_BIN=...` (or let the script try to build one via `INSTALL_TDX_QEMU=1`).
 
 Run:
 ```bash

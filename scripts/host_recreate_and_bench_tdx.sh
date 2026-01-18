@@ -31,6 +31,7 @@ set -euo pipefail
 # Tunables (env):
 #   BASE_IMG       : ubuntu cloud image path (24.04 preferred)
 #   VM1_SSH/VM2_SSH: forwarded SSH ports (default: 2222/2223)
+#   QEMU_BIN       : path to qemu-system-x86_64 (default: qemu-system-x86_64)
 #   REQ_N          : total requests for TCP benchmark (default: 200000)
 #   CLIENTS        : redis-benchmark concurrency (default: 4)
 #   THREADS        : redis-benchmark threads (default: 4)
@@ -54,18 +55,34 @@ set -euo pipefail
 # Shared-memory (CXL) latency simulation:
 #   CXL_SHM_DELAY_NS: inject artificial latency on each shared-memory ring access (ns). If unset and host has <2 NUMA nodes, auto-defaults to CXL_SHM_DELAY_NS_DEFAULT.
 #   CXL_SHM_DELAY_NS_DEFAULT: default delay to use on 1-NUMA hosts when CXL_SHM_DELAY_NS is unset (default: 150).
+#
+# Host dependency helpers:
+#   INSTALL_HOST_DEPS: auto-install host packages via apt-get when missing (default: 1)
+#   INSTALL_TDX_QEMU : auto|0|1. If 'auto', builds a TDX-enabled QEMU only when the current QEMU lacks 'tdx-guest' (default: auto).
+#   TDX_QEMU_REPO    : git repo for TDX-enabled QEMU (default: https://github.com/intel/qemu-tdx.git)
+#   TDX_QEMU_REF     : git ref to build (default: tdx)
+#   TDX_QEMU_PREFIX  : install prefix for built QEMU (default: /opt/qemu-tdx)
+#   TDX_QEMU_SRC_DIR : source checkout dir (default: /opt/qemu-tdx-src)
+#   TDX_QEMU_BUILD_DIR: build dir (default: /opt/qemu-tdx-build)
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULTS_DIR="${ROOT}/results"
 mkdir -p "${RESULTS_DIR}"
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "[*] Not running as root; KVM (/dev/kvm) must be accessible to your user for TDX." >&2
-  echo "    If you hit a /dev/kvm permission error, rerun with: sudo -E $0" >&2
+  exec sudo -E bash "$0" "$@"
 fi
 
 VM1_SSH="${VM1_SSH:-2222}"
 VM2_SSH="${VM2_SSH:-2223}"
+QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+INSTALL_HOST_DEPS="${INSTALL_HOST_DEPS:-1}"
+INSTALL_TDX_QEMU="${INSTALL_TDX_QEMU:-auto}"
+TDX_QEMU_REPO="${TDX_QEMU_REPO:-https://github.com/intel/qemu-tdx.git}"
+TDX_QEMU_REF="${TDX_QEMU_REF:-tdx}"
+TDX_QEMU_PREFIX="${TDX_QEMU_PREFIX:-/opt/qemu-tdx}"
+TDX_QEMU_SRC_DIR="${TDX_QEMU_SRC_DIR:-/opt/qemu-tdx-src}"
+TDX_QEMU_BUILD_DIR="${TDX_QEMU_BUILD_DIR:-/opt/qemu-tdx-build}"
 
 REQ_N="${REQ_N:-200000}"
 CLIENTS="${CLIENTS:-4}"
@@ -119,23 +136,160 @@ need_cmd() {
   return 1
 }
 
+apt_retry_lock() {
+  local desc="$1"
+  shift
+  local out=""
+  local rc=0
+
+  for _ in $(seq 1 180); do
+    set +e
+    out="$("$@" 2>&1)"
+    rc=$?
+    set -e
+
+    if [[ "${rc}" -eq 0 ]]; then
+      [[ -n "${out}" ]] && printf '%s\n' "${out}"
+      return 0
+    fi
+
+    if printf '%s' "${out}" | grep -qiE 'could not get lock|unable to acquire the dpkg frontend lock|could not open lock file|unable to lock directory'; then
+      echo "[*] ${desc}: apt lock held, waiting..."
+      sleep 2
+      continue
+    fi
+
+    printf '%s\n' "${out}" >&2
+    return "${rc}"
+  done
+
+  echo "[!] ${desc}: timed out waiting for apt lock" >&2
+  printf '%s\n' "${out}" >&2
+  return 1
+}
+
+install_host_apt_deps() {
+  if [[ "${INSTALL_HOST_DEPS}" != "1" ]]; then
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "[*] INSTALL_HOST_DEPS=1 but apt-get is unavailable; skipping host auto-install." >&2
+    return 0
+  fi
+
+  echo "[*] Installing host dependencies (apt-get) ..."
+  apt_retry_lock "apt-get update" apt-get update
+  apt_retry_lock "apt-get install host deps" apt-get install -y \
+    ca-certificates \
+    cloud-image-utils \
+    curl \
+    openssh-client \
+    openssl \
+    ovmf \
+    qemu-system-x86 \
+    qemu-utils
+}
+
+install_tdx_qemu() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "[!] INSTALL_TDX_QEMU requested but apt-get is unavailable; install a TDX-enabled QEMU manually." >&2
+    return 1
+  fi
+  if [[ -e "${TDX_QEMU_PREFIX}/bin/qemu-system-x86_64" ]]; then
+    if "${TDX_QEMU_PREFIX}/bin/qemu-system-x86_64" -object help 2>/dev/null | grep -q 'tdx-guest'; then
+      QEMU_BIN="${TDX_QEMU_PREFIX}/bin/qemu-system-x86_64"
+      return 0
+    fi
+  fi
+
+  echo "[*] Building a TDX-enabled QEMU (this may take a while) ..."
+  apt_retry_lock "apt-get update" apt-get update
+  apt_retry_lock "apt-get install QEMU build deps" apt-get install -y \
+    build-essential \
+    git \
+    ninja-build \
+    meson \
+    pkg-config \
+    python3 \
+    python3-venv \
+    libglib2.0-dev \
+    libpixman-1-dev \
+    libslirp-dev \
+    zlib1g-dev \
+    libfdt-dev \
+    libcap-ng-dev \
+    libattr1-dev
+
+  mkdir -p "${TDX_QEMU_SRC_DIR}" "${TDX_QEMU_BUILD_DIR}" "${TDX_QEMU_PREFIX}"
+
+  if [[ ! -d "${TDX_QEMU_SRC_DIR}/.git" ]]; then
+    rm -rf "${TDX_QEMU_SRC_DIR}"
+    git clone --depth 1 --branch "${TDX_QEMU_REF}" "${TDX_QEMU_REPO}" "${TDX_QEMU_SRC_DIR}"
+  else
+    git -C "${TDX_QEMU_SRC_DIR}" fetch --all --prune
+    git -C "${TDX_QEMU_SRC_DIR}" checkout "${TDX_QEMU_REF}"
+    git -C "${TDX_QEMU_SRC_DIR}" pull --ff-only || true
+  fi
+
+  rm -rf "${TDX_QEMU_BUILD_DIR:?}/"*
+  (
+    cd "${TDX_QEMU_BUILD_DIR}"
+    "${TDX_QEMU_SRC_DIR}/configure" \
+      --prefix="${TDX_QEMU_PREFIX}" \
+      --target-list=x86_64-softmmu \
+      --enable-kvm \
+      --disable-werror \
+      --disable-docs
+    make -j"$(nproc)"
+    make install
+  )
+
+  if [[ ! -x "${TDX_QEMU_PREFIX}/bin/qemu-system-x86_64" ]]; then
+    echo "[!] QEMU build finished but binary is missing: ${TDX_QEMU_PREFIX}/bin/qemu-system-x86_64" >&2
+    return 1
+  fi
+  if ! "${TDX_QEMU_PREFIX}/bin/qemu-system-x86_64" -object help 2>/dev/null | grep -q 'tdx-guest'; then
+    echo "[!] Built QEMU still does not expose 'tdx-guest'." >&2
+    echo "    Binary: ${TDX_QEMU_PREFIX}/bin/qemu-system-x86_64" >&2
+    return 1
+  fi
+
+  QEMU_BIN="${TDX_QEMU_PREFIX}/bin/qemu-system-x86_64"
+  echo "[+] TDX-enabled QEMU ready: ${QEMU_BIN}"
+}
+
+install_host_apt_deps
+
 need_cmd ssh
 need_cmd ssh-keygen
 need_cmd bash
 need_cmd openssl
 
-if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
-  echo "[!] Missing command: qemu-system-x86_64" >&2
+if [[ "${QEMU_BIN}" == */* ]]; then
+  if [[ ! -x "${QEMU_BIN}" ]]; then
+    echo "[!] QEMU_BIN not found/executable: ${QEMU_BIN}" >&2
+    exit 1
+  fi
+elif ! command -v "${QEMU_BIN}" >/dev/null 2>&1; then
+  echo "[!] Missing command: ${QEMU_BIN}" >&2
   echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y qemu-system-x86" >&2
   exit 1
 fi
-if ! qemu-system-x86_64 -object help 2>/dev/null | grep -q 'tdx-guest'; then
-  echo "[!] QEMU does not support TDX guests on this host (missing 'tdx-guest' object)." >&2
-  qemu_ver="$(qemu-system-x86_64 -version 2>/dev/null | head -n 1 || true)"
+if ! "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'tdx-guest'; then
+  qemu_ver="$("${QEMU_BIN}" -version 2>/dev/null | head -n 1 || true)"
+  echo "[!] QEMU does not support TDX guests (missing 'tdx-guest' object)." >&2
+  echo "    QEMU_BIN: ${QEMU_BIN}" >&2
   [[ -n "${qemu_ver}" ]] && echo "    Detected: ${qemu_ver}" >&2
-  echo "    Check: qemu-system-x86_64 -object help | grep tdx-guest" >&2
-  echo "    You need a TDX-enabled QEMU build + TDX-enabled host kernel to run this workflow." >&2
-  exit 1
+  echo "    Check: ${QEMU_BIN} -object help | grep tdx-guest" >&2
+
+  if [[ "${INSTALL_TDX_QEMU}" == "1" || ( "${INSTALL_TDX_QEMU}" == "auto" && "${QEMU_BIN}" == "qemu-system-x86_64" ) ]]; then
+    install_tdx_qemu
+  else
+    echo "    Fix options:" >&2
+    echo "      - Install/use a TDX-enabled QEMU build and rerun with QEMU_BIN=/path/to/qemu-system-x86_64" >&2
+    echo "      - Or let this script build one: INSTALL_TDX_QEMU=1" >&2
+    exit 1
+  fi
 fi
 
 tmpdir="$(mktemp -d /tmp/cxl-sec-dsm-sim-tdx.XXXXXX)"
@@ -209,6 +363,7 @@ STOP_EXISTING=1 FORCE_RECREATE=1 BASE_IMG="${BASE_IMG}" \
 VM1_SSH="${VM1_SSH}" VM2_SSH="${VM2_SSH}" \
 VM_TDX_ENABLE=1 TDX_BIOS="${TDX_BIOS}" \
 CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \
+QEMU_BIN="${QEMU_BIN}" \
 bash "${ROOT}/scripts/host_quickstart.sh"
 
 wait_ssh "vm1" "${VM1_SSH}"
