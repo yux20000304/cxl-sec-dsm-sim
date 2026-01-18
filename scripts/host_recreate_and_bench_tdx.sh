@@ -60,7 +60,7 @@ set -euo pipefail
 #   INSTALL_HOST_DEPS: auto-install host packages via apt-get when missing (default: 1)
 #   INSTALL_TDX_QEMU : auto|0|1. If 'auto', builds a TDX-enabled QEMU only when the current QEMU lacks 'tdx-guest' (default: auto).
 #   TDX_QEMU_REPO    : git repo for TDX-enabled QEMU (default: https://github.com/intel/qemu-tdx.git)
-#   TDX_QEMU_REF     : git ref to build (default: tdx)
+#   TDX_QEMU_REF     : git ref to build (default: tdx-qemu-upstream)
 #   TDX_QEMU_PREFIX  : install prefix for built QEMU (default: /opt/qemu-tdx)
 #   TDX_QEMU_SRC_DIR : source checkout dir (default: /opt/qemu-tdx-src)
 #   TDX_QEMU_BUILD_DIR: build dir (default: /opt/qemu-tdx-build)
@@ -233,9 +233,27 @@ install_tdx_qemu() {
     rm -rf "${TDX_QEMU_SRC_DIR}"
     git clone --depth 1 --branch "${TDX_QEMU_REF}" "${TDX_QEMU_REPO}" "${TDX_QEMU_SRC_DIR}"
   else
-    git -C "${TDX_QEMU_SRC_DIR}" fetch --all --prune
-    git -C "${TDX_QEMU_SRC_DIR}" checkout "${TDX_QEMU_REF}"
-    git -C "${TDX_QEMU_SRC_DIR}" pull --ff-only || true
+    # Shallow clones created with --depth default to single-branch and won't be
+    # able to switch to another ref unless we widen the fetch refspec.
+    git -C "${TDX_QEMU_SRC_DIR}" remote set-url origin "${TDX_QEMU_REPO}" >/dev/null 2>&1 || true
+    git -C "${TDX_QEMU_SRC_DIR}" config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+    git -C "${TDX_QEMU_SRC_DIR}" fetch origin --prune
+
+    set +e
+    if git -C "${TDX_QEMU_SRC_DIR}" show-ref --verify --quiet "refs/remotes/origin/${TDX_QEMU_REF}"; then
+      git -C "${TDX_QEMU_SRC_DIR}" checkout -B "${TDX_QEMU_REF}" "origin/${TDX_QEMU_REF}"
+      rc=$?
+    else
+      git -C "${TDX_QEMU_SRC_DIR}" checkout -f "${TDX_QEMU_REF}"
+      rc=$?
+    fi
+    set -e
+
+    if [[ "${rc}" -ne 0 ]]; then
+      echo "[!] Existing QEMU checkout cannot switch to ref '${TDX_QEMU_REF}'. Re-cloning..." >&2
+      rm -rf "${TDX_QEMU_SRC_DIR}"
+      git clone --depth 1 --branch "${TDX_QEMU_REF}" "${TDX_QEMU_REPO}" "${TDX_QEMU_SRC_DIR}"
+    fi
   fi
 
   if [[ ! -f "${TDX_QEMU_SRC_DIR}/configure" ]]; then
