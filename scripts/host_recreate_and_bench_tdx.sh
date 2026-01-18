@@ -677,14 +677,10 @@ if [[ "${is_tdx_image_path}" -ne 1 ]]; then
   ssh_vm2 "sudo timeout ${WAIT_CLOUD_INIT_SECS} cloud-init status --wait >/dev/null 2>&1 || true"
 fi
 
-mount_hostshare='
-sudo mkdir -p /mnt/hostshare
-if ! mountpoint -q /mnt/hostshare; then
-  sudo mount -t 9p -o trans=virtio hostshare /mnt/hostshare
-fi
-'
-ssh_vm1 "${mount_hostshare}"
-ssh_vm2 "${mount_hostshare}"
+ssh_vm1 "sudo mkdir -p /mnt/hostshare"
+ssh_vm1 "if ! mountpoint -q /mnt/hostshare; then sudo mount -t 9p -o trans=virtio hostshare /mnt/hostshare; fi"
+ssh_vm2 "sudo mkdir -p /mnt/hostshare"
+ssh_vm2 "if ! mountpoint -q /mnt/hostshare; then sudo mount -t 9p -o trans=virtio hostshare /mnt/hostshare; fi"
 
 echo "[*] TDX guest hints (best-effort):"
 ssh_vm1 "dmesg | grep -i tdx | tail -n 20 || true"
