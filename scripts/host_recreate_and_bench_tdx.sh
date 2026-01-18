@@ -139,6 +139,70 @@ need_cmd() {
   return 1
 }
 
+ensure_kvm_for_tdx() {
+  local vendor=""
+  vendor="$(awk -F: '/^vendor_id/{gsub(/^[ \t]+/, "", $2); print $2; exit}' /proc/cpuinfo 2>/dev/null || true)"
+  if [[ -n "${vendor}" && "${vendor}" != "GenuineIntel" ]]; then
+    echo "[!] TDX is Intel-only. Detected CPU vendor_id='${vendor}'." >&2
+    exit 1
+  fi
+
+  local has_vtx=0
+  if grep -q -m1 -E '\b(vmx|svm)\b' /proc/cpuinfo 2>/dev/null; then
+    has_vtx=1
+  fi
+
+  if [[ ! -c /dev/kvm ]]; then
+    modprobe kvm >/dev/null 2>&1 || true
+    modprobe kvm_intel >/dev/null 2>&1 || true
+    modprobe kvm_amd >/dev/null 2>&1 || true
+  fi
+
+  local has_kvm=0
+  local has_kvm_access=0
+  if [[ -c /dev/kvm ]]; then
+    has_kvm=1
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then
+      has_kvm_access=1
+    fi
+  fi
+
+  if [[ "${has_kvm_access}" != "1" ]]; then
+    echo "[!] TDX guests require KVM acceleration (/dev/kvm) and CPU virtualization flags (vmx/svm)." >&2
+    if [[ "${has_kvm}" == "1" ]]; then
+      echo "    /dev/kvm exists but is not accessible (run with sudo or add your user to group 'kvm')." >&2
+    else
+      echo "    /dev/kvm is missing." >&2
+    fi
+    if [[ "${has_vtx}" != "1" ]]; then
+      echo "    CPU virtualization flags (vmx/svm) are not visible; nested virtualization is likely disabled." >&2
+    fi
+    echo "    Fix:" >&2
+    echo "      - Bare metal: enable VT-x/AMD-V in BIOS and ensure KVM modules are available." >&2
+    echo "      - VM/cloud: enable nested virtualization in your hypervisor/provider, or run on bare metal." >&2
+    exit 1
+  fi
+
+  # Best-effort: detect whether the host KVM stack even has TDX host support.
+  # Without this, QEMU will fail with "vm-type tdx not supported by KVM".
+  if [[ -r /sys/module/kvm_intel/parameters/tdx ]]; then
+    local tdx_param
+    tdx_param="$(cat /sys/module/kvm_intel/parameters/tdx 2>/dev/null || true)"
+    if [[ -n "${tdx_param}" && "${tdx_param}" != "Y" && "${tdx_param}" != "y" && "${tdx_param}" != "1" ]]; then
+      echo "[!] kvm_intel TDX support appears disabled (kvm_intel.tdx='${tdx_param}')." >&2
+      echo "    Try: sudo modprobe -r kvm_intel && sudo modprobe kvm_intel tdx=1 (requires a TDX-capable host kernel + BIOS)." >&2
+      exit 1
+    fi
+  else
+    echo "[!] Host kernel/KVM does not expose kvm_intel.tdx; likely missing TDX host support." >&2
+    echo "    This will fail with: qemu-system-x86_64: vm-type tdx not supported by KVM" >&2
+    echo "    Fix: boot a TDX-enabled host kernel + enable TDX in BIOS/firmware (cloud: use a TDX host image/bare metal)." >&2
+    exit 1
+  fi
+}
+
+ensure_kvm_for_tdx
+
 apt_retry_lock() {
   local desc="$1"
   shift

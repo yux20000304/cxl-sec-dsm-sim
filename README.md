@@ -267,9 +267,11 @@ Common knobs:
 ### TDX: 2 confidential VMs + ivshmem (Redis + GAPBS)
 Host prereqs (quick check):
 - `/dev/kvm` available
+- `cat /sys/module/kvm_intel/parameters/tdx` is `Y`/`1` (TDX enabled in host KVM; if missing, your host kernel likely lacks TDX host support)
 - `qemu-system-x86_64 -object help | grep tdx-guest`
 - TDVF/OVMF firmware file for `-bios` (Ubuntu: `sudo apt-get install -y ovmf`, then set `TDX_BIOS=/usr/share/OVMF/OVMF_CODE_4M.fd`)
 If `tdx-guest` is missing, your distro QEMU build likely doesn't include TDX support; install a TDX-enabled QEMU and rerun with `QEMU_BIN=...` (or let the script try to build one via `INSTALL_TDX_QEMU=1` which uses `TDX_QEMU_REF=tdx-qemu-upstream` by default).
+If you see `qemu-system-x86_64: vm-type tdx not supported by KVM`, your host kernel/KVM does not support TDX guests (this is a platform/kernel/BIOS issue, not a missing package).
 
 Run:
 ```bash
