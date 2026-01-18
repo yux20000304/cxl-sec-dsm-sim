@@ -253,94 +253,67 @@ SKIP_RECREATE=1 bash scripts/host_recreate_and_bench_gapbs_multihost.sh
 ```
 Outputs are written to `results/` as timestamped `gapbs_*` logs plus a compare CSV (includes `throughput_teps`).
 
-## TDX hardware: TDX guests (VMs + ivshmem, no Gramine)
-This workflow keeps the two-VM + ivshmem setup, but runs Redis + GAPBS benchmarks
-directly inside **Intel TDX confidential guests**. TDX is a VM-level TEE, so Gramine
-is not required to run inside a TEE (though you *can* still run Gramine inside a TDX
-guest for additional isolation/debugging).
+## TEE benchmarks (TDX / SGX) quickstart
+This repo supports two TEEs:
+- **TDX**: VM-level TEE (confidential guests). No Gramine required.
+- **SGX**: process-level TEE (enclaves) via Gramine SGX.
 
-Host prereqs:
-- `/dev/kvm` available (nested virt enabled if running inside a cloud VM)
-- QEMU supports TDX guests (`qemu-system-x86_64 -object help | grep tdx-guest`)
-- A TDVF/OVMF firmware file for `-bios` (Ubuntu: `sudo apt-get install -y ovmf`, then set `TDX_BIOS=/usr/share/OVMF/OVMF_CODE_4M.fd`)
+Common knobs:
+- `CXL_SHM_DELAY_NS=<ns>` injects a per-access delay on shared-memory reads/writes (set `0` to disable). Useful when the host has only 1 NUMA node; the TEE scripts may auto-default it to `150` if unset.
+- `BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img` for VM-based workflows.
 
-Notes:
-- The ivshmem-backed “shared CXL medium” is **shared memory** and is therefore not
-  protected by TDX (it must be shared with the host/device). Use this workflow to
-  validate functionality and measure performance, but do not treat the ring payload
-  as confidential unless you add application-level crypto/auth (see `TDXRingSecure`).
+### TDX: 2 confidential VMs + ivshmem (Redis + GAPBS)
+Host prereqs (quick check):
+- `/dev/kvm` available
+- `qemu-system-x86_64 -object help | grep tdx-guest`
+- TDVF/OVMF firmware file for `-bios` (Ubuntu: `sudo apt-get install -y ovmf`, then set `TDX_BIOS=/usr/share/OVMF/OVMF_CODE_4M.fd`)
 
-One command:
+Run:
 ```bash
 sudo -E bash scripts/host_recreate_and_bench_tdx.sh
 ```
-Outputs are written to `results/` as timestamped `tdx_*.log` / `tdx_*.csv`.
-Redis compare CSV: `TDXNativeTCP`, `TDXRing`, `TDXRingSecure`.
-GAPBS compare CSV: `TDXGapbsNative`, `TDXGapbsMultihostRing`, `TDXGapbsMultihostCrypto`, `TDXGapbsMultihostSecure` (includes `vm=avg` rows).
+Outputs:
+- Redis: `results/tdx_compare_*.csv` (`TDXNativeTCP`, `TDXRing`, `TDXRingSecure`)
+- GAPBS: `results/tdx_gapbs_compare_*_*.csv` (`TDXGapbsNative`, `TDXGapbsMultihostRing`, `TDXGapbsMultihostCrypto`, `TDXGapbsMultihostSecure`, includes `vm=avg`)
 
-## SGX hardware: Gramine SGX compare (no VMs)
-This workflow runs on an SGX-capable *host OS* (not inside QEMU guests): it starts
-Redis under `gramine-sgx` and benchmarks (host native TCP vs Gramine SGX TCP vs libsodium-encrypted TCP vs ring shared-memory vs secure ring).
+Note: the ivshmem-backed “shared CXL medium” is shared memory and not protected by TDX; use the `*Secure` variants if you need payload crypto/auth.
 
-Prereqs:
+### SGX: host SGX (no VMs) via Gramine SGX
+Prereqs (quick check):
 - CPU flags include `aes` and `sgx`
-- SGX device nodes exist (typically `/dev/sgx_enclave`)
-- AESM is running (`aesmd`)
-- Gramine is installed (`gramine-sgx`, `gramine-sgx-sign`; `gramine-sgx-get-token` optional) or let `scripts/host_bench_gramine_sgx.sh` install it on Ubuntu (`INSTALL_GRAMINE=1`)
-- libsodium headers are available (`libsodium-dev`) or let `scripts/host_bench_gramine_sgx.sh` install them (`INSTALL_LIBSODIUM=1`)
-- `numactl` is installed (optional; only needed for NUMA pinning) or let `scripts/host_bench_gramine_sgx.sh` install it (`INSTALL_NUMACTL=1`)
-- Redis tools are installed (`redis-cli`, `redis-benchmark`, usually via `redis-tools`)
-Notes:
-- Some platforms use SGX Launch Control (FLC) and don't need a launch token. Recent Gramine packages may not ship `gramine-sgx-get-token`; if you see a warning about it, run with `SGX_TOKEN_MODE=skip`.
+- SGX device exists (typically `/dev/sgx_enclave`)
 
-One command:
+Run Redis compare:
 ```bash
 sudo -E bash scripts/host_bench_gramine_sgx.sh
 ```
-Optional NUMA pinning (simulate “remote” CXL memory on the host):
-```bash
-BENCH_CPU_NODE=0 CXL_MEM_NODE=1 sudo -E bash scripts/host_bench_gramine_sgx.sh
-```
-If the host has only a single NUMA node, the script auto-falls back to the
-software delay model above (`CXL_SHM_DELAY_NS`) instead of NUMA binding.
-Outputs are written to `results/` as timestamped `sgx_*.log` / `sgx_*.csv`.
-The compare CSV includes `HostNativeTCP`, `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, `GramineSGXRing`, and `GramineSGXRingSecure` labels.
+Outputs: `results/sgx_*.csv` (`HostNativeTCP`, `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, `GramineSGXRing`, `GramineSGXRingSecure`).
+Tip: if you see missing tools/packages, rerun with `INSTALL_GRAMINE=1 INSTALL_LIBSODIUM=1`; if `gramine-sgx-get-token` is missing on an FLC platform, use `SGX_TOKEN_MODE=skip`.
 
-### GAPBS under Gramine SGX (no VMs)
-This runs the GAPBS multi-host shared-memory matrix on a single SGX-capable host (two processes sharing a file-backed `/dev/shm` mapping).
-
-One command:
+Run GAPBS compare:
 ```bash
 sudo -E bash scripts/host_bench_gapbs_gramine_sgx.sh
 ```
-Outputs are written to `results/` as timestamped `gapbs_sgx_*` logs plus a compare CSV (`gapbs_compare_sgx_*.csv`).
+Outputs: `results/gapbs_compare_sgx_*.csv`.
 
-## SGX hardware: Gramine SGX inside guests (VMs + ivshmem)
-This workflow keeps the two-VM + ivshmem setup, but runs Redis under `gramine-sgx`
-*inside VM1*. This requires **SGX virtualization** support in the host KVM/QEMU
-stack; otherwise the guest won't have `/dev/sgx_enclave`.
-Benchmarks include VM native TCP, Gramine SGX TCP, libsodium-encrypted TCP, ring shared-memory, and secure ring.
+### SGX virtualization: SGX inside guests (2 VMs + ivshmem)
+This requires SGX virtualization support; otherwise the guest won't have `/dev/sgx_enclave`.
 
-Host prereqs:
-- `/dev/kvm` available (nested virt enabled if running inside a cloud VM)
-- CPU flags include `aes` and `sgx`
-- QEMU supports SGX EPC objects (`qemu-system-x86_64 -object help | grep memory-backend-epc`)
+Host prereqs (quick check):
+- `/dev/kvm` available
+- `qemu-system-x86_64 -object help | grep memory-backend-epc`
 
-One command:
+Run Redis compare:
 ```bash
 sudo -E bash scripts/host_recreate_and_bench_gramine_sgxvm.sh
 ```
-Outputs are written to `results/` as timestamped `sgxvm_*.log` / `sgxvm_*.csv`.
-The compare CSV includes `SGXVMNativeTCP`, `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, `GramineSGXVMRing`, and `GramineSGXVMRingSecure` labels.
+Outputs: `results/sgxvm_*.csv` (`SGXVMNativeTCP`, `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, `GramineSGXVMRing`, `GramineSGXVMRingSecure`).
 
-### GAPBS under Gramine SGX inside guests (VMs + ivshmem)
-This runs the GAPBS multi-host shared-memory matrix with each VM running the GAPBS binaries under `gramine-sgx` (requires SGX virtualization for both guests).
-
-One command:
+Run GAPBS compare:
 ```bash
 sudo -E bash scripts/host_recreate_and_bench_gapbs_gramine_sgxvm.sh
 ```
-Outputs are written to `results/` as timestamped `gapbs_sgxvm_*` logs plus a compare CSV (`gapbs_sgxvm_compare_*.csv`).
+Outputs: `results/gapbs_sgxvm_compare_*.csv`.
 
 ## Quick shared-memory sanity check
 VM1:
