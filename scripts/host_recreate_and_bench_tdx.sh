@@ -531,6 +531,15 @@ if [[ -n "${BASE_IMG}" ]]; then
   esac
 fi
 
+# For TDX images, default to root/123456 if no SSH user was provided.
+if [[ "${is_tdx_image_path}" -eq 1 && -z "${SSH_USER}" ]]; then
+  SSH_USER="root"
+  if [[ -z "${SSH_PASS}" ]]; then
+    SSH_PASS="123456"
+  fi
+  SSH_AUTH_MODE="pass"
+fi
+
 # Auto-pick SSH user/auth: try ubuntu+key, then tdx/123456 if needed.
 pick_ssh_auth() {
   local port="$1"
@@ -559,6 +568,14 @@ pick_ssh_auth() {
   SSH_USER="tdx"; SSH_PASS="123456"; SSH_AUTH_MODE="pass"
   if command -v sshpass >/dev/null 2>&1; then
     if sshpass -p "${SSH_PASS}" ssh "${ssh_pass_opts[@]}" -p "${port}" tdx@127.0.0.1 "true" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  # Option C: root/123456 password login (common in TDX images)
+  SSH_USER="root"; SSH_PASS="123456"; SSH_AUTH_MODE="pass"
+  if command -v sshpass >/dev/null 2>&1; then
+    if sshpass -p "${SSH_PASS}" ssh "${ssh_pass_opts[@]}" -p "${port}" root@127.0.0.1 "true" >/dev/null 2>&1; then
       return 0
     fi
   fi
