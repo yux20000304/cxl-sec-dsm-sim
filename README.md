@@ -269,7 +269,7 @@ Host prereqs (quick check):
 - `/dev/kvm` available
 - `qemu-system-x86_64 -object help | grep tdx-guest`
 - TDVF/OVMF firmware file for `-bios` (Ubuntu: `sudo apt-get install -y ovmf`, then set `TDX_BIOS=/usr/share/OVMF/OVMF_CODE_4M.fd`)
-If `tdx-guest` is missing, your distro QEMU build likely doesn't include TDX support; install a TDX-enabled QEMU and rerun with `QEMU_BIN=...` (or let the script try to build one via `INSTALL_TDX_QEMU=1`).
+If `tdx-guest` is missing, your distro QEMU build likely doesn't include TDX support; install a TDX-enabled QEMU and rerun with `QEMU_BIN=...` (or let the script try to build one via `INSTALL_TDX_QEMU=1` which uses `TDX_QEMU_REF=tdx-qemu-upstream` by default).
 
 Run:
 ```bash

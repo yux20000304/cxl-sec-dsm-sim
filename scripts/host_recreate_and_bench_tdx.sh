@@ -79,7 +79,10 @@ QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 INSTALL_HOST_DEPS="${INSTALL_HOST_DEPS:-1}"
 INSTALL_TDX_QEMU="${INSTALL_TDX_QEMU:-auto}"
 TDX_QEMU_REPO="${TDX_QEMU_REPO:-https://github.com/intel/qemu-tdx.git}"
-TDX_QEMU_REF="${TDX_QEMU_REF:-tdx}"
+# NOTE: intel/qemu-tdx has a lightweight "tdx" branch that is NOT a QEMU source
+# tree. Use a branch that contains the full QEMU sources (and thus has
+# ./configure), e.g. "tdx-qemu-upstream".
+TDX_QEMU_REF="${TDX_QEMU_REF:-tdx-qemu-upstream}"
 TDX_QEMU_PREFIX="${TDX_QEMU_PREFIX:-/opt/qemu-tdx}"
 TDX_QEMU_SRC_DIR="${TDX_QEMU_SRC_DIR:-/opt/qemu-tdx-src}"
 TDX_QEMU_BUILD_DIR="${TDX_QEMU_BUILD_DIR:-/opt/qemu-tdx-build}"
@@ -206,11 +209,15 @@ install_tdx_qemu() {
   apt_retry_lock "apt-get update" apt-get update
   apt_retry_lock "apt-get install QEMU build deps" apt-get install -y \
     build-essential \
+    bison \
+    flex \
     git \
     ninja-build \
     meson \
     pkg-config \
     python3 \
+    python3-pip \
+    python3-setuptools \
     python3-venv \
     libglib2.0-dev \
     libpixman-1-dev \
@@ -229,6 +236,23 @@ install_tdx_qemu() {
     git -C "${TDX_QEMU_SRC_DIR}" fetch --all --prune
     git -C "${TDX_QEMU_SRC_DIR}" checkout "${TDX_QEMU_REF}"
     git -C "${TDX_QEMU_SRC_DIR}" pull --ff-only || true
+  fi
+
+  if [[ ! -f "${TDX_QEMU_SRC_DIR}/configure" ]]; then
+    echo "[!] ${TDX_QEMU_REPO}@${TDX_QEMU_REF} does not look like a QEMU source tree (missing 'configure')." >&2
+    echo "    Hint: use a full QEMU branch such as: TDX_QEMU_REF=tdx-qemu-upstream" >&2
+    if [[ "${TDX_QEMU_REF}" == "tdx" ]]; then
+      echo "[*] Retrying with TDX_QEMU_REF=tdx-qemu-upstream ..." >&2
+      rm -rf "${TDX_QEMU_SRC_DIR}"
+      TDX_QEMU_REF="tdx-qemu-upstream"
+      git clone --depth 1 --branch "${TDX_QEMU_REF}" "${TDX_QEMU_REPO}" "${TDX_QEMU_SRC_DIR}"
+      if [[ ! -f "${TDX_QEMU_SRC_DIR}/configure" ]]; then
+        echo "[!] Still missing 'configure' after retry; install a TDX-enabled QEMU manually and set QEMU_BIN=..." >&2
+        return 1
+      fi
+    else
+      return 1
+    fi
   fi
 
   rm -rf "${TDX_QEMU_BUILD_DIR:?}/"*
