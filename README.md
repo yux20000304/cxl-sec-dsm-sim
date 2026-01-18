@@ -254,10 +254,10 @@ SKIP_RECREATE=1 bash scripts/host_recreate_and_bench_gapbs_multihost.sh
 Outputs are written to `results/` as timestamped `gapbs_*` logs plus a compare CSV (includes `throughput_teps`).
 
 ## TDX hardware: TDX guests (VMs + ivshmem, no Gramine)
-This workflow keeps the two-VM + ivshmem setup, but runs both Redis variants directly
-inside **Intel TDX confidential guests**. TDX is a VM-level TEE, so Gramine is not
-required to run inside a TEE (though you *can* still run Gramine inside a TDX guest
-for additional isolation/debugging).
+This workflow keeps the two-VM + ivshmem setup, but runs Redis + GAPBS benchmarks
+directly inside **Intel TDX confidential guests**. TDX is a VM-level TEE, so Gramine
+is not required to run inside a TEE (though you *can* still run Gramine inside a TDX
+guest for additional isolation/debugging).
 
 Host prereqs:
 - `/dev/kvm` available (nested virt enabled if running inside a cloud VM)
@@ -275,7 +275,8 @@ One command:
 sudo -E bash scripts/host_recreate_and_bench_tdx.sh
 ```
 Outputs are written to `results/` as timestamped `tdx_*.log` / `tdx_*.csv`.
-The compare CSV includes `TDXNativeTCP`, `TDXRing`, and `TDXRingSecure` labels.
+Redis compare CSV: `TDXNativeTCP`, `TDXRing`, `TDXRingSecure`.
+GAPBS compare CSV: `TDXGapbsNative`, `TDXGapbsMultihostRing`, `TDXGapbsMultihostCrypto`, `TDXGapbsMultihostSecure` (includes `vm=avg` rows).
 
 ## SGX hardware: Gramine SGX compare (no VMs)
 This workflow runs on an SGX-capable *host OS* (not inside QEMU guests): it starts
