@@ -5,3 +5,7 @@
 [submodule "gapbs"]
 	path = gapbs
 	url = https://github.com/yux20000304/gapbs.git
+
+[submodule "tdx"]
+	path = tdx
+	url = https://github.com/yux20000304/tdx.git

@@ -15,7 +15,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: run_vms.sh --cxl <path> --cxl-size <size> --vm1-disk <qcow2> --vm1-seed <seed.img> --vm2-disk <qcow2> --vm2-seed <seed.img>
+Usage: run_vms.sh --cxl <path> --cxl-size <size> --vm1-disk <qcow2> [--vm1-seed <seed.img>] --vm2-disk <qcow2> [--vm2-seed <seed.img>]
 Optional:
   --vm1-ssh 2222 --vm2-ssh 2223
   --vm1-mem 4G --vm2-mem 4G
@@ -79,7 +79,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for f in CXL_PATH CXL_SIZE VM1_DISK VM2_DISK VM1_SEED VM2_SEED; do
+for f in CXL_PATH CXL_SIZE VM1_DISK VM2_DISK; do
   if [[ -z "${!f}" ]]; then
     echo "[!] Missing required arg: ${f}" >&2
     usage
@@ -91,12 +91,20 @@ if [[ ! -f "${CXL_PATH}" ]]; then
   echo "[!] Shared CXL file not found: ${CXL_PATH}" >&2
   exit 1
 fi
-for f in "${VM1_DISK}" "${VM2_DISK}" "${VM1_SEED}" "${VM2_SEED}"; do
+for f in "${VM1_DISK}" "${VM2_DISK}"; do
   if [[ ! -f "${f}" ]]; then
     echo "[!] Missing file: ${f}" >&2
     exit 1
   fi
 done
+if [[ -n "${VM1_SEED}" && ! -f "${VM1_SEED}" ]]; then
+  echo "[!] Missing file: ${VM1_SEED}" >&2
+  exit 1
+fi
+if [[ -n "${VM2_SEED}" && ! -f "${VM2_SEED}" ]]; then
+  echo "[!] Missing file: ${VM2_SEED}" >&2
+  exit 1
+fi
 
 QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
 
@@ -216,11 +224,24 @@ fi
 
 default_tdx_bios() {
   local c
+  # On Canonical TDX stacks, /usr/share/ovmf/OVMF.fd is TDX-capable and
+  # aligns with their run_td defaults. Prefer it first to avoid early
+  # boot issues observed with certain OVMF.tdx.fd builds.
+  for c in \
+    /usr/share/ovmf/OVMF.fd \
+    /usr/share/OVMF/OVMF.fd \
+    /usr/share/ovmf/OVMF.tdx.fd \
+    /usr/share/OVMF/OVMF.tdx.fd; do
+    if [[ -f "${c}" ]]; then
+      echo "${c}"
+      return 0
+    fi
+  done
+  # Fallbacks (non-TDX specific). Keep previous behavior as last resort.
   for c in \
     /usr/share/OVMF/OVMF_CODE_4M.fd \
     /usr/share/OVMF/OVMF_CODE.fd \
-    /usr/share/qemu/OVMF.fd \
-    /usr/share/OVMF/OVMF.fd; do
+    /usr/share/qemu/OVMF.fd; do
     if [[ -f "${c}" ]]; then
       echo "${c}"
       return 0
@@ -417,9 +438,11 @@ run_vm() {
     local tdx_id="tdx-${name}"
     tdx_opts=(
       -object "tdx-guest,id=${tdx_id}"
+      -object "memory-backend-ram,id=mem0,size=${mem}"
       -bios "${tdx_bios}"
     )
-    machine="q35,kernel-irqchip=split,confidential-guest-support=${tdx_id},smm=off"
+    # For TDX, ensure the machine uses the explicit RAM backend.
+    machine="q35,kernel-irqchip=split,confidential-guest-support=${tdx_id},memory-backend=mem0"
   fi
 
   local sgx_opts=()
@@ -440,9 +463,20 @@ run_vm() {
     machine="q35,sgx-epc.0.memdev=epc-${name},sgx-epc.0.node=0"
   fi
 
-  local cxl_opts="-object memory-backend-file,id=cxlmem-${name},share=on,mem-path=${CXL_PATH},size=${CXL_SIZE}"
-  if [[ -n "${CXL_MEM_NODE}" ]]; then
-    cxl_opts+=",host-nodes=${CXL_MEM_NODE},policy=bind"
+  # Attach shared CXL (ivshmem) unless explicitly disabled. For TDX guests,
+  # default to disabling ivshmem unless TDX_ATTACH_IVSHMEM=1 is set, to reduce
+  # early boot incompatibilities.
+  local attach_ivshmem=1
+  if [[ "${tdx_enable}" == "1" ]]; then
+    attach_ivshmem="${TDX_ATTACH_IVSHMEM:-0}"
+  fi
+
+  local cxl_opts=""
+  if [[ "${attach_ivshmem}" == "1" ]]; then
+    cxl_opts="-object memory-backend-file,id=cxlmem-${name},share=on,mem-path=${CXL_PATH},size=${CXL_SIZE}"
+    if [[ -n "${CXL_MEM_NODE}" ]]; then
+      cxl_opts+=",host-nodes=${CXL_MEM_NODE},policy=bind"
+    fi
   fi
 
   local vmnet_opts=()
@@ -468,6 +502,11 @@ run_vm() {
     fi
   fi
 
+  local attach_hostshare=1
+  if [[ "${tdx_enable}" == "1" ]]; then
+    attach_hostshare="${TDX_ATTACH_HOSTSHARE:-1}"
+  fi
+
   local cmd=(
     ${QEMU_BIN}
     -name "${name}"
@@ -475,23 +514,29 @@ run_vm() {
     "${tdx_opts[@]}"
     "${sgx_opts[@]}"
     -machine "${machine}"
-    -display none
+    -nographic
+    -nodefaults
     -smp "${cpus}"
     -m "${mem}"
     -overcommit mem-lock=off
     ${cxl_opts}
-    -device ivshmem-plain,memdev=cxlmem-${name},id=ivshmem0
-    -drive if=virtio,file="${disk}",format=qcow2
-    -drive if=virtio,file="${seed}",format=raw
+    $( [[ -n "${cxl_opts}" ]] && echo -n "-device ivshmem-plain,memdev=cxlmem-${name},id=ivshmem0" )
+    -drive if=none,file="${disk}",format=qcow2,id=vd0
+    -device virtio-blk-pci,drive=vd0
     -netdev user,id=net0,hostfwd=tcp::${ssh_port}-:22
     -device virtio-net-pci,netdev=net0
     "${vmnet_opts[@]}"
-    -virtfs local,path="${HOSTSHARE}",mount_tag=hostshare,security_model=none,id=hostshare
+    $( [[ "${attach_hostshare}" == "1" ]] && echo -n "-virtfs local,path=${HOSTSHARE},mount_tag=hostshare,security_model=none,id=hostshare" )
     -daemonize
     -monitor unix:"${monitor}",server,nowait
     -pidfile "${pidfile}"
     -serial file:"${log}"
   )
+
+  # Optionally attach cloud-init seed if provided
+  if [[ -n "${seed}" ]]; then
+    cmd+=( -drive "if=virtio,file=${seed},format=raw" )
+  fi
 
   echo "[*] Launching ${name} (SSH port ${ssh_port})"
 
@@ -508,6 +553,33 @@ run_vm() {
   rc=$?
   set -e
   if [[ "${rc}" -eq 0 ]]; then
+    # Quick post-launch sanity: ensure pidfile appears and process is alive.
+    local tries=0
+    local pid=""
+    for tries in $(seq 1 20); do
+      if [[ -r "${pidfile}" ]]; then
+        pid="$(cat "${pidfile}" 2>/dev/null || true)"
+        [[ -n "${pid}" ]] && break
+      fi
+      sleep 0.1
+    done
+
+    if [[ -z "${pid}" || ! -e "/proc/${pid}" ]]; then
+      echo "[!] ${name}: QEMU failed to remain alive after launch (no pid)." >&2
+      echo "    Monitor: ${monitor}" >&2
+      echo "    Log:     ${log}" >&2
+      [[ -f "${log}" ]] && { echo "--- ${log} (tail) ---" >&2; tail -n 200 "${log}" >&2 || true; }
+      return 1
+    fi
+
+    # Give it a brief moment; if it exits immediately, fail fast instead of
+    # letting later SSH waits time out.
+    sleep 0.5
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      echo "[!] ${name}: QEMU exited shortly after launch (pid=${pid})." >&2
+      [[ -f "${log}" ]] && { echo "--- ${log} (tail) ---" >&2; tail -n 200 "${log}" >&2 || true; }
+      return 1
+    fi
     return 0
   fi
 
@@ -523,23 +595,29 @@ run_vm() {
       "${tdx_opts[@]}"
       "${sgx_opts[@]}"
       -machine "${machine}"
-      -display none
+      -nographic
+      -nodefaults
       -smp "${cpus}"
       -m "${mem}"
       -overcommit mem-lock=off
       ${cxl_opts}
-      -device ivshmem-plain,memdev=cxlmem-${name},id=ivshmem0
-      -drive if=virtio,file="${disk}",format=qcow2
-      -drive if=virtio,file="${seed}",format=raw
+      $( [[ -n "${cxl_opts}" ]] && echo -n "-device ivshmem-plain,memdev=cxlmem-${name},id=ivshmem0" )
+      -drive if=none,file="${disk}",format=qcow2,id=vd0
+      -device virtio-blk-pci,drive=vd0
       -netdev user,id=net0,hostfwd=tcp::${ssh_port}-:22
       -device virtio-net-pci,netdev=net0
       "${vmnet_opts[@]}"
-      -virtfs local,path="${HOSTSHARE}",mount_tag=hostshare,security_model=none,id=hostshare
+      $( [[ "${attach_hostshare}" == "1" ]] && echo -n "-virtfs local,path=${HOSTSHARE},mount_tag=hostshare,security_model=none,id=hostshare" )
       -daemonize
       -monitor unix:"${monitor}",server,nowait
       -pidfile "${pidfile}"
       -serial file:"${log}"
     )
+
+    # Optionally attach cloud-init seed if provided
+    if [[ -n "${seed}" ]]; then
+      cmd+=( -drive "if=virtio,file=${seed},format=raw" )
+    fi
 
     full_cmd=()
     if [[ -n "${cpu_node}" ]]; then

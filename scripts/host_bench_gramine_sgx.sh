@@ -32,7 +32,7 @@ set -euo pipefail
 #   SODIUM_LOCAL_PORT: tunnel client listen port on loopback (default: 18479)
 #   SEC_MGR_PORT : TCP port for cxl_sec_mgr (default: 19001)
 #   BENCH_CPU_NODE: optional host NUMA node to pin benchmark processes (cpu+mem), e.g. 0
-#   CXL_MEM_NODE : optional host NUMA node to allocate the ring backing pages on (simulate “remote” CXL memory), e.g. 1
+#   CXL_MEM_NODE : optional host NUMA node to allocate the ring backing pages on (simulate "remote" CXL memory), e.g. 1
 #   INSTALL_NUMACTL: 1 to auto-install numactl via apt when needed (default: 1)
 #   CXL_SHM_DELAY_NS: inject artificial latency on each shared-memory ring access (ns). If unset and host has <2 NUMA nodes, auto-defaults to CXL_SHM_DELAY_NS_DEFAULT.
 #   CXL_SHM_DELAY_NS_DEFAULT: default delay to use on 1-NUMA hosts when CXL_SHM_DELAY_NS is unset (default: 150).

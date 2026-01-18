@@ -109,6 +109,26 @@ GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-2147483648}"
 BASE_IMG="${BASE_IMG:-}"
 TDX_BIOS="${TDX_BIOS:-}"
 
+# If TDX_BIOS is not explicitly set, prefer the system-provided TDX firmware.
+pick_default_tdx_bios() {
+  local c
+  for c in \
+    /usr/share/ovmf/OVMF.tdx.fd \
+    /usr/share/OVMF/OVMF.tdx.fd; do
+    [[ -f "${c}" ]] && { echo "${c}"; return; }
+  done
+  for c in \
+    /usr/share/OVMF/OVMF_CODE_4M.fd \
+    /usr/share/OVMF/OVMF_CODE.fd \
+    /usr/share/qemu/OVMF.fd \
+    /usr/share/OVMF/OVMF.fd; do
+    [[ -f "${c}" ]] && { echo "${c}"; return; }
+  done
+}
+if [[ -z "${TDX_BIOS}" ]]; then
+  TDX_BIOS="$(pick_default_tdx_bios || true)"
+fi
+
 CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS:-}"
 CXL_SHM_DELAY_NS_DEFAULT="${CXL_SHM_DELAY_NS_DEFAULT:-150}"
 
@@ -252,6 +272,7 @@ install_host_apt_deps() {
     curl \
     openssh-client \
     openssl \
+    sshpass \
     ovmf \
     qemu-system-x86 \
     qemu-utils
@@ -381,7 +402,10 @@ elif ! command -v "${QEMU_BIN}" >/dev/null 2>&1; then
   echo "    Install on Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y qemu-system-x86" >&2
   exit 1
 fi
-if ! "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'tdx-guest'; then
+if [[ "${INSTALL_TDX_QEMU}" == "1" ]]; then
+  echo "[*] INSTALL_TDX_QEMU=1: forcing build of TDX-enabled QEMU ..."
+  install_tdx_qemu
+elif ! "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'tdx-guest'; then
   qemu_ver="$("${QEMU_BIN}" -version 2>/dev/null | head -n 1 || true)"
   echo "[!] QEMU does not support TDX guests (missing 'tdx-guest' object)." >&2
   echo "    QEMU_BIN: ${QEMU_BIN}" >&2
@@ -398,6 +422,62 @@ if ! "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'tdx-guest'; then
   fi
 fi
 
+tdx_preflight_or_exit() {
+  # Quick minimal TDX init probe to avoid long SSH waits.
+  # Try to create a TDX guest (no disk). If kernel/QEMU/TDVF mismatch,
+  # it should fail immediately:
+  #  - "vm-type tdx not supported by KVM"
+  #  - "KVM_TDX_INIT_VM failed: Invalid argument"
+  #  - or an early e0000091 exit
+  local bios="${TDX_BIOS}"
+  if [[ -z "${bios}" || ! -f "${bios}" ]]; then
+    echo "[!] TDX preflight: TDX_BIOS is not set or does not exist." >&2
+    return 1
+  fi
+  echo "[*] TDX preflight: using QEMU='${QEMU_BIN}' BIOS='${bios}' ..."
+  local log
+  log="$(mktemp /tmp/tdx-preflight.XXXX.log)"
+  set +e
+  timeout 5s "${QEMU_BIN}" -enable-kvm -cpu host \
+    -object tdx-guest,id=tdx \
+    -bios "${bios}" \
+    -machine q35,kernel-irqchip=split,confidential-guest-support=tdx,smm=off \
+    -m 512 -display none -nodefaults -nographic -no-reboot \
+    >"${log}" 2>&1
+  local rc=$?
+  set -e
+  if grep -qiE 'vm-type tdx not supported by KVM|KVM_TDX_INIT_VM failed|unknown exit|Failed to get registers' "${log}"; then
+    echo "[!] TDX preflight failed: host TDX stack is incompatible with QEMU/TDVF." >&2
+    tail -n 50 "${log}" >&2 || true
+    rm -f "${log}" || true
+    exit 1
+  fi
+  rm -f "${log}" || true
+}
+
+if [[ "${INSTALL_TDX_QEMU}" == "1" ]]; then
+  echo "[*] INSTALL_TDX_QEMU=1: forcing build of TDX-enabled QEMU ..."
+  install_tdx_qemu
+elif ! "${QEMU_BIN}" -object help 2>/dev/null | grep -q 'tdx-guest'; then
+  qemu_ver="$("${QEMU_BIN}" -version 2>/dev/null | head -n 1 || true)"
+  echo "[!] QEMU does not support TDX guests (missing 'tdx-guest' object)." >&2
+  echo "    QEMU_BIN: ${QEMU_BIN}" >&2
+  [[ -n "${qemu_ver}" ]] && echo "    Detected: ${qemu_ver}" >&2
+  echo "    Check: ${QEMU_BIN} -object help | grep tdx-guest" >&2
+
+  if [[ "${INSTALL_TDX_QEMU}" == "1" || ( "${INSTALL_TDX_QEMU}" == "auto" && "${QEMU_BIN}" == "qemu-system-x86_64" ) ]]; then
+    install_tdx_qemu
+  else
+    echo "    Fix options:" >&2
+    echo "      - Install/use a TDX-enabled QEMU and set QEMU_BIN=..." >&2
+    echo "      - Or let this script build one: INSTALL_TDX_QEMU=1" >&2
+    exit 1
+  fi
+fi
+
+# Run a TDX preflight before creating/waiting for guests to fail fast.
+tdx_preflight_or_exit
+
 tmpdir="$(mktemp -d /tmp/cxl-sec-dsm-sim-tdx.XXXXXX)"
 cleanup() { rm -rf "${tmpdir}"; }
 trap cleanup EXIT
@@ -405,7 +485,13 @@ trap cleanup EXIT
 sshkey="${tmpdir}/vm_sshkey"
 ssh-keygen -t ed25519 -N "" -f "${sshkey}" -q
 
-ssh_opts=(
+# Default to key-based SSH for ubuntu; if a TDX image is detected or key auth
+# fails, fall back to tdx/123456 password login.
+SSH_USER="${SSH_USER:-}"
+SSH_AUTH_MODE="key"   # key|pass
+SSH_PASS="${SSH_PASS:-}"
+
+ssh_key_opts=(
   -i "${sshkey}"
   -o BatchMode=yes
   -o StrictHostKeyChecking=no
@@ -413,21 +499,86 @@ ssh_opts=(
   -o LogLevel=ERROR
 )
 
-ssh_vm1() { ssh "${ssh_opts[@]}" -p "${VM1_SSH}" ubuntu@127.0.0.1 "$@"; }
-ssh_vm2() { ssh "${ssh_opts[@]}" -p "${VM2_SSH}" ubuntu@127.0.0.1 "$@"; }
+ssh_pass_opts=(
+  -o PreferredAuthentications=password
+  -o PubkeyAuthentication=no
+  -o StrictHostKeyChecking=no
+  -o UserKnownHostsFile=/dev/null
+  -o LogLevel=ERROR
+)
+
+ssh_do() {
+  local port="$1"; shift
+  if [[ "${SSH_AUTH_MODE}" == "pass" ]]; then
+    sshpass -p "${SSH_PASS}" ssh "${ssh_pass_opts[@]}" -p "${port}" "${SSH_USER}"@127.0.0.1 "$@"
+  else
+    ssh "${ssh_key_opts[@]}" -p "${port}" "${SSH_USER}"@127.0.0.1 "$@"
+  fi
+}
+
+ssh_vm1() { ssh_do "${VM1_SSH}" "$@"; }
+ssh_vm2() { ssh_do "${VM2_SSH}" "$@"; }
+
+# Shorter default waits; override via environment variables as needed.
+WAIT_SSH_SECS="${WAIT_SSH_SECS:-60}"
+WAIT_CLOUD_INIT_SECS="${WAIT_CLOUD_INIT_SECS:-60}"
+
+# Detect whether this is a TD image built by TDX tools (different login defaults).
+is_tdx_image_path=0
+if [[ -n "${BASE_IMG}" ]]; then
+  case "${BASE_IMG}" in
+    *tdx-guest-ubuntu-*.qcow2) is_tdx_image_path=1 ;;
+  esac
+fi
+
+# Auto-pick SSH user/auth: try ubuntu+key, then tdx/123456 if needed.
+pick_ssh_auth() {
+  local port="$1"
+  # If SSH_USER and/or SSH_PASS are explicitly set, try that first.
+  if [[ -n "${SSH_USER}" ]]; then
+    if [[ -n "${SSH_PASS}" ]]; then
+      SSH_AUTH_MODE="pass"
+      if sshpass -p "${SSH_PASS}" ssh "${ssh_pass_opts[@]}" -p "${port}" "${SSH_USER}"@127.0.0.1 "true" >/dev/null 2>&1; then
+        return 0
+      fi
+    else
+      SSH_AUTH_MODE="key"
+      if ssh "${ssh_key_opts[@]}" -p "${port}" "${SSH_USER}"@127.0.0.1 "true" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+  fi
+
+  # Option A: ubuntu + key
+  SSH_USER="ubuntu"; SSH_AUTH_MODE="key"; SSH_PASS=""
+  if ssh "${ssh_key_opts[@]}" -p "${port}" ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Option B: tdx/123456 password login (official TDX image)
+  SSH_USER="tdx"; SSH_PASS="123456"; SSH_AUTH_MODE="pass"
+  if command -v sshpass >/dev/null 2>&1; then
+    if sshpass -p "${SSH_PASS}" ssh "${ssh_pass_opts[@]}" -p "${port}" tdx@127.0.0.1 "true" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
 
 wait_ssh() {
   local name="$1"
   local port="$2"
-  echo "[*] Waiting for ${name} SSH on 127.0.0.1:${port} ..."
-  for _ in $(seq 1 300); do
-    if ssh "${ssh_opts[@]}" -p "${port}" ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
-      echo "    ${name} SSH ready."
+  echo "[*] Waiting for ${name} SSH on 127.0.0.1:${port} (timeout=${WAIT_SSH_SECS}s) ..."
+  local end=$(( $(date +%s) + WAIT_SSH_SECS ))
+  while (( $(date +%s) < end )); do
+    if pick_ssh_auth "${port}"; then
+      echo "    ${name} SSH ready (user=${SSH_USER}, mode=${SSH_AUTH_MODE})."
       return 0
     fi
-    sleep 1
+    sleep 0.5
   done
-  echo "[!] Timeout waiting for ${name} SSH." >&2
+  echo "[!] Timeout waiting for ${name} SSH after ${WAIT_SSH_SECS}s." >&2
   return 1
 }
 
@@ -465,12 +616,35 @@ ssh_retry_lock() {
 }
 
 echo "[*] Recreating TDX VMs (2 guests + ivshmem) ..."
-STOP_EXISTING=1 FORCE_RECREATE=1 BASE_IMG="${BASE_IMG}" \
-VM1_SSH="${VM1_SSH}" VM2_SSH="${VM2_SSH}" \
-VM_TDX_ENABLE=1 TDX_BIOS="${TDX_BIOS}" \
-CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \
-QEMU_BIN="${QEMU_BIN}" \
-bash "${ROOT}/scripts/host_quickstart.sh"
+if [[ -n "${BASE_IMG}" && -f "${BASE_IMG}" ]]; then
+  # For TDX-built images, skip seed attachment (default user is tdx/123456
+  # and does not rely on our cloud-init seed).
+  SKIP_SEED=0
+  if [[ "${is_tdx_image_path}" -eq 1 ]]; then
+    SKIP_SEED=1
+  fi
+  STOP_EXISTING=1 FORCE_RECREATE=1 BASE_IMG="${BASE_IMG}" \
+  VM1_SSH="${VM1_SSH}" VM2_SSH="${VM2_SSH}" \
+  VM_TDX_ENABLE=1 TDX_BIOS="${TDX_BIOS}" \
+  SKIP_SEED="${SKIP_SEED}" FULL_CLONE="${is_tdx_image_path}" \
+  CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \
+  QEMU_BIN="${QEMU_BIN}" \
+  bash "${ROOT}/scripts/host_quickstart.sh"
+else
+  echo "[*] No BASE_IMG provided; building a TD guest image (qcow2) via tdx tools ..."
+  UBUNTU_VERSION="${UBUNTU_VERSION:-24.04}"
+  OUTPUT="${ROOT}/infra/images/tdx-guest-ubuntu-${UBUNTU_VERSION}-generic.qcow2"
+  UBUNTU_VERSION="${UBUNTU_VERSION}" OUTPUT="${OUTPUT}" \
+  bash "${ROOT}/scripts/tdx_build_guest_image.sh"
+  STOP_EXISTING=1 FORCE_RECREATE=1 BASE_IMG="${OUTPUT}" \
+  VM1_SSH="${VM1_SSH}" VM2_SSH="${VM2_SSH}" \
+  VM_TDX_ENABLE=1 TDX_BIOS="${TDX_BIOS}" \
+  SKIP_SEED=1 FULL_CLONE=1 \
+  CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \
+  QEMU_BIN="${QEMU_BIN}" \
+  bash "${ROOT}/scripts/host_quickstart.sh"
+  is_tdx_image_path=1
+fi
 
 wait_ssh "vm1" "${VM1_SSH}"
 wait_ssh "vm2" "${VM2_SSH}"
@@ -479,9 +653,12 @@ echo "[*] Guest OS versions:"
 ssh_vm1 "lsb_release -sd || true"
 ssh_vm2 "lsb_release -sd || true"
 
-echo "[*] Waiting for cloud-init to finish (avoids apt/dpkg locks) ..."
-ssh_vm1 "sudo timeout 300 cloud-init status --wait >/dev/null 2>&1 || true"
-ssh_vm2 "sudo timeout 300 cloud-init status --wait >/dev/null 2>&1 || true"
+# TDX images do not rely on our seed; avoid unnecessary waits.
+if [[ "${is_tdx_image_path}" -ne 1 ]]; then
+  echo "[*] Waiting for cloud-init to finish (timeout=${WAIT_CLOUD_INIT_SECS}s) ..."
+  ssh_vm1 "sudo timeout ${WAIT_CLOUD_INIT_SECS} cloud-init status --wait >/dev/null 2>&1 || true"
+  ssh_vm2 "sudo timeout ${WAIT_CLOUD_INIT_SECS} cloud-init status --wait >/dev/null 2>&1 || true"
+fi
 
 mount_hostshare='
 sudo mkdir -p /mnt/hostshare
@@ -498,10 +675,10 @@ ssh_vm2 "dmesg | grep -i tdx | tail -n 20 || true"
 
 echo "[*] Installing dependencies in guests ..."
 ssh_retry_lock ssh_vm1 "vm1 apt-get update" "sudo env DEBIAN_FRONTEND=noninteractive apt-get update"
-ssh_retry_lock ssh_vm1 "vm1 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl lsb-release redis-server redis-tools net-tools tmux pciutils libsodium-dev"
+ssh_retry_lock ssh_vm1 "vm1 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl lsb-release redis-server redis-tools net-tools tmux pciutils libsodium-dev pkg-config"
 
 ssh_retry_lock ssh_vm2 "vm2 apt-get update" "sudo env DEBIAN_FRONTEND=noninteractive apt-get update"
-ssh_retry_lock ssh_vm2 "vm2 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl lsb-release redis-tools net-tools tmux pciutils libsodium-dev"
+ssh_retry_lock ssh_vm2 "vm2 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl lsb-release redis-tools net-tools tmux pciutils libsodium-dev pkg-config"
 
 echo "[*] Building Redis (ring version) in vm1 ..."
 ssh_vm1 "sudo systemctl disable --now redis-server >/dev/null 2>&1 || true"

@@ -9,7 +9,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: create_vm_images.sh --base <cloud-image> --outdir <dir> [--vm1 vm1.qcow2] [--vm2 vm2.qcow2] [--size 10G]
+Usage: create_vm_images.sh --base <cloud-image> --outdir <dir> [--vm1 vm1.qcow2] [--vm2 vm2.qcow2] [--size 10G] [--full]
 EOF
 }
 
@@ -18,6 +18,7 @@ OUTDIR=""
 VM1="vm1.qcow2"
 VM2="vm2.qcow2"
 SIZE="10G"
+FULL_CLONE="${FULL_CLONE:-0}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -26,6 +27,7 @@ while [[ $# -gt 0 ]]; do
     --vm1) VM1="$2"; shift 2 ;;
     --vm2) VM2="$2"; shift 2 ;;
     --size) SIZE="$2"; shift 2 ;;
+    --full) FULL_CLONE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -41,12 +43,24 @@ if [[ ! -f "${BASE}" ]]; then
   exit 1
 fi
 
+# Ensure backing image is an absolute path so qemu-img doesn't resolve it
+# relative to the output dir (which would duplicate infra/images/...).
+BASE="$(realpath "${BASE}")"
+
 mkdir -p "${OUTDIR}"
 
-echo "[*] Creating VM1 disk ${OUTDIR}/${VM1}"
-qemu-img create -f qcow2 -b "${BASE}" -F qcow2 "${OUTDIR}/${VM1}" "${SIZE}"
+if [[ "${FULL_CLONE}" == "1" ]]; then
+  echo "[*] Creating VM1 disk (full clone) ${OUTDIR}/${VM1}"
+  qemu-img convert -O qcow2 "${BASE}" "${OUTDIR}/${VM1}"
 
-echo "[*] Creating VM2 disk ${OUTDIR}/${VM2}"
-qemu-img create -f qcow2 -b "${BASE}" -F qcow2 "${OUTDIR}/${VM2}" "${SIZE}"
+  echo "[*] Creating VM2 disk (full clone) ${OUTDIR}/${VM2}"
+  qemu-img convert -O qcow2 "${BASE}" "${OUTDIR}/${VM2}"
+else
+  echo "[*] Creating VM1 disk ${OUTDIR}/${VM1}"
+  qemu-img create -f qcow2 -b "${BASE}" -F qcow2 "${OUTDIR}/${VM1}" "${SIZE}"
+
+  echo "[*] Creating VM2 disk ${OUTDIR}/${VM2}"
+  qemu-img create -f qcow2 -b "${BASE}" -F qcow2 "${OUTDIR}/${VM2}" "${SIZE}"
+fi
 
 echo "[+] Done. Disks created in ${OUTDIR}"

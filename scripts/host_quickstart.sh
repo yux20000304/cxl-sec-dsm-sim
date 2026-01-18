@@ -253,14 +253,28 @@ fi
 echo "${BASE_IMG}" > "${stamp}"
 
 echo "[3/3] Launching VMs..."
-bash "${INFRA}/run_vms.sh" \
-  --cxl "${CXL_PATH}" --cxl-size "${CXL_SIZE}" \
-  --vm1-disk "${OUTDIR}/vm1.qcow2" --vm1-seed "${OUTDIR}/seed-vm1.img" \
-  --vm2-disk "${OUTDIR}/vm2.qcow2" --vm2-seed "${OUTDIR}/seed-vm2.img" \
-  --vm1-ssh "${VM1_SSH}" --vm2-ssh "${VM2_SSH}" \
-  --vm1-mem "${VM1_MEM}" --vm2-mem "${VM2_MEM}" \
-  --vm1-cpus "${VM1_CPUS}" --vm2-cpus "${VM2_CPUS}" \
-  --hostshare "${HOSTSHARE}"
+
+# Allow SKIP_SEED=1 to skip attaching cloud-init seed (e.g. for TD images built by canonical/tdx tools).
+SKIP_SEED="${SKIP_SEED:-0}"
+if [[ "${SKIP_SEED}" == "1" ]]; then
+  bash "${INFRA}/run_vms.sh" \
+    --cxl "${CXL_PATH}" --cxl-size "${CXL_SIZE}" \
+    --vm1-disk "${OUTDIR}/vm1.qcow2" \
+    --vm2-disk "${OUTDIR}/vm2.qcow2" \
+    --vm1-ssh "${VM1_SSH}" --vm2-ssh "${VM2_SSH}" \
+    --vm1-mem "${VM1_MEM}" --vm2-mem "${VM2_MEM}" \
+    --vm1-cpus "${VM1_CPUS}" --vm2-cpus "${VM2_CPUS}" \
+    --hostshare "${HOSTSHARE}"
+else
+  bash "${INFRA}/run_vms.sh" \
+    --cxl "${CXL_PATH}" --cxl-size "${CXL_SIZE}" \
+    --vm1-disk "${OUTDIR}/vm1.qcow2" --vm1-seed "${OUTDIR}/seed-vm1.img" \
+    --vm2-disk "${OUTDIR}/vm2.qcow2" --vm2-seed "${OUTDIR}/seed-vm2.img" \
+    --vm1-ssh "${VM1_SSH}" --vm2-ssh "${VM2_SSH}" \
+    --vm1-mem "${VM1_MEM}" --vm2-mem "${VM2_MEM}" \
+    --vm1-cpus "${VM1_CPUS}" --vm2-cpus "${VM2_CPUS}" \
+    --hostshare "${HOSTSHARE}"
+fi
 
 echo "[+] Done. SSH:"
 echo "    VM1: ssh ubuntu@127.0.0.1 -p ${VM1_SSH}"
