@@ -54,6 +54,27 @@ MIRROR_DIR="${MIRROR_DIR:-${ROOT}/../mirror}"
 DEFAULT_NOBLE_IMG="${MIRROR_DIR}/ubuntu-24.04-server-cloudimg-amd64.img"
 DEFAULT_JAMMY_IMG="${MIRROR_DIR}/jammy-server-cloudimg-amd64.img"
 
+size_to_bytes() {
+  local v="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --from=iec "${v}" 2>/dev/null && return 0
+  fi
+  if [[ "${v}" =~ ^([0-9]+)([KkMmGgTt])?$ ]]; then
+    local n="${BASH_REMATCH[1]}"
+    local s="${BASH_REMATCH[2]}"
+    case "${s}" in
+      K|k) echo $((n * 1024)) ;;
+      M|m) echo $((n * 1024 * 1024)) ;;
+      G|g) echo $((n * 1024 * 1024 * 1024)) ;;
+      T|t) echo $((n * 1024 * 1024 * 1024 * 1024)) ;;
+      "") echo "${n}" ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  return 1
+}
+
 default_vm_state_dir() {
   if [[ -n "${VM_STATE_DIR:-}" ]]; then
     echo "${VM_STATE_DIR}"
@@ -128,7 +149,14 @@ echo "[1/3] Shared CXL backing file..."
 if [[ ! -f "${CXL_PATH}" ]]; then
   bash "${INFRA}/create_cxl_shared.sh" "${CXL_PATH}" "${CXL_SIZE}"
 else
-  echo "    reuse ${CXL_PATH}"
+  cur_size="$(stat -c '%s' "${CXL_PATH}" 2>/dev/null || true)"
+  req_size="$(size_to_bytes "${CXL_SIZE}" 2>/dev/null || true)"
+  if [[ -n "${cur_size}" && -n "${req_size}" && "${cur_size}" -lt "${req_size}" ]]; then
+    echo "    grow ${CXL_PATH} from ${cur_size} bytes to ${CXL_SIZE}"
+    truncate -s "${CXL_SIZE}" "${CXL_PATH}"
+  else
+    echo "    reuse ${CXL_PATH}"
+  fi
 fi
 
 echo "[2/3] VM disks + cloud-init seeds..."

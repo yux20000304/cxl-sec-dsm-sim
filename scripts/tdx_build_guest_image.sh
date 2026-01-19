@@ -45,6 +45,37 @@ echo "[*] Building TD image via canonical/tdx tools ..."
 echo "    Ubuntu: ${UBUNTU_VERSION}"
 echo "    Output: ${OUTPUT}"
 
+# Ensure libvirt daemon and default network are available for virt-install
+ensure_libvirt() {
+  if ! command -v virsh >/dev/null 2>&1; then
+    echo "[*] Installing libvirt client tools (virsh) ..."
+    sudo apt-get update -y >/dev/null 2>&1 || true
+    sudo apt-get install -y libvirt-clients >/dev/null 2>&1 || true
+  fi
+
+  if ! sudo systemctl is-active --quiet libvirtd; then
+    echo "[*] Starting libvirtd service ..."
+    sudo systemctl enable --now libvirtd >/dev/null 2>&1 || true
+  fi
+
+  # Ensure the default NAT network exists and is active
+  if ! sudo virsh net-info default >/dev/null 2>&1; then
+    if [[ -f /usr/share/libvirt/networks/default.xml ]]; then
+      echo "[*] Defining libvirt default network ..."
+      sudo virsh net-define /usr/share/libvirt/networks/default.xml >/dev/null 2>&1 || true
+    fi
+  fi
+  if sudo virsh net-info default >/dev/null 2>&1; then
+    if ! sudo virsh net-is-active default >/dev/null 2>&1; then
+      echo "[*] Starting libvirt default network ..."
+      sudo virsh net-start default >/dev/null 2>&1 || true
+    fi
+    sudo virsh net-autostart default >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_libvirt
+
 set +e
 sudo -E bash -lc "cd '${TDX_IMG_DIR}'; ./create-td-image.sh -v '${UBUNTU_VERSION}' -o '${OUTPUT}'"
 rc=$?
@@ -82,6 +113,9 @@ NP
     --copy-in "${TDX_DIR}/attestation/":/tmp/tdx \
     --copy-in "${TDX_DIR}/tests/lib/tdx-tools/":/tmp/tdx \
     --run-command "/tmp/tdx/setup.sh" \
+    --run-command "sed -i '/^\s*KbdInteractiveAuthentication\b.*/d' /etc/ssh/sshd_config || true" \
+    --run-command "rm -f /etc/ssh/sshd_config.d/60-cloudimg-settings.conf || true" \
+    --run-command "mkdir -p /etc/systemd/system && ln -sf /dev/null /etc/systemd/system/systemd-networkd-wait-online.service || true" \
     --mkdir /etc/netplan \
     --copy-in "${tmpdir}/99-netcfg.yaml":/etc/netplan/ \
     --run-command "echo root:123456 | chpasswd"

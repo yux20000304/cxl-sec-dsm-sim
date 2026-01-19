@@ -156,7 +156,12 @@ static int init_layout(size_t map_size) {
     return 0;
 }
 
-static int shm_init(const char *path, size_t map_size) {
+static int shm_init(const char *path, size_t map_size, size_t map_offset) {
+    long page = sysconf(_SC_PAGESIZE);
+    if (page > 0 && (map_offset % (size_t)page) != 0) {
+        fprintf(stderr, "map offset %zu is not page-aligned\n", map_offset);
+        return -1;
+    }
     g.shm_fd = open(path, O_RDWR);
     if (g.shm_fd < 0) {
         fprintf(stderr, "open %s failed: %s\n", path, strerror(errno));
@@ -168,9 +173,18 @@ static int shm_init(const char *path, size_t map_size) {
         return -1;
     }
     g.file_size = st.st_size;
-    if (map_size > st.st_size) map_size = st.st_size;
+    if (S_ISREG(st.st_mode)) {
+        if ((size_t)st.st_size <= map_offset) {
+            fprintf(stderr, "map offset %zu exceeds file size %zu\n",
+                    map_offset, (size_t)st.st_size);
+            return -1;
+        }
+        if (map_size > (size_t)st.st_size - map_offset) {
+            map_size = (size_t)st.st_size - map_offset;
+        }
+    }
     g.map_size = map_size;
-    g.mm = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, g.shm_fd, 0);
+    g.mm = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, g.shm_fd, (off_t)map_offset);
     if (g.mm == MAP_FAILED) {
         fprintf(stderr, "mmap failed: %s\n", strerror(errno));
         return -1;
@@ -369,13 +383,21 @@ static void handle_resp(void) {
 int main(int argc, char **argv) {
     const char *path = "/sys/bus/pci/devices/0000:00:02.0/resource2";
     size_t map_size = 1024ULL * 1024 * 1024; /* 1GB default */
+    size_t map_offset = 0;
     const char *listen = "0.0.0.0";
     int port = 6380;
     int opt;
     while ((opt = getopt(argc, argv, "")) != -1) {}
+    const char *offset_env = getenv("CXL_RING_OFFSET");
+    if (!offset_env || !offset_env[0]) offset_env = getenv("CXL_SHM_OFFSET");
+    if (offset_env && offset_env[0]) {
+        unsigned long long v = strtoull(offset_env, NULL, 0);
+        if (v > 0) map_offset = (size_t)v;
+    }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--path") && i + 1 < argc) path = argv[++i];
         else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) map_size = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) map_offset = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--listen") && i + 1 < argc) {
             listen = argv[++i];
             char *colon = strrchr(listen, ':');
@@ -386,7 +408,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_sig);
     signal(SIGTERM, handle_sig);
 
-    if (shm_init(path, map_size) != 0) {
+    if (shm_init(path, map_size, map_offset) != 0) {
         fprintf(stderr, "failed to init shm\n");
         return 1;
     }
@@ -399,7 +421,8 @@ int main(int argc, char **argv) {
     epoll_add(g.listen_fd, EPOLLIN, NULL);
     g.next_id = 1;
 
-    fprintf(stderr, "[*] ring client: path=%s map=%zu listen=%s:%d\n", path, map_size, listen, port);
+    fprintf(stderr, "[*] ring client: path=%s map=%zu offset=%zu listen=%s:%d\n",
+            path, map_size, map_offset, listen, port);
     struct epoll_event evs[64];
     while (running) {
         handle_resp();

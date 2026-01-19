@@ -4,6 +4,7 @@
 #include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <signal.h>
@@ -96,7 +97,7 @@ static void on_sig(int sig) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
-            "  %s --ring <path> --listen <ip:port> [--map-size <bytes>] [--timeout-ms <ms>]\n"
+            "  %s --ring <path> --listen <ip:port> [--map-size <bytes>] [--map-offset <bytes>] [--timeout-ms <ms>]\n"
             "\n"
             "Notes:\n"
             "- Auto-detects the shared-memory layout (Redis ring or GAPBS graph).\n"
@@ -399,7 +400,14 @@ int main(int argc, char **argv) {
     const char *ring_path = NULL;
     const char *listen = NULL;
     uint64_t map_size = 0;
+    uint64_t map_offset = 0;
     unsigned timeout_ms = 10000;
+
+    const char *offset_env = getenv("CXL_RING_OFFSET");
+    if (!offset_env || !offset_env[0]) offset_env = getenv("CXL_SHM_OFFSET");
+    if (offset_env && offset_env[0]) {
+        map_offset = strtoull(offset_env, NULL, 0);
+    }
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -411,6 +419,8 @@ int main(int argc, char **argv) {
             listen = argv[++i];
         } else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) {
             map_size = strtoull(argv[++i], NULL, 0);
+        } else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) {
+            map_offset = strtoull(argv[++i], NULL, 0);
         } else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) {
             timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
         } else {
@@ -444,8 +454,29 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    uint64_t total_size = (uint64_t)st.st_size;
-    if (map_size) total_size = map_size;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page > 0 && (map_offset % (uint64_t)page) != 0) {
+        fprintf(stderr, "[!] map offset %" PRIu64 " is not page-aligned\n", map_offset);
+        close(fd);
+        return 1;
+    }
+
+    uint64_t total_size = 0;
+    if (map_size) {
+        total_size = map_size;
+        if (S_ISREG(st.st_mode) && (uint64_t)st.st_size > map_offset) {
+            uint64_t avail = (uint64_t)st.st_size - map_offset;
+            if (total_size > avail) total_size = avail;
+        }
+    } else if (S_ISREG(st.st_mode)) {
+        if ((uint64_t)st.st_size <= map_offset) {
+            fprintf(stderr, "[!] map offset %" PRIu64 " exceeds file size %zu\n",
+                    map_offset, (size_t)st.st_size);
+            close(fd);
+            return 1;
+        }
+        total_size = (uint64_t)st.st_size - map_offset;
+    }
     if (total_size < 4096) {
         fprintf(stderr, "[!] ring mapping size too small (need >= 4096). Provide --map-size if fstat reports 0.\n");
         close(fd);
@@ -453,7 +484,7 @@ int main(int argc, char **argv) {
     }
 
     size_t map_len = 4096;
-    unsigned char *mm = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    unsigned char *mm = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)map_offset);
     if (mm == MAP_FAILED) {
         fprintf(stderr, "[!] mmap(%s, %zu) failed: %s\n", ring_path, map_len, strerror(errno));
         close(fd);
@@ -485,11 +516,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    fprintf(stderr, "[*] cxl_sec_mgr: ring=%s listen=%s:%s map_size=%llu\n",
+    fprintf(stderr, "[*] cxl_sec_mgr: ring=%s listen=%s:%s map_size=%llu map_offset=%llu\n",
             ring_path,
             lh,
             lp,
-            (unsigned long long)total_size);
+            (unsigned long long)total_size,
+            (unsigned long long)map_offset);
 
     free(lh);
     free(lp);

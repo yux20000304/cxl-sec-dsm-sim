@@ -487,6 +487,23 @@ static int load_layout(unsigned char *mm, struct layout *lo) {
     return 0;
 }
 
+static int layout_fits(const struct layout *lo, size_t map_size) {
+    if (!lo || lo->ring_count == 0) return -1;
+    for (uint32_t i = 0; i < lo->ring_count; i++) {
+        size_t req_off = lo->rings[i].req_off;
+        size_t req_sz = lo->rings[i].req_sz;
+        size_t resp_off = lo->rings[i].resp_off;
+        size_t resp_sz = lo->rings[i].resp_sz;
+        if (req_off == 0 || resp_off == 0) return -1;
+        if ((req_off % 4096) || (resp_off % 4096)) return -1;
+        if ((req_sz % 4096) || (resp_sz % 4096)) return -1;
+        if (req_off + req_sz > map_size) return -1;
+        if (resp_off + resp_sz > map_size) return -1;
+        if (resp_off < req_off + req_sz) return -1;
+    }
+    return 0;
+}
+
 static int ring_push(unsigned char *mm, const struct ring_info *ri, uint32_t cid, uint16_t type, const unsigned char *payload, uint32_t len) {
     shm_delay();
     uint64_t head = 0, tail = 0;
@@ -922,6 +939,7 @@ static void run_bench(unsigned char *mm, struct layout *lo, int n, int pipeline,
 int main(int argc, char **argv) {
     const char *path = "/sys/bus/pci/devices/0000:00:02.0/resource2";
     size_t map_size = 1024ULL * 1024 * 1024;
+    size_t map_offset = 0;
     int bench_n = 0;
     int pipeline = 0;
     int threads = 1;
@@ -942,6 +960,12 @@ int main(int argc, char **argv) {
         unsigned long long v = strtoull(delay_env, NULL, 0);
         if (errno == 0) shm_delay_ns = (uint64_t)v;
     }
+    const char *offset_env = getenv("CXL_RING_OFFSET");
+    if (!offset_env || !offset_env[0]) offset_env = getenv("CXL_SHM_OFFSET");
+    if (offset_env && offset_env[0]) {
+        unsigned long long v = strtoull(offset_env, NULL, 0);
+        if (v > 0) map_offset = (size_t)v;
+    }
 
     const char *sec_node_env = getenv("CXL_SEC_NODE_ID");
     uint32_t sec_node = sec_node_env ? (uint32_t)strtoul(sec_node_env, NULL, 0) : 0;
@@ -950,6 +974,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--path") && i + 1 < argc) path = argv[++i];
         else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) map_size = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) map_offset = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--pipeline")) pipeline = 1;
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ring") && i + 1 < argc) ring_idx = atoi(argv[++i]); /* kept for single ring mode */
@@ -964,7 +989,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--sec-timeout-ms") && i + 1 < argc) sec_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--ping-timeout-ms") && i + 1 < argc) ping_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            printf("Usage: %s [--path <ring>] [--map-size <bytes>] [--bench N] [--pipeline] [--threads N]\n"
+            printf("Usage: %s [--path <ring>] [--map-size <bytes>] [--map-offset <bytes>] [--bench N] [--pipeline] [--threads N]\n"
                    "          [--max-inflight N] [--latency] [--cost] [--csv <path>] [--label <name>]\n"
                    "          [--secure --sec-mgr <ip:port> --sec-node-id <n>]\n"
                    "          [--ping-timeout-ms <ms>] (ping mode only; 0=wait forever)\n",
@@ -976,12 +1001,35 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_sig);
     signal(SIGTERM, handle_sig);
 
+    long page = sysconf(_SC_PAGESIZE);
+    if (page > 0 && (map_offset % (size_t)page) != 0) {
+        fprintf(stderr, "[!] map offset %zu is not page-aligned\n", map_offset);
+        return 1;
+    }
+
     int fd = open(path, O_RDWR);
     if (fd < 0) {
         perror("open");
         return 1;
     }
-    unsigned char *mm = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    struct stat st;
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+        if ((size_t)st.st_size <= map_offset) {
+            fprintf(stderr, "[!] map offset %zu exceeds file size %zu\n",
+                    map_offset, (size_t)st.st_size);
+            close(fd);
+            return 1;
+        }
+        if (map_size > (size_t)st.st_size - map_offset) {
+            map_size = (size_t)st.st_size - map_offset;
+        }
+    }
+    if (map_size == 0) {
+        fprintf(stderr, "[!] map size is zero after clamping\n");
+        close(fd);
+        return 1;
+    }
+    unsigned char *mm = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)map_offset);
     if (mm == MAP_FAILED) {
         perror("mmap");
         close(fd);
@@ -994,9 +1042,15 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
+    if (layout_fits(&lo, map_size) != 0) {
+        fprintf(stderr, "[!] ring layout exceeds map size (%zu); check RING_MAP_SIZE/CXL_SIZE\n", map_size);
+        munmap(mm, map_size);
+        close(fd);
+        return 1;
+    }
     if (ring_idx < 0 || ring_idx >= (int)lo.ring_count) ring_idx = 0;
-    printf("[*] ring direct: path=%s map=%zu ring_count=%u using_ring=%d slots=%u secure=%d shm_delay_ns=%llu\n",
-           path, map_size, lo.ring_count, ring_idx, lo.rings[ring_idx].slots, secure,
+    printf("[*] ring direct: path=%s map=%zu offset=%zu ring_count=%u using_ring=%d slots=%u secure=%d shm_delay_ns=%llu\n",
+           path, map_size, map_offset, lo.ring_count, ring_idx, lo.rings[ring_idx].slots, secure,
            (unsigned long long)shm_delay_ns);
 
     if (secure) {
