@@ -2,6 +2,7 @@ infra/images/
 tmp/
 results/*.log
 results/*.csv
+cxl_ring_shared.bin
 
 # Gramine outputs are environment-specific; keep only *.manifest.template in git.
 gramine/*.manifest
