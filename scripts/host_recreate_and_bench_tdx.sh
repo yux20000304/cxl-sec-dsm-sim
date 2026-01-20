@@ -663,6 +663,15 @@ pick_ssh_auth() {
     return 0
   fi
 
+  # Option A2: ubuntu + password (matches create_cloud_init.sh default)
+  # Only attempt if sshpass is available; default password is 'ubuntu' unless overridden
+  if command -v sshpass >/dev/null 2>&1; then
+    SSH_USER="ubuntu"; SSH_PASS="${SSH_UBUNTU_PASS:-ubuntu}"; SSH_AUTH_MODE="pass"
+    if sshpass -p "${SSH_PASS}" ssh "${ssh_pass_opts[@]}" -p "${port}" ubuntu@127.0.0.1 "true" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
   # Option B: tdx/123456 password login (official TDX image)
   SSH_USER="tdx"; SSH_PASS="123456"; SSH_AUTH_MODE="pass"
   if command -v sshpass >/dev/null 2>&1; then
@@ -760,7 +769,7 @@ if [[ -n "${BASE_IMG}" && -f "${BASE_IMG}" ]]; then
   VM1_MEM="${VM1_MEM}" VM2_MEM="${VM2_MEM}" \
   VM1_CPUS="${VM1_CPUS}" VM2_CPUS="${VM2_CPUS}" \
   CXL_SIZE="${CXL_SIZE}" \
-  VM_TDX_ENABLE=1 TDX_BIOS="${TDX_BIOS}" \
+  VM_TDX_ENABLE=1 TDX_BIOS="${TDX_BIOS}" TDX_ATTACH_IVSHMEM=1 \
   SKIP_SEED="${SKIP_SEED}" FULL_CLONE="${is_tdx_image_path}" \
   CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \
   QEMU_BIN="${QEMU_BIN}" \
@@ -776,7 +785,7 @@ else
   VM1_MEM="${VM1_MEM}" VM2_MEM="${VM2_MEM}" \
   VM1_CPUS="${VM1_CPUS}" VM2_CPUS="${VM2_CPUS}" \
   CXL_SIZE="${CXL_SIZE}" \
-  VM_TDX_ENABLE=1 TDX_BIOS="${TDX_BIOS}" \
+  VM_TDX_ENABLE=1 TDX_BIOS="${TDX_BIOS}" TDX_ATTACH_IVSHMEM=1 \
   SKIP_SEED=0 FULL_CLONE=1 \
   CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \
   QEMU_BIN="${QEMU_BIN}" \
@@ -820,7 +829,16 @@ ssh_vm2 "sudo systemctl enable --now ssh.service >/dev/null 2>&1 || sudo systemc
 
 echo "[*] Building Redis (ring version) in vm1 ..."
 ssh_vm1 "sudo systemctl disable --now redis-server >/dev/null 2>&1 || true"
-ssh_vm1 "cd /mnt/hostshare/redis/src && sudo -n bash -lc 'ulimit -n ${ULIMIT_NOFILE} 2>/dev/null || ulimit -n 8192 2>/dev/null || true; make -j${REDIS_MAKE_JOBS} MALLOC=libc USE_LTO=no CFLAGS=\"-O2 -fno-lto\" LDFLAGS=\"-fno-lto\"'"
+# Build inside /tmp to avoid virtio-9p open-file limitations, then copy artifacts back
+ssh_vm1 "sudo -n bash -lc 'set -euo pipefail; \
+  tmp=/tmp/redis_ring_build; \
+  rm -rf \"\$tmp\" && mkdir -p \"\$tmp\"; \
+  cp -a /mnt/hostshare/redis/. \"\$tmp\"/; \
+  cd \"\$tmp/src\"; \
+  ulimit -n ${ULIMIT_NOFILE} 2>/dev/null || ulimit -n 8192 2>/dev/null || true; \
+  make -j${REDIS_MAKE_JOBS} MALLOC=libc USE_LTO=no CFLAGS=\"-O2 -fno-lto\" LDFLAGS=\"-fno-lto\"; \
+  cp -a \"\$tmp\"/. /mnt/hostshare/redis/ \
+'"
 
 echo "[*] Building ring client in vm2 (/tmp/cxl_ring_direct) ..."
 ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c -lsodium"

@@ -26,3 +26,5 @@ cxl_sec_mgr/cxl_sec_mgr
 *.iso
 .DS_Store
 .vscode/
+__pycache__/
+*.pyc

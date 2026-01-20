@@ -49,24 +49,36 @@ class CxlShm:
     It also initializes the ring headers if magic is absent.
     """
 
-    def __init__(self, path: str, map_size: Optional[int] = None):
+    def __init__(self, path: str, map_size: Optional[int] = None, map_offset: int = 0):
         flags = os.O_RDWR
         self.fd = os.open(path, flags)
         st = os.fstat(self.fd)
         self.file_size = st.st_size
+        self.map_offset = map_offset
+        if self.map_offset < 0 or (self.map_offset % mmap.PAGESIZE) != 0:
+            raise ValueError(f"map_offset must be >=0 and page-size aligned (got {self.map_offset})")
         if map_size:
             self.map_size = map_size
         else:
             if self.file_size > 0:
-                self.map_size = self.file_size
+                if self.file_size < self.map_offset:
+                    raise ValueError("map_offset exceeds file size")
+                self.map_size = self.file_size - self.map_offset
             else:
-                self.map_size = self._detect_uio_size(path)
+                map_index = self.map_offset // mmap.PAGESIZE
+                self.map_size = self._detect_uio_size(path, map_index)
         if self.map_size <= 0:
             raise ValueError(f"Invalid map_size resolved for {path}")
-        self.mm = mmap.mmap(self.fd, self.map_size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        self.mm = mmap.mmap(
+            self.fd,
+            self.map_size,
+            mmap.MAP_SHARED,
+            mmap.PROT_READ | mmap.PROT_WRITE,
+            offset=self.map_offset,
+        )
         self.layout = self._init_or_load_layout()
 
-    def _detect_uio_size(self, path: str) -> int:
+    def _detect_uio_size(self, path: str, map_index: int = 0) -> int:
         base = os.path.basename(path)
         if not base.startswith("uio") and "uio" not in base:
             raise ValueError("map_size not provided and file size is 0; please pass --map-size")
@@ -80,7 +92,7 @@ class CxlShm:
                     break
         if not uio:
             raise ValueError("Could not infer UIO device name for size detection")
-        sysfs_path = f"/sys/class/uio/{uio}/maps/map0/size"
+        sysfs_path = f"/sys/class/uio/{uio}/maps/map{map_index}/size"
         try:
             with open(sysfs_path, "r") as f:
                 size_str = f.read().strip()
@@ -213,10 +225,11 @@ def _cli():
     parser = argparse.ArgumentParser(description="Simple CXL shared-memory ring inspector")
     parser.add_argument("--path", required=True, help="Path to shared file or /dev/uioX")
     parser.add_argument("--map-size", type=int, help="Bytes to map (default: whole file)")
+    parser.add_argument("--map-offset", type=int, default=0, help="Bytes to offset mmap (page-size aligned)")
     parser.add_argument("--peek", action="store_true", help="Peek at ring heads/tails")
     args = parser.parse_args()
 
-    shm = CxlShm(args.path, args.map_size)
+    shm = CxlShm(args.path, args.map_size, args.map_offset)
     req_ring = SpscRing(shm.mm, shm.layout.req)
     resp_ring = SpscRing(shm.mm, shm.layout.resp)
     h1, t1 = req_ring._load_head_tail()
