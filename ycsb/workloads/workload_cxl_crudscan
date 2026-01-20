@@ -1,0 +1,28 @@
+# CXL Redis workload to exercise CRUD + scan in one run.
+# Intended for comparing:
+# - Native Redis TCP
+# - Gramine SGX Redis TCP
+# - Gramine SGX + libsodium tunnel
+# - Gramine SGX ring/secure-ring (via JNI binding)
+workload=site.ycsb.workloads.CoreWorkload
+
+recordcount=10000
+operationcount=10000
+
+fieldcount=10
+fieldlength=100
+
+readproportion=0.30
+updateproportion=0.30
+insertproportion=0.20
+scanproportion=0.10
+deleteproportion=0.10
+# YCSB core uses maxscanlength (+ scanlengthdistribution), not "scanlength".
+maxscanlength=10
+scanlengthdistribution=uniform
+
+requestdistribution=uniform
+insertorder=ordered
+
+readallfields=true
+writeallfields=true

@@ -231,6 +231,22 @@ bash scripts/host_recreate_and_bench_gramine.sh
 Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
 The compare CSV includes `NativeTCP`, `GramineNativeTCP`, `GramineSodiumTCP`, `GramineRing`, and `GramineRingSecure` labels.
 
+### One command: recreate VMs + Redis YCSB (Gramine SGX inside SGX VM)
+This rebuilds VM1/VM2, enables SGX virtualization in VM1, then runs YCSB (CRUD+scan mix) across:
+- Native Redis over TCP
+- Gramine SGX Redis over TCP
+- Gramine SGX Redis over libsodium-encrypted TCP
+- Gramine SGX ring Redis over BAR2 (YCSB JNI binding)
+- Gramine SGX secure ring Redis over BAR2 (YCSB JNI binding + `cxl_sec_mgr`)
+
+```bash
+sudo -E bash scripts/host_recreate_and_ycsb_gramine_sgxvm.sh
+```
+
+Notes:
+- Default workload file: `ycsb/workloads/workload_cxl_crudscan` (override with `YCSB_WORKLOAD`).
+- Outputs are written to `results/` as timestamped `sgxvm_ycsb_*.log` plus a compare CSV `sgxvm_ycsb_compare_*.csv`.
+
 ### Local GAPBS benchmark (no VMs)
 ```bash
 bash scripts/host_bench_gapbs_local.sh

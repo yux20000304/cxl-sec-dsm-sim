@@ -22,6 +22,7 @@ set -euo pipefail
 # Tunables (env):
 #   BASE_IMG       : ubuntu cloud image path (optional; host_quickstart auto-detects noble)
 #   VM1_SSH/VM2_SSH: forwarded SSH ports (default: 2222/2223)
+#   VM1_CPUS/VM2_CPUS: vCPUs per VM (default: 8)
 #   SKIP_RECREATE  : 1 to reuse existing SGX-enabled VMs (default: 0)
 #   SSH_KEY        : optional ssh private key path (used when SKIP_RECREATE=1)
 #   GAPBS_KERNEL   : bfs|cc|pr|... (default: bfs)
@@ -58,6 +59,8 @@ fi
 
 VM1_SSH="${VM1_SSH:-2222}"
 VM2_SSH="${VM2_SSH:-2223}"
+VM1_CPUS="${VM1_CPUS:-8}"
+VM2_CPUS="${VM2_CPUS:-8}"
 
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
 SCALE="${SCALE:-22}"
@@ -135,6 +138,39 @@ ssh_opts=(
   -o LogLevel=ERROR
 )
 
+# Ensure required submodules (e.g., GAPBS) are present on the hostshare before
+# launching VMs. This prevents build failures inside guests due to empty
+# submodule directories.
+ensure_submodules() {
+  # Only attempt when running from a git checkout.
+  if [[ -d "${ROOT}/.git" ]] && command -v git >/dev/null 2>&1; then
+    local need_update=0
+    # GAPBS is required for this workflow.
+    if [[ ! -s "${ROOT}/gapbs/Makefile" ]] && [[ ! -d "${ROOT}/gapbs/src" ]]; then
+      need_update=1
+    fi
+    # Redis is typically populated, but include it for completeness.
+    if [[ ! -d "${ROOT}/redis/src" ]]; then
+      need_update=1
+    fi
+    if [[ "${need_update}" == "1" ]]; then
+      echo "[*] Initializing git submodules (gapbs/redis) ..."
+      if ! git -C "${ROOT}" submodule update --init --recursive; then
+        echo "[!] Failed to initialize git submodules. Ensure network access and repo integrity." >&2
+        exit 1
+      fi
+    fi
+    # Final sanity check for GAPBS after update.
+    if [[ ! -s "${ROOT}/gapbs/Makefile" ]] && [[ ! -d "${ROOT}/gapbs/src" ]]; then
+      echo "[!] GAPBS submodule seems missing or empty at ${ROOT}/gapbs." >&2
+      echo "    Hint: (from repo root) git submodule update --init --recursive" >&2
+      exit 1
+    fi
+  fi
+}
+
+ensure_submodules
+
 if [[ "${SKIP_RECREATE}" != "1" ]]; then
   tmpdir="$(mktemp -d /tmp/cxl-sec-dsm-sim-gapbs-sgxvm.XXXXXX)"
   sshkey="${tmpdir}/vm_sshkey"
@@ -204,6 +240,7 @@ if [[ "${SKIP_RECREATE}" != "1" ]]; then
   echo "[*] Recreating SGX VMs (BASE_IMG=${base_desc})"
   STOP_EXISTING=1 FORCE_RECREATE=1 BASE_IMG="${BASE_IMG}" \
     VM1_SSH="${VM1_SSH}" VM2_SSH="${VM2_SSH}" \
+    VM1_CPUS="${VM1_CPUS}" VM2_CPUS="${VM2_CPUS}" \
     VM_SGX_ENABLE=1 VM1_SGX_ENABLE=1 VM2_SGX_ENABLE=1 \
     VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE}" VM2_SGX_EPC_SIZE="${VM2_SGX_EPC_SIZE}" \
     SGX_EPC_PREALLOC="${SGX_EPC_PREALLOC}" \
@@ -272,8 +309,8 @@ echo "[*] Building cxl_sec_mgr in vm1 (/tmp/cxl_sec_mgr) ..."
 ssh_vm1 "cd /mnt/hostshare/cxl_sec_mgr && sudo -n make clean && sudo -n make -j2 && sudo -n cp -f cxl_sec_mgr /tmp/cxl_sec_mgr"
 
 echo "[*] Building Gramine manifests + SGX artifacts for GAPBS in vm1 ..."
-ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make -B links gapbs-native.manifest gapbs-ring.manifest gapbs-ring-secure.manifest GAPBS_KERNEL='${GAPBS_KERNEL}' CXL_RING_PATH='${RING_PATH}' CXL_RING_MAP_SIZE='${RING_MAP_SIZE}' SGX_SIZE='${SGX_SIZE}' SGX_THREADS='${SGX_THREADS}' LOG_LEVEL='${LOG_LEVEL}' USE_RUNTIME_GLIBC=1"
-ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make sgx-sign-gapbs SGX_SIZE='${SGX_SIZE}' SGX_THREADS='${SGX_THREADS}' LOG_LEVEL='${LOG_LEVEL}' USE_RUNTIME_GLIBC=1"
+ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make -B links gapbs-native.manifest gapbs-ring.manifest gapbs-ring-secure.manifest GAPBS_KERNEL='${GAPBS_KERNEL}' CXL_RING_PATH='${RING_PATH}' CXL_RING_MAP_SIZE='${RING_MAP_SIZE}' SGX_SIZE='${SGX_SIZE}' SGX_THREADS='${SGX_THREADS}' SGX_DEBUG='${SGX_DEBUG:-0}' LOG_LEVEL='${LOG_LEVEL}' USE_RUNTIME_GLIBC=1"
+ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make sgx-sign-gapbs SGX_SIZE='${SGX_SIZE}' SGX_THREADS='${SGX_THREADS}' SGX_DEBUG='${SGX_DEBUG:-0}' LOG_LEVEL='${LOG_LEVEL}' USE_RUNTIME_GLIBC=1"
 
 set +e
 token_out="$(ssh_vm1 "cd /mnt/hostshare/gramine && sudo -n make sgx-token-gapbs" 2>&1)"
@@ -353,18 +390,18 @@ wait "${pid_plain_ring_vm1}"
 wait "${pid_plain_ring_vm2}"
 
 echo "[*] Benchmark 3/5: GramineSGXVMRing publish in vm1"
-ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 gramine-sgx ./'gapbs-ring' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 gramine-sgx ./'gapbs-ring' -g '${SCALE}' -k '${DEGREE}' -n 1" \
   | tee "${sgx_ring_pub_log}"
 
 echo "[*] Benchmark 3/5: GramineSGXVMRing attach+run in vm1+vm2 (concurrent)"
 (
-  ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach gramine-sgx ./'gapbs-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach gramine-sgx ./'gapbs-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${sgx_ring_vm1_log}" 2>&1
 ) &
 pid_sgx_ring_vm1=$!
 
 (
-  ssh_vm2_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach gramine-sgx ./'gapbs-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm2_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach gramine-sgx ./'gapbs-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${sgx_ring_vm2_log}" 2>&1
 ) &
 pid_sgx_ring_vm2=$!
@@ -377,18 +414,18 @@ crypto_key_vm2_hex="$(openssl rand -hex 32)"
 crypto_key_common_hex="$(openssl rand -hex 32)"
 
 echo "[*] Benchmark 4/5: GramineSGXVMCrypto publish in vm1 (libsodium; per-VM key + common key; no mgr)"
-ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
   | tee "${sgx_crypto_pub_log}"
 
 echo "[*] Benchmark 4/5: GramineSGXVMCrypto attach+run in vm1+vm2 (concurrent)"
 (
-  ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${sgx_crypto_vm1_log}" 2>&1
 ) &
 pid_sgx_crypto_vm1=$!
 
 (
-  ssh_vm2_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX='${crypto_key_vm2_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm2_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX='${crypto_key_vm2_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${sgx_crypto_vm2_log}" 2>&1
 ) &
 pid_sgx_crypto_vm2=$!
@@ -432,18 +469,18 @@ exit 1
 sec_mgr_vm1="127.0.0.1:${SEC_MGR_PORT}"
 sec_mgr_vm2="${vm1_ip}:${SEC_MGR_PORT}"
 
-ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm1}' CXL_SEC_NODE_ID=1 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm1}' CXL_SEC_NODE_ID=1 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
   | tee "${sgx_secure_pub_log}"
 
 echo "[*] Benchmark 5/5: GramineSGXVMSecure attach+run in vm1+vm2 (concurrent)"
 (
-  ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm1}' CXL_SEC_NODE_ID=1 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm1_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm1}' CXL_SEC_NODE_ID=1 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${sgx_secure_vm1_log}" 2>&1
 ) &
 pid_sgx_secure_vm1=$!
 
 (
-  ssh_vm2_tty "cd /mnt/hostshare/gramine && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm2}' CXL_SEC_NODE_ID=2 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm2_tty "cd /mnt/hostshare/gramine && sudo -n env GLIBC_TUNABLES='glibc.pthread.rseq=0' OMP_NUM_THREADS='${OMP_THREADS}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${sec_mgr_vm2}' CXL_SEC_NODE_ID=2 gramine-sgx ./'gapbs-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${sgx_secure_vm2_log}" 2>&1
 ) &
 pid_sgx_secure_vm2=$!

@@ -18,6 +18,7 @@ set -euo pipefail
 # Tunables (env):
 #   BASE_IMG     : path to ubuntu-24.04-server-cloudimg-amd64.img (optional; if unset, host_quickstart downloads 24.04 by default)
 #   VM1_SSH/VM2_SSH: ssh forwarded ports (default: 2222/2223)
+#   VM1_CPUS/VM2_CPUS: vCPUs per VM (default: 8)
 #   REQ_N        : total requests for TCP benchmark (default: 200000)
 #   CLIENTS      : redis-benchmark concurrency (default: 4)
 #   THREADS      : thread count for both benches (default: 4)
@@ -47,6 +48,8 @@ fi
 
 VM1_SSH="${VM1_SSH:-2222}"
 VM2_SSH="${VM2_SSH:-2223}"
+VM1_CPUS="${VM1_CPUS:-8}"
+VM2_CPUS="${VM2_CPUS:-8}"
 
 REQ_N="${REQ_N:-200000}"
 CLIENTS="${CLIENTS:-4}"
@@ -157,6 +160,7 @@ base_desc="${BASE_IMG:-auto (download Ubuntu 24.04 if missing)}"
 echo "[*] Recreating VMs (BASE_IMG=${base_desc})"
 STOP_EXISTING=1 FORCE_RECREATE=1 BASE_IMG="${BASE_IMG}" \
 VM1_SSH="${VM1_SSH}" VM2_SSH="${VM2_SSH}" \
+VM1_CPUS="${VM1_CPUS}" VM2_CPUS="${VM2_CPUS}" \
 CLOUD_INIT_SSH_KEY_FILE="${sshkey}.pub" \
 bash "${ROOT}/scripts/host_quickstart.sh"
 

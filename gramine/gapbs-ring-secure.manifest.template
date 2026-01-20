@@ -52,8 +52,16 @@ fs.mounts = [
   { uri = "file:/usr",  path = "/usr" },
   { uri = "file:/etc",  path = "/etc" },
   { uri = "file:/tmp",  path = "/tmp" },
-  { uri = "file:/dev",  path = "/dev" },
   { uri = "file:/home", path = "/home" },
+
+  # Minimal device set instead of mounting the whole /dev.
+  { uri = "dev:/dev/null",       path = "/dev/null" },
+  { uri = "dev:/dev/zero",       path = "/dev/zero" },
+  { uri = "dev:/dev/random",     path = "/dev/random" },
+  { uri = "dev:/dev/urandom",    path = "/dev/urandom" },
+  { uri = "dev:/dev/tty",        path = "/dev/tty" },
+  { uri = "dev:/dev/sgx_enclave",    path = "/dev/sgx_enclave" },
+  { uri = "dev:/dev/sgx_provision",  path = "/dev/sgx_provision" },
 
   # Convenience: allow file-backed shared memory under /dev/shm.
   { uri = "dev:/dev/shm", path = "/dev/shm", type = "untrusted_shm" },
@@ -80,7 +88,7 @@ fs.mounts = [
 
 sgx.enclave_size = "{{ sgx_size | default('1024M') }}"
 sgx.max_threads = {{ sgx_threads | default(64) }}
-sgx.debug = true
+sgx.debug = {{ 'true' if (sgx_debug | default('true') | lower) in ['1','true','yes'] else 'false' }}
 
 sgx.trusted_files = [
   "file:../gapbs/{{ kernel }}-ring-secure",
@@ -102,11 +110,17 @@ sgx.allowed_files = [
   "file:/usr/",
   "file:/etc/",
   "file:/tmp/",
-  "file:/dev/",
   "file:/home/",
   "file:/sys/",
   "file:/lib/",
   "file:/lib64/",
+  "dev:/dev/null",
+  "dev:/dev/zero",
+  "dev:/dev/random",
+  "dev:/dev/urandom",
+  "dev:/dev/tty",
+  "dev:/dev/sgx_enclave",
+  "dev:/dev/sgx_provision",
   "dev:/dev/shm/",
   "dev:{{ cxl_path }}",
 ]

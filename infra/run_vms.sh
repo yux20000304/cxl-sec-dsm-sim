@@ -468,58 +468,26 @@ run_vm() {
     fi
   fi
 
-  local cmd=(
-    ${QEMU_BIN}
-    -name "${name}"
-    "${enable_kvm[@]}"
-    "${tdx_opts[@]}"
-    "${sgx_opts[@]}"
-    -machine "${machine}"
-    -display none
-    -smp "${cpus}"
-    -m "${mem}"
-    -overcommit mem-lock=off
-    ${cxl_opts}
-    -device ivshmem-plain,memdev=cxlmem-${name},id=ivshmem0
-    -drive if=virtio,file="${disk}",format=qcow2
-    -drive if=virtio,file="${seed}",format=raw
-    -netdev user,id=net0,hostfwd=tcp::${ssh_port}-:22
-    -device virtio-net-pci,netdev=net0
-    "${vmnet_opts[@]}"
-    -virtfs local,path="${HOSTSHARE}",mount_tag=hostshare,security_model=none,id=hostshare
-    -daemonize
-    -monitor unix:"${monitor}",server,nowait
-    -pidfile "${pidfile}"
-    -serial file:"${log}"
-  )
-
-  echo "[*] Launching ${name} (SSH port ${ssh_port})"
-
-  local full_cmd=()
-  if [[ -n "${cpu_node}" ]]; then
-    full_cmd+=( numactl --cpunodebind="${cpu_node}" --membind="${cpu_node}" )
-  fi
-  full_cmd+=( "${cmd[@]}" )
-
-  local out=""
-  local rc=0
-  set +e
-  out="$("${full_cmd[@]}" 2>&1)"
-  rc=$?
-  set -e
-  if [[ "${rc}" -eq 0 ]]; then
-    return 0
+  # Prefer exposing invariant TSC to guests for better timekeeping and Gramine performance.
+  # We'll first attempt with "-cpu host,+invtsc" (when KVM is used), and if QEMU rejects it,
+  # we fall back to plain "-cpu host".
+  local kvm_try=("${enable_kvm[@]}")
+  if [[ "${#kvm_try[@]}" -gt 0 ]]; then
+    for i in "${!kvm_try[@]}"; do
+      if [[ "${kvm_try[$i]}" == "-cpu" && $((i+1)) -lt ${#kvm_try[@]} && "${kvm_try[$((i+1))]}" == host ]]; then
+        kvm_try[$((i+1))]="host,+invtsc"
+        break
+      fi
+    done
   fi
 
-  if [[ "${sgx_enable}" == "1" && "${sgx_epc_prealloc}" == "auto" ]] && printf '%s' "${out}" | grep -q 'qemu_prealloc_mem: preallocating memory failed'; then
-    echo "[!] ${name}: EPC preallocation failed; retrying with SGX_EPC_PREALLOC=off." >&2
-    rm -f "${pidfile}" "${monitor}" "${log}" 2>/dev/null || true
-
-    sgx_opts=( -object "memory-backend-epc,id=epc-${name},size=${sgx_epc_size},prealloc=off" )
+  make_cmd_with_kvm() {
+    local -n __kvm_ref=$1
+    # shellcheck disable=SC2034
     cmd=(
       ${QEMU_BIN}
       -name "${name}"
-      "${enable_kvm[@]}"
+      "${__kvm_ref[@]}"
       "${tdx_opts[@]}"
       "${sgx_opts[@]}"
       -machine "${machine}"
@@ -540,6 +508,53 @@ run_vm() {
       -pidfile "${pidfile}"
       -serial file:"${log}"
     )
+  }
+
+  local cmd=()
+  make_cmd_with_kvm kvm_try
+
+  echo "[*] Launching ${name} (SSH port ${ssh_port})"
+
+  local full_cmd=()
+  if [[ -n "${cpu_node}" ]]; then
+    full_cmd+=( numactl --cpunodebind="${cpu_node}" --membind="${cpu_node}" )
+  fi
+  full_cmd+=( "${cmd[@]}" )
+
+  local out=""
+  local rc=0
+  set +e
+  out="$("${full_cmd[@]}" 2>&1)"
+  rc=$?
+  set -e
+  if [[ "${rc}" -eq 0 ]]; then
+    return 0
+  fi
+
+  # If QEMU rejected +invtsc feature, retry without it.
+  if printf '%s' "${out}" | grep -qiE 'invtsc|invalid cpu feature|feature not available'; then
+    rm -f "${pidfile}" "${monitor}" "${log}" 2>/dev/null || true
+    make_cmd_with_kvm enable_kvm
+    full_cmd=()
+    if [[ -n "${cpu_node}" ]]; then
+      full_cmd+=( numactl --cpunodebind="${cpu_node}" --membind="${cpu_node}" )
+    fi
+    full_cmd+=( "${cmd[@]}" )
+    set +e
+    out="$("${full_cmd[@]}" 2>&1)"
+    rc=$?
+    set -e
+    if [[ "${rc}" -eq 0 ]]; then
+      return 0
+    fi
+  fi
+
+  if [[ "${sgx_enable}" == "1" && "${sgx_epc_prealloc}" == "auto" ]] && printf '%s' "${out}" | grep -q 'qemu_prealloc_mem: preallocating memory failed'; then
+    echo "[!] ${name}: EPC preallocation failed; retrying with SGX_EPC_PREALLOC=off." >&2
+    rm -f "${pidfile}" "${monitor}" "${log}" 2>/dev/null || true
+
+    sgx_opts=( -object "memory-backend-epc,id=epc-${name},size=${sgx_epc_size},prealloc=off" )
+    make_cmd_with_kvm enable_kvm
 
     full_cmd=()
     if [[ -n "${cpu_node}" ]]; then

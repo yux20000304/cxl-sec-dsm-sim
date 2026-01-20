@@ -1,6 +1,7 @@
 SGX_SIGNER_KEY ?= redis-signer-key.pem
 SGX_SIZE ?= 1024M
 SGX_THREADS ?= 64
+SGX_DEBUG ?= 0
 LOG_LEVEL ?= warning
 
 # Ring device defaults (ivshmem BAR2 via sysfs).
@@ -16,7 +17,7 @@ GAPBS_KERNEL ?= bfs
 # 1 = use Gramine runtime glibc (closer to SGX mode)
 USE_RUNTIME_GLIBC ?= 0
 
-MANIFEST_COMMON_DEFS = -Dsgx_size=$(SGX_SIZE) -Dsgx_threads=$(SGX_THREADS) -Dlog_level=$(LOG_LEVEL)
+MANIFEST_COMMON_DEFS = -Dsgx_size=$(SGX_SIZE) -Dsgx_threads=$(SGX_THREADS) -Dlog_level=$(LOG_LEVEL) -Dsgx_debug=$(SGX_DEBUG)
 MANIFEST_RING_DEFS = -Dcxl_ring_path="$(CXL_RING_PATH)" -Dcxl_ring_count="$(CXL_RING_COUNT)" -Dcxl_ring_map_size="$(CXL_RING_MAP_SIZE)"
 MANIFEST_GAPBS_DEFS = -Dgapbs_kernel="$(GAPBS_KERNEL)" -Dgapbs_cxl_path="$(CXL_RING_PATH)" -Dgapbs_cxl_map_size="$(CXL_RING_MAP_SIZE)"
 
