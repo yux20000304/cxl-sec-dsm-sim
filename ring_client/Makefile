@@ -1,6 +1,6 @@
 CC ?= gcc
 CFLAGS ?= -O2 -Wall -Wextra -std=gnu11
-LDFLAGS ?=
+LDFLAGS ?= -lsodium
 
 BIN ?= cxl_ring_client cxl_ring_direct
 

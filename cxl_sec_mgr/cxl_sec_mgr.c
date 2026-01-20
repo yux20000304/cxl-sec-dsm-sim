@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -98,14 +99,53 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
             "  %s --ring <path> --listen <ip:port> [--map-size <bytes>] [--map-offset <bytes>] [--timeout-ms <ms>]\n"
+            "  %s --ring <path> --listen <ip:port> --tdx-ring [--ring-count N] [--ring-region-size <bytes>] [--ring-region-base <bytes>]\n"
             "\n"
             "Notes:\n"
             "- Auto-detects the shared-memory layout (Redis ring or GAPBS graph).\n"
+            "- With --tdx-ring, the layout is derived from ring-count/region-size/region-base (no header probing).\n"
             "- Initializes a shared-memory ACL table at offset %u in the mapping.\n"
             "- Table entries are address-range based (offsets in the mapping).\n"
             "- Clients request access via a simple TCP protocol.\n",
             prog,
+            prog,
             (unsigned)CXL_SEC_TABLE_OFF);
+}
+
+static int parse_size_u64(const char *arg, uint64_t *out) {
+    if (!arg || !out) return -1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(arg, &end, 0);
+    if (errno != 0) return -1;
+
+    unsigned long long multiplier = 1ULL;
+    if (end && *end != '\0') {
+        if (end[1] != '\0') return -1;
+        switch (*end) {
+            case 'K':
+            case 'k':
+                multiplier = 1024ULL;
+                break;
+            case 'M':
+            case 'm':
+                multiplier = 1024ULL * 1024ULL;
+                break;
+            case 'G':
+            case 'g':
+                multiplier = 1024ULL * 1024ULL * 1024ULL;
+                break;
+            case 'T':
+            case 't':
+                multiplier = 1024ULL * 1024ULL * 1024ULL * 1024ULL;
+                break;
+            default:
+                return -1;
+        }
+    }
+    if (multiplier != 0ULL && value > (ULLONG_MAX / multiplier)) return -1;
+    *out = (uint64_t)(value * multiplier);
+    return 0;
 }
 
 static int parse_hostport(const char *s, char **host_out, char **port_out) {
@@ -196,6 +236,32 @@ static uint32_t load_u32(const unsigned char *p) {
     uint32_t v = 0;
     memcpy(&v, p, sizeof(v));
     return v;
+}
+
+static int load_layout_tdx_ring(uint64_t total_size,
+                                uint32_t ring_count,
+                                uint64_t region_size,
+                                uint64_t region_base,
+                                struct layout *lo) {
+    if (!lo) return -1;
+    if (ring_count == 0 || ring_count > CXL_RING_MAX_RINGS) return -1;
+    if (ring_count > CXL_SEC_MAX_ENTRIES) return -1;
+    if (region_size == 0) return -1;
+    if ((region_base % 4096ULL) != 0 || (region_size % 4096ULL) != 0) return -1;
+    if (region_base > total_size) return -1;
+    if (ring_count > (uint32_t)((total_size - region_base) / region_size)) return -1;
+
+    memset(lo, 0, sizeof(*lo));
+    lo->region_count = ring_count;
+    lo->total_size = total_size;
+    for (uint32_t i = 0; i < ring_count; i++) {
+        uint64_t start = region_base + (uint64_t)i * region_size;
+        uint64_t end = start + region_size;
+        if (end < start || end > total_size) return -1;
+        lo->regions[i].start_off = start;
+        lo->regions[i].end_off = end;
+    }
+    return 0;
 }
 
 static int load_layout(const unsigned char *mm, uint64_t total_size, struct layout *lo) {
@@ -402,11 +468,29 @@ int main(int argc, char **argv) {
     uint64_t map_size = 0;
     uint64_t map_offset = 0;
     unsigned timeout_ms = 10000;
+    int tdx_ring = 0;
+    uint32_t tdx_ring_count = 0;
+    uint64_t tdx_region_size = 0;
+    uint64_t tdx_region_base = 0;
 
     const char *offset_env = getenv("CXL_RING_OFFSET");
     if (!offset_env || !offset_env[0]) offset_env = getenv("CXL_SHM_OFFSET");
     if (offset_env && offset_env[0]) {
         map_offset = strtoull(offset_env, NULL, 0);
+    }
+
+    const char *rc_env = getenv("CXL_RING_COUNT");
+    if (rc_env && rc_env[0]) {
+        unsigned long long v = strtoull(rc_env, NULL, 0);
+        if (v > 0 && v <= UINT32_MAX) tdx_ring_count = (uint32_t)v;
+    }
+    const char *rs_env = getenv("CXL_RING_REGION_SIZE");
+    if (rs_env && rs_env[0]) {
+        (void)parse_size_u64(rs_env, &tdx_region_size);
+    }
+    const char *rb_env = getenv("CXL_RING_REGION_BASE");
+    if (rb_env && rb_env[0]) {
+        (void)parse_size_u64(rb_env, &tdx_region_base);
     }
 
     for (int i = 1; i < argc; i++) {
@@ -421,6 +505,25 @@ int main(int argc, char **argv) {
             map_size = strtoull(argv[++i], NULL, 0);
         } else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) {
             map_offset = strtoull(argv[++i], NULL, 0);
+        } else if (!strcmp(argv[i], "--tdx-ring")) {
+            tdx_ring = 1;
+        } else if (!strcmp(argv[i], "--ring-count") && i + 1 < argc) {
+            unsigned long long v = strtoull(argv[++i], NULL, 0);
+            if (v == 0 || v > UINT32_MAX) {
+                fprintf(stderr, "[!] Invalid --ring-count\n");
+                return 2;
+            }
+            tdx_ring_count = (uint32_t)v;
+        } else if (!strcmp(argv[i], "--ring-region-size") && i + 1 < argc) {
+            if (parse_size_u64(argv[++i], &tdx_region_size) != 0) {
+                fprintf(stderr, "[!] Invalid --ring-region-size\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--ring-region-base") && i + 1 < argc) {
+            if (parse_size_u64(argv[++i], &tdx_region_base) != 0) {
+                fprintf(stderr, "[!] Invalid --ring-region-base\n");
+                return 2;
+            }
         } else if (!strcmp(argv[i], "--timeout-ms") && i + 1 < argc) {
             timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
         } else {
@@ -529,19 +632,41 @@ int main(int argc, char **argv) {
     struct layout lo;
     memset(&lo, 0, sizeof(lo));
 
-    unsigned waited = 0;
-    while (g_running) {
-        if (load_layout(mm, total_size, &lo) == 0) break;
-        if (waited >= timeout_ms) break;
-        sleep_ms(10);
-        waited += 10;
-    }
-    if (lo.region_count == 0) {
-        fprintf(stderr, "[!] timeout waiting for shared-memory layout header (magic/version)\n");
-        close(lfd);
-        munmap(mm, map_len);
-        close(fd);
-        return 1;
+    if (tdx_ring) {
+        if (tdx_ring_count == 0) tdx_ring_count = 4;
+        if (tdx_region_size == 0) tdx_region_size = 16ULL * 1024ULL * 1024ULL;
+        if (load_layout_tdx_ring(total_size, tdx_ring_count, tdx_region_size, tdx_region_base, &lo) != 0) {
+            fprintf(stderr,
+                    "[!] invalid --tdx-ring config (ring_count=%u region_size=%llu region_base=%llu map_size=%llu)\n",
+                    (unsigned)tdx_ring_count,
+                    (unsigned long long)tdx_region_size,
+                    (unsigned long long)tdx_region_base,
+                    (unsigned long long)total_size);
+            close(lfd);
+            munmap(mm, map_len);
+            close(fd);
+            return 1;
+        }
+        fprintf(stderr,
+                "[*] cxl_sec_mgr: tdx-ring layout configured (rings=%u region_size=%llu region_base=%llu)\n",
+                (unsigned)tdx_ring_count,
+                (unsigned long long)tdx_region_size,
+                (unsigned long long)tdx_region_base);
+    } else {
+        unsigned waited = 0;
+        while (g_running) {
+            if (load_layout(mm, total_size, &lo) == 0) break;
+            if (waited >= timeout_ms) break;
+            sleep_ms(10);
+            waited += 10;
+        }
+        if (lo.region_count == 0) {
+            fprintf(stderr, "[!] timeout waiting for shared-memory layout header (magic/version)\n");
+            close(lfd);
+            munmap(mm, map_len);
+            close(fd);
+            return 1;
+        }
     }
 
     CxlSecTable *t = (CxlSecTable *)(mm + CXL_SEC_TABLE_OFF);

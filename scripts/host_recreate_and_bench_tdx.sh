@@ -6,8 +6,9 @@ set -euo pipefail
 #
 # Redis:
 # 1) TDXNativeTCP:      native Redis (TCP/RESP) baseline (VM2 -> VM1 via internal NIC cxl0).
-# 2) TDXRing:           ring-enabled Redis (shared-memory ring, no RESP) (VM2 -> VM1 via ivshmem BAR2).
-# 3) TDXRingSecure:     ring-enabled Redis + ACL + software crypto (cxl_sec_mgr + libsodium).
+# 2) TDXSodiumTCP:      native Redis over libsodium-encrypted TCP (user-space tunnel) (VM2 -> VM1 via cxl0).
+# 3) TDXRing:           ring-enabled Redis (shared-memory ring, no RESP) (VM2 -> VM1 via ivshmem BAR2).
+# 4) TDXRingSecure:     ring-enabled Redis + ACL + software crypto (cxl_sec_mgr + libsodium).
 #
 # GAPBS:
 # 4) TDXGapbsNative:           native GAPBS binary (vm1 + vm2).
@@ -47,6 +48,9 @@ set -euo pipefail
 #   RING_REGION_BASE: base offset within BAR2 mmap (default: 0)
 #   MAX_INFLIGHT   : ring client inflight limit (default: 512)
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr inside vm1 (default: 19001)
+#   SODIUM_KEY_HEX : pre-shared key for libsodium tunnel (hex64, default: deterministic test key)
+#   SODIUM_PORT    : vm1 tunnel listen port on cxl0 (default: 6380)
+#   SODIUM_LOCAL_PORT: vm2 local tunnel listen port (default: 6380)
 #   TDX_BIOS       : firmware file passed to QEMU `-bios` (default auto-detected)
 #   RING_ONLY      : 1 to run a ring-only quick validation and exit (default: 0)
 #   RING_ONLY_BENCH_N : total ops for ring-only bench (default: 10000)
@@ -55,6 +59,7 @@ set -euo pipefail
 #   RING_ONLY_PIPELINE : 1 to enable pipelined ring-only bench (default: 1)
 #   RING_ONLY_PING_TIMEOUT_MS : ping timeout for ring-only (default: 5000)
 #   RING_REDIS_PORT : TCP port for ring-enabled redis-server (default: 0 to disable TCP)
+#   RING_SECURE_REGION_BASE: base offset for secure ring regions (default: 4096; keeps first page for CXLSEC table)
 #   SSH_ALLOW_FALLBACK   : 1 to try multiple users during SSH probe (default: 1)
 #   SSH_PROBE_INITIAL_DELAY : initial wait between SSH probe attempts (seconds, default: 2)
 #   SSH_PROBE_MAX_DELAY  : max wait between SSH probe attempts (seconds, default: 10)
@@ -140,6 +145,10 @@ ULIMIT_NOFILE="${ULIMIT_NOFILE:-65535}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
 SEC_MGR_TIMEOUT_MS="${SEC_MGR_TIMEOUT_MS:-600000}"
 ENABLE_SECURE="${ENABLE_SECURE:-0}"
+SODIUM_KEY_HEX="${SODIUM_KEY_HEX:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
+SODIUM_PORT="${SODIUM_PORT:-6380}"
+SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
+RING_SECURE_REGION_BASE="${RING_SECURE_REGION_BASE:-4096}"
 
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
 SCALE="${SCALE:-22}"
@@ -901,7 +910,13 @@ ssh_vm1 "sudo -n bash -lc 'set -euo pipefail; \
 '"
 
 echo "[*] Building ring client in vm2 (/tmp/cxl_ring_direct) ..."
-ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c"
+ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c -lsodium"
+
+if [[ "${RING_ONLY}" != "1" ]]; then
+  echo "[*] Building libsodium tunnel in guests (/tmp/cxl_sodium_tunnel) ..."
+  ssh_vm1 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
+  ssh_vm2 "make -C /mnt/hostshare/sodium_tunnel BIN=/tmp/cxl_sodium_tunnel"
+fi
 
 echo "[*] Re-checking SSH connectivity after builds ..."
 wait_ssh "vm1" "${VM1_SSH}"
@@ -1047,6 +1062,7 @@ bind_ivshmem_uio() {
 
 ts="$(date +%Y%m%d_%H%M%S)"
 native_log="${RESULTS_DIR}/tdx_native_tcp_${ts}.log"
+sodium_log="${RESULTS_DIR}/tdx_sodium_tcp_${ts}.log"
 ring_log="${RESULTS_DIR}/tdx_ring_${ts}.log"
 ring_csv="${RESULTS_DIR}/tdx_ring_${ts}.csv"
 ring_secure_log="${RESULTS_DIR}/tdx_ring_secure_${ts}.log"
@@ -1141,7 +1157,7 @@ if [[ "${RING_ONLY}" == "1" ]]; then
   exit 0
 fi
 
-echo "[*] Benchmark 1/3: native Redis (TCP/RESP) inside TDX guests"
+echo "[*] Benchmark 1/8: native Redis (TCP/RESP) inside TDX guests"
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_native_tdx >/dev/null 2>&1 || true"
@@ -1151,10 +1167,31 @@ ssh_vm1 "for i in \$(seq 1 200); do redis-cli -p 6379 ping >/dev/null 2>&1 && ex
 ssh_vm2 "for i in \$(seq 1 200); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${native_log}"
 
+echo "[*] Benchmark 2/8: native Redis over libsodium-encrypted TCP (tunnel)"
+ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
+ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
+
+ssh_vm1 "tmux new-session -d -s sodium_server \"/tmp/cxl_sodium_tunnel --mode server --listen 0.0.0.0:${SODIUM_PORT} --backend 127.0.0.1:6379 --key ${SODIUM_KEY_HEX} >/tmp/sodium_server_${ts}.log 2>&1\""
+ssh_vm2 "tmux new-session -d -s sodium_client \"/tmp/cxl_sodium_tunnel --mode client --listen 127.0.0.1:${SODIUM_LOCAL_PORT} --connect ${VMNET_VM1_IP}:${SODIUM_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_client_${ts}.log 2>&1\""
+
+if ! ssh_vm2 "for i in \$(seq 1 600); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
+  echo "[!] libsodium tunnel not ready. Dumping diagnostics..." >&2
+  ssh_vm2 "tail -n 200 /tmp/sodium_client_${ts}.log 2>/dev/null || true" >&2
+  ssh_vm1 "tail -n 200 /tmp/sodium_server_${ts}.log 2>/dev/null || true" >&2
+  ssh_vm1 "ss -lntp 2>/dev/null | grep -E ':${SODIUM_PORT}\\b' || true" >&2
+  ssh_vm2 "ss -lntp 2>/dev/null | grep -E ':${SODIUM_LOCAL_PORT}\\b' || true" >&2
+  exit 1
+fi
+
+ssh_vm2 "redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${sodium_log}"
+
+ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
+ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
+
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_native_tdx >/dev/null 2>&1 || true"
 
-echo "[*] Benchmark 2/3: ring Redis (shared-memory) inside TDX guests"
+echo "[*] Benchmark 3/8: ring Redis (shared-memory) inside TDX guests"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
 ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} ./redis-server --port ${RING_REDIS_PORT} ${ring_redis_sock_args} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
@@ -1200,13 +1237,37 @@ ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 
 RUN_SECURE=0
 if [[ "${ENABLE_SECURE}" == "1" ]]; then
-  echo "[*] Skipping secure ring Redis: the new TDX SHM layout does not support --secure/cxl_sec_mgr yet."
+  echo "[*] Benchmark 4/8: secure ring Redis (ACL + software crypto via cxl_sec_mgr)"
+
+  echo "[*] Secure ring: clearing first page for CXLSEC table ..."
+  ssh_vm1 "sudo -n env CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} python3 -c 'import mmap, os; off=int(os.environ.get(\"CXL_RING_OFFSET\", \"0\"), 0); fd=os.open(\"${RING_PATH_VM1}\", os.O_RDWR); m=mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off); m[:] = b\"\\0\"*4096; m.flush(); m.close(); os.close(fd)'"
+
+  ssh_vm1 "tmux kill-session -t cxl_sec_mgr_ring_tdx >/dev/null 2>&1 || true"
+  ssh_vm1 "tmux kill-session -t redis_ring_tdx_secure >/dev/null 2>&1 || true"
+  ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
+
+  ssh_vm1 "tmux new-session -d -s cxl_sec_mgr_ring_tdx \"sudo -n /tmp/cxl_sec_mgr --ring ${RING_PATH_VM1} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} --map-offset ${RING_MAP_OFFSET_VM1} --tdx-ring --ring-count ${RING_COUNT} --ring-region-size ${RING_REGION_SIZE} --ring-region-base ${RING_SECURE_REGION_BASE} >/tmp/cxl_sec_mgr_ring_tdx_${ts}.log 2>&1\""
+  ssh_vm1 "tmux new-session -d -s redis_ring_tdx_secure \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 ./redis-server --port ${RING_REDIS_PORT} ${ring_redis_sock_args} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx_secure.log 2>&1\""
+
+  ssh_vm2 "for i in \$(seq 1 200); do sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --sec-timeout-ms ${SEC_MGR_TIMEOUT_MS} --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms 5000 >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'secure ring not ready' >&2; exit 1"
+
+  ring_secure_label="tdx_ring_secure_${ts}"
+  ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
+  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --sec-timeout-ms ${SEC_MGR_TIMEOUT_MS} --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
+  ssh_vm2 "cat /tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
+
+  ssh_vm1 "tmux kill-session -t redis_ring_tdx_secure >/dev/null 2>&1 || true"
+  ssh_vm1 "tmux kill-session -t cxl_sec_mgr_ring_tdx >/dev/null 2>&1 || true"
+  ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
+  RUN_SECURE=1
 else
   echo "[*] Skipping secure ring Redis (ENABLE_SECURE=0)"
 fi
 
 native_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
 native_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${native_log}" || true)"
+sodium_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
+sodium_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
 ring_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_csv}" || true)"
 ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
 ring_secure_set=""
@@ -1220,6 +1281,8 @@ fi
   echo "label,op,throughput_rps"
   echo "TDXNativeTCP,SET,${native_set}"
   echo "TDXNativeTCP,GET,${native_get}"
+  echo "TDXSodiumTCP,SET,${sodium_set}"
+  echo "TDXSodiumTCP,GET,${sodium_get}"
   echo "TDXRing,SET,${ring_set}"
   echo "TDXRing,GET,${ring_get}"
   if [[ "${RUN_SECURE}" == "1" ]]; then
@@ -1228,19 +1291,19 @@ fi
   fi
 } > "${compare_csv}"
 
-echo "[*] Benchmark 4/7: GAPBS native in vm1"
+echo "[*] Benchmark 5/8: GAPBS native in vm1"
 ssh_vm1 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' ./'${GAPBS_KERNEL}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
   | tee "${gapbs_native_vm1_log}"
 
-echo "[*] Benchmark 4/7: GAPBS native in vm2"
+echo "[*] Benchmark 5/8: GAPBS native in vm2"
 ssh_vm2 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' ./'${GAPBS_KERNEL}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
   | tee "${gapbs_native_vm2_log}"
 
-echo "[*] Benchmark 5/7: GAPBS multihost ring publish in vm1"
+echo "[*] Benchmark 6/8: GAPBS multihost ring publish in vm1"
 ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 ./'${GAPBS_KERNEL}-ring' -g '${SCALE}' -k '${DEGREE}' -n 1" \
   | tee "${gapbs_ring_pub_log}"
 
-echo "[*] Benchmark 5/7: GAPBS multihost ring attach+run in vm1+vm2 (concurrent)"
+echo "[*] Benchmark 6/8: GAPBS multihost ring attach+run in vm1+vm2 (concurrent)"
 (
   ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach ./'${GAPBS_KERNEL}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${gapbs_ring_vm1_log}" 2>&1
@@ -1261,11 +1324,11 @@ crypto_key_vm1_hex="$(openssl rand -hex 32)"
 crypto_key_vm2_hex="$(openssl rand -hex 32)"
 crypto_key_common_hex="$(openssl rand -hex 32)"
 
-echo "[*] Benchmark 6/7: GAPBS multihost crypto publish in vm1 (libsodium; per-VM key + common key; no mgr)"
+echo "[*] Benchmark 7/8: GAPBS multihost crypto publish in vm1 (libsodium; per-VM key + common key; no mgr)"
 ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
   | tee "${gapbs_crypto_pub_log}"
 
-echo "[*] Benchmark 6/7: GAPBS multihost crypto attach+run in vm1+vm2 (concurrent)"
+echo "[*] Benchmark 7/8: GAPBS multihost crypto attach+run in vm1+vm2 (concurrent)"
 (
   ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${gapbs_crypto_vm1_log}" 2>&1
@@ -1281,7 +1344,7 @@ pid_gapbs_crypto_vm2=$!
 wait "${pid_gapbs_crypto_vm1}"
 wait "${pid_gapbs_crypto_vm2}"
 
-echo "[*] Benchmark 7/7: GAPBS multihost secure publish in vm1 (ACL/key table via cxl_sec_mgr)"
+echo "[*] Benchmark 8/8: GAPBS multihost secure publish in vm1 (ACL/key table via cxl_sec_mgr)"
 # Ensure the security manager doesn't latch onto an older valid header (resource2 may reject write(2); use mmap).
 ssh_vm1 "sudo -n env CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} python3 -c 'import mmap, os; off=int(os.environ.get(\"CXL_RING_OFFSET\", \"0\"), 0); fd=os.open(\"${RING_PATH_VM1}\", os.O_RDWR); m=mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off); m[:] = b\"\\0\"*4096; m.flush(); m.close(); os.close(fd)'"
 
@@ -1317,7 +1380,7 @@ exit 1
 ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
   | tee "${gapbs_secure_pub_log}"
 
-echo "[*] Benchmark 7/7: GAPBS multihost secure attach+run in vm1+vm2 (concurrent)"
+echo "[*] Benchmark 8/8: GAPBS multihost secure attach+run in vm1+vm2 (concurrent)"
 (
   ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     >"${gapbs_secure_vm1_log}" 2>&1
@@ -1477,6 +1540,7 @@ gapbs_secure_avg_teps="$(avg2_int "${gapbs_secure_vm1_teps}" "${gapbs_secure_vm2
 
 echo "[+] Done."
 echo "    ${native_log}"
+echo "    ${sodium_log}"
 echo "    ${ring_log}"
 echo "    ${ring_csv}"
 echo "    ${ring_secure_log}"
