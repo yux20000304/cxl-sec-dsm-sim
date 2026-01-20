@@ -1,120 +1,81 @@
 #define _GNU_SOURCE
-#include <arpa/inet.h>
-#include <endian.h>
+
+#include "../tdx_shm/tdx_shm_transport.h"
+
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
-#include <netdb.h>
-#include <netinet/tcp.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sodium.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 
-/* Binary ring client matching redis/src/cxl_ring.c (version=2, slot_size=4096).
- * Request: u8 op (1=GET,2=SET), u8 key_len, u16 val_len (LE), key, val
- * Response: u8 status (0=OK,1=MISS,2=ERR), u16 val_len (LE), val (for GET hit)
- * Ring slot layout keeps 16-byte header (cid,u16 type,u16 flags,u32 len,u32 resv) + payload.
- * Latency/cost collection is optional (--latency/--cost) to avoid overhead in fast paths.
+/* TDX shared-memory ring client matching Redis shared-memory backend (GET/SET binary protocol).
+ *
+ * Transport: per-ring TDX SHM region (double-queue layout):
+ * - server->client: q12
+ * - client->server: q21
+ *
+ * Each request/response message is stored in a 4KiB slot as:
+ *   u16 msg_len (bytes after this length field)
+ *   16B header: cid,u16 type,u16 flags,u32 len,u32 reserved
+ *   payload (len bytes)
+ *
+ * Request payload:
+ *   u8 op (1=GET,2=SET), u8 key_len, u16 val_len (LE), key, val
+ * Response payload:
+ *   u8 status (0=OK,1=MISS,2=ERR), u16 val_len (LE), u8 reserved, val
+ *
+ * Notes:
+ * - Keep RESP parsing out of the hot path.
+ * - Slot payload budget is limited by the TDX SHM framing:
+ *     max_payload = (TDX_SHM_SLOT_SIZE - 2) - 16 = 4078 bytes
  */
 
-#define MAGIC "CXLSHM1\0"
-#define VERSION 2
 #define MSG_DATA 1
 #define MSG_CLOSE 2
-#define SLOT_SIZE 4096
 
 #define OP_GET 1
 #define OP_SET 2
+
 #define STATUS_OK 0
 #define STATUS_MISS 1
 #define STATUS_ERR 2
 
-#define CXL_SEC_TABLE_OFF 512
-#define CXL_SEC_MAGIC "CXLSEC1\0"
-#define CXL_SEC_VERSION 1
-#define CXL_SEC_MAX_ENTRIES 16
-#define CXL_SEC_MAX_PRINCIPALS 16
+#define MAX_RINGS 8
+#define RING_SLOT_HDR_SIZE 16U
+#define RING_MAX_PAYLOAD ((uint32_t)TDX_SHM_MSG_MAX - RING_SLOT_HDR_SIZE)
 
-#define SEC_PROTO_MAGIC 0x43534543u /* 'CSEC' */
-#define SEC_PROTO_VERSION 1
-#define SEC_REQ_ACCESS 1
-
-#define SEC_STATUS_OK 0
-#define SEC_STATUS_BAD_REQ 1
-#define SEC_STATUS_NOT_READY 2
-#define SEC_STATUS_NO_REGION 3
-#define SEC_STATUS_TABLE_FULL 4
-
-typedef struct {
-    uint64_t start_off;
-    uint64_t end_off;
-    unsigned char key[crypto_stream_chacha20_ietf_KEYBYTES];
-    uint32_t principal_count;
-    uint32_t reserved;
-    uint64_t principals[CXL_SEC_MAX_PRINCIPALS];
-} CxlSecEntry;
-
-typedef struct {
-    char magic[8];
-    uint32_t version;
-    uint32_t entry_count;
-    CxlSecEntry entries[CXL_SEC_MAX_ENTRIES];
-} CxlSecTable;
-
-struct sec_req {
-    uint32_t magic_be;
-    uint16_t version_be;
-    uint16_t type_be;
-    uint64_t principal_be;
-    uint64_t offset_be;
-    uint32_t length_be;
-    uint32_t reserved_be;
-};
-
-struct sec_resp {
-    uint32_t magic_be;
-    uint16_t version_be;
-    uint16_t status_be;
-    uint32_t reserved_be;
-};
-
-/* Only grab a lock when >1 thread shares the same ring (protect head/tail). */
 static int use_lock = 0;
 static pthread_mutex_t req_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t resp_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Optional: inject artificial latency on each shared-memory ring access. */
 static uint64_t shm_delay_ns = 0;
 static uint64_t shm_pause_iters_per_ns_x1024 = 0;
 
-static int sec_enabled = 0;
-static int sec_fd = -1;
-static uint32_t sec_node_id = 0;
-static uint64_t sec_principal = 0;
-static pthread_mutex_t sec_mgr_lock = PTHREAD_MUTEX_INITIALIZER;
-
 static volatile int running = 1;
-static void handle_sig(int sig) { (void)sig; running = 0; }
+static void handle_sig(int sig) {
+    (void)sig;
+    running = 0;
+}
 
 struct ring_info {
-    size_t req_off, req_sz;
-    size_t resp_off, resp_sz;
-    uint32_t slots;
+    struct tdx_shm_queue_view req;  /* q21 (client -> server) */
+    struct tdx_shm_queue_view resp; /* q12 (server -> client) */
+    uint32_t slots;                 /* capacity - 1 (informational) */
     uint32_t ring_idx;
 };
 
 struct layout {
     uint32_t ring_count;
-    struct ring_info rings[8];
+    struct ring_info rings[MAX_RINGS];
 };
 
 struct latency_stats {
@@ -161,10 +122,22 @@ struct agg_latency {
     int count;
 };
 
+struct ring_slot_hdr {
+    uint32_t cid;
+    uint16_t type;
+    uint16_t flags;
+    uint32_t len;
+    uint32_t reserved;
+};
+
 static inline uint64_t nowns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static inline size_t align_up(size_t value, size_t align) {
+    return (value + align - 1U) & ~(align - 1U);
 }
 
 static void shm_delay_calibrate(void) {
@@ -191,372 +164,176 @@ static inline void shm_delay(void) {
     }
 }
 
-static void sleep_ms(unsigned ms) {
-    struct timespec ts;
-    ts.tv_sec = ms / 1000U;
-    ts.tv_nsec = (long)(ms % 1000U) * 1000000L;
-    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+static int parse_size(const char *arg, size_t *out) {
+    if (!arg || !out) return -1;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(arg, &end, 0);
+    if (errno != 0) return -1;
+
+    unsigned long long multiplier = 1ULL;
+    if (end && *end != '\0') {
+        if (end[1] != '\0') return -1;
+        switch (*end) {
+            case 'K':
+            case 'k':
+                multiplier = 1024ULL;
+                break;
+            case 'M':
+            case 'm':
+                multiplier = 1024ULL * 1024ULL;
+                break;
+            case 'G':
+            case 'g':
+                multiplier = 1024ULL * 1024ULL * 1024ULL;
+                break;
+            default:
+                return -1;
+        }
     }
+    if (multiplier != 0ULL && value > (ULLONG_MAX / multiplier)) return -1;
+    unsigned long long bytes = value * multiplier;
+    if (bytes > (unsigned long long)SIZE_MAX) return -1;
+    *out = (size_t)bytes;
+    return 0;
 }
 
-static int parse_hostport(const char *s, char **host_out, char **port_out) {
-    const char *colon = strrchr(s, ':');
-    if (!colon || colon == s || *(colon + 1) == '\0') return -1;
-    size_t host_len = (size_t)(colon - s);
-    char *host = (char *)calloc(host_len + 1, 1);
-    char *port = strdup(colon + 1);
-    if (!host || !port) {
-        free(host);
-        free(port);
+static uint32_t env_u32(const char *key, uint32_t def) {
+    const char *v = getenv(key);
+    if (!v || !v[0]) return def;
+    errno = 0;
+    unsigned long long x = strtoull(v, NULL, 0);
+    if (errno != 0) return def;
+    if (x > 0xffffffffULL) return def;
+    return (uint32_t)x;
+}
+
+static size_t env_size(const char *key, size_t def) {
+    const char *v = getenv(key);
+    if (!v || !v[0]) return def;
+    size_t out = 0;
+    if (parse_size(v, &out) != 0) return def;
+    return out;
+}
+
+static int tdx_region_attach(void *base, size_t size, struct tdx_shm_region *out) {
+    if (!base || !out) return -1;
+
+    struct tdx_shm_header *hdr = (struct tdx_shm_header *)base;
+    if (hdr->magic != TDX_SHM_MAGIC) return -1;
+    if (hdr->version != TDX_SHM_VERSION) return -1;
+    if (hdr->total_size == 0 || hdr->total_size > (uint64_t)size) return -1;
+
+    if (hdr->q12.slot_size != TDX_SHM_SLOT_SIZE || hdr->q21.slot_size != TDX_SHM_SLOT_SIZE) return -1;
+    if (hdr->q12.capacity != TDX_SHM_QUEUE_CAPACITY || hdr->q21.capacity != TDX_SHM_QUEUE_CAPACITY) return -1;
+
+    size_t queue_bytes = (size_t)TDX_SHM_QUEUE_CAPACITY * (size_t)TDX_SHM_SLOT_SIZE;
+    if ((size_t)hdr->q12.data_offset + queue_bytes > size) return -1;
+    if ((size_t)hdr->q21.data_offset + queue_bytes > size) return -1;
+
+    out->hdr = hdr;
+    out->q12.q = &hdr->q12;
+    out->q12.data = (uint8_t *)base + hdr->q12.data_offset;
+    out->q21.q = &hdr->q21;
+    out->q21.data = (uint8_t *)base + hdr->q21.data_offset;
+    return 0;
+}
+
+static int load_layout(unsigned char *mm, size_t map_size, struct layout *lo) {
+    if (!mm || !lo) return -1;
+
+    uint32_t ring_count = env_u32("CXL_RING_COUNT", 1);
+    if (ring_count == 0 || ring_count > MAX_RINGS) return -1;
+
+    size_t region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
+    size_t region_base = env_size("CXL_RING_REGION_BASE", 0);
+
+    if ((region_base % 4096) != 0 || (region_size % 4096) != 0) return -1;
+    if (region_size < align_up(sizeof(struct tdx_shm_header), 64U) +
+                          2U * (size_t)TDX_SHM_QUEUE_CAPACITY * (size_t)TDX_SHM_SLOT_SIZE) {
         return -1;
     }
-    memcpy(host, s, host_len);
-    host[host_len] = '\0';
-    *host_out = host;
-    *port_out = port;
-    return 0;
-}
+    if (region_base > map_size) return -1;
+    if ((size_t)ring_count > (map_size - region_base) / region_size) return -1;
 
-static int socket_connect(const char *host, const char *port) {
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    struct addrinfo *res = NULL;
-    int rc = getaddrinfo(host, port, &hints, &res);
-    if (rc != 0) {
-        fprintf(stderr, "[!] getaddrinfo(connect %s:%s): %s\n", host, port, gai_strerror(rc));
-        return -1;
-    }
-
-    int fd = -1;
-    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
-        close(fd);
-        fd = -1;
-    }
-
-    freeaddrinfo(res);
-    return fd;
-}
-
-static ssize_t read_full(int fd, void *buf, size_t n) {
-    size_t off = 0;
-    while (off < n) {
-        ssize_t r = read(fd, (unsigned char *)buf + off, n - off);
-        if (r == 0) return (ssize_t)off;
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        off += (size_t)r;
-    }
-    return (ssize_t)off;
-}
-
-static int write_full(int fd, const void *buf, size_t n) {
-    size_t off = 0;
-    while (off < n) {
-        ssize_t w = write(fd, (const unsigned char *)buf + off, n - off);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        off += (size_t)w;
-    }
-    return 0;
-}
-
-static CxlSecTable *sec_table(unsigned char *mm) {
-    return (CxlSecTable *)(mm + CXL_SEC_TABLE_OFF);
-}
-
-static const CxlSecEntry *sec_find_entry(unsigned char *mm, uint64_t off, uint64_t len) {
-    if (!mm || len == 0) return NULL;
-    uint64_t end = off + len;
-    if (end < off) return NULL;
-    CxlSecTable *t = sec_table(mm);
-    if (memcmp(t->magic, CXL_SEC_MAGIC, 8) != 0 || t->version != CXL_SEC_VERSION) return NULL;
-    uint32_t n = t->entry_count;
-    if (n > CXL_SEC_MAX_ENTRIES) n = CXL_SEC_MAX_ENTRIES;
-    for (uint32_t i = 0; i < n; i++) {
-        const CxlSecEntry *e = &t->entries[i];
-        if (off >= e->start_off && end <= e->end_off) return e;
-    }
-    return NULL;
-}
-
-static int sec_entry_has_principal(const CxlSecEntry *e, uint64_t principal) {
-    if (!e) return 0;
-    uint32_t n = e->principal_count;
-    if (n > CXL_SEC_MAX_PRINCIPALS) n = CXL_SEC_MAX_PRINCIPALS;
-    for (uint32_t i = 0; i < n; i++) {
-        if (e->principals[i] == principal) return 1;
-    }
-    return 0;
-}
-
-static int sec_connect_mgr(const char *addr) {
-    char *host = NULL, *port = NULL;
-    if (parse_hostport(addr, &host, &port) != 0) return -1;
-    int fd = socket_connect(host, port);
-    free(host);
-    free(port);
-    if (fd < 0) return -1;
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    return fd;
-}
-
-static int sec_wait_table_ready(unsigned char *mm, unsigned timeout_ms) {
-    unsigned waited = 0;
-    while (waited < timeout_ms) {
-        CxlSecTable *t = sec_table(mm);
-        if (memcmp(t->magic, CXL_SEC_MAGIC, 8) == 0 && t->version == CXL_SEC_VERSION) return 0;
-        sleep_ms(10);
-        waited += 10;
-    }
-    return -1;
-}
-
-static int sec_request_access(uint64_t off, uint32_t len) {
-    if (sec_fd < 0) return -1;
-    struct sec_req req;
-    memset(&req, 0, sizeof(req));
-    req.magic_be = htonl(SEC_PROTO_MAGIC);
-    req.version_be = htons(SEC_PROTO_VERSION);
-    req.type_be = htons(SEC_REQ_ACCESS);
-    req.principal_be = htobe64(sec_principal);
-    req.offset_be = htobe64(off);
-    req.length_be = htonl(len);
-
-    pthread_mutex_lock(&sec_mgr_lock);
-    int ok = 0;
-    if (write_full(sec_fd, &req, sizeof(req)) != 0) ok = -1;
-    struct sec_resp resp;
-    if (ok == 0) {
-        ssize_t r = read_full(sec_fd, &resp, sizeof(resp));
-        if (r != (ssize_t)sizeof(resp)) ok = -1;
-        else {
-            uint32_t magic = ntohl(resp.magic_be);
-            uint16_t ver = ntohs(resp.version_be);
-            uint16_t status = ntohs(resp.status_be);
-            if (magic != SEC_PROTO_MAGIC || ver != SEC_PROTO_VERSION || status != SEC_STATUS_OK) ok = -1;
-        }
-    }
-    pthread_mutex_unlock(&sec_mgr_lock);
-    return ok;
-}
-
-static int sec_ensure_access(unsigned char *mm, uint64_t off, uint64_t len) {
-    if (!sec_enabled) return 0;
-    for (int tries = 0; tries < 3; tries++) {
-        const CxlSecEntry *e = sec_find_entry(mm, off, len);
-        if (!e) return -1;
-        if (sec_entry_has_principal(e, sec_principal)) return 0;
-        if (sec_request_access(off, (uint32_t)(len > 0xffffffffu ? 0xffffffffu : len)) != 0) return -1;
-        sleep_ms(1);
-    }
-    return -1;
-}
-
-static void sec_crypt(unsigned char *buf, size_t len, uint8_t direction, uint8_t ring_idx, uint64_t seq,
-                      const unsigned char key[crypto_stream_chacha20_ietf_KEYBYTES]) {
-    unsigned char nonce[crypto_stream_chacha20_ietf_NONCEBYTES];
-    memset(nonce, 0, sizeof(nonce));
-    nonce[0] = direction;
-    nonce[1] = ring_idx;
-    memcpy(nonce + 4, &seq, sizeof(seq));
-    crypto_stream_chacha20_ietf_xor(buf, buf, (unsigned long long)len, nonce, key);
-}
-
-static void tsq_init(struct ts_queue *q, int cap) {
-    q->buf = (uint64_t *)calloc(cap, sizeof(uint64_t));
-    q->cap = cap;
-    q->head = 0;
-    q->tail = 0;
-}
-
-static void tsq_free(struct ts_queue *q) {
-    free(q->buf);
-    q->buf = NULL;
-    q->cap = q->head = q->tail = 0;
-}
-
-static int tsq_push(struct ts_queue *q, uint64_t v) {
-    if (!q->buf || q->cap == 0) return 0;
-    int next = (q->head + 1) % q->cap;
-    if (next == q->tail) return -1; /* full */
-    q->buf[q->head] = v;
-    q->head = next;
-    return 0;
-}
-
-static int tsq_pop(struct ts_queue *q, uint64_t *out) {
-    if (!q->buf || q->head == q->tail) return -1;
-    *out = q->buf[q->tail];
-    q->tail = (q->tail + 1) % q->cap;
-    return 0;
-}
-
-static void lat_init(struct latency_stats *ls, int cap) {
-    ls->samples = (double *)calloc(cap, sizeof(double));
-    ls->cap = cap;
-    ls->count = 0;
-    ls->sum = 0.0;
-}
-
-static void lat_record(struct latency_stats *ls, double us) {
-    if (!ls->samples || ls->count >= ls->cap) return;
-    ls->samples[ls->count++] = us;
-    ls->sum += us;
-}
-
-static int cmp_double(const void *a, const void *b) {
-    double da = *(const double *)a;
-    double db = *(const double *)b;
-    return (da > db) - (da < db);
-}
-
-static double percentile(double *arr, int n, double p) {
-    if (n == 0) return 0.0;
-    double idx = p * (n - 1);
-    int i = (int)idx;
-    if (i < 0) i = 0;
-    if (i >= n) i = n - 1;
-    return arr[i];
-}
-
-static void compute_agg_latency(struct latency_stats *ls, struct agg_latency *out) {
-    memset(out, 0, sizeof(*out));
-    if (!ls || ls->count == 0 || !ls->samples) return;
-    qsort(ls->samples, ls->count, sizeof(double), cmp_double);
-    out->count = ls->count;
-    out->avg = ls->sum / ls->count;
-    out->p50 = percentile(ls->samples, ls->count, 0.50);
-    out->p75 = percentile(ls->samples, ls->count, 0.75);
-    out->p90 = percentile(ls->samples, ls->count, 0.90);
-    out->p99 = percentile(ls->samples, ls->count, 0.99);
-    out->p999 = percentile(ls->samples, ls->count, 0.999);
-    out->p9999 = percentile(ls->samples, ls->count, 0.9999);
-}
-
-static void stage_init(struct stage_ctx *s, int collect_latency, int collect_cost, int cap_hint) {
-    memset(s, 0, sizeof(*s));
-    s->collect_latency = collect_latency;
-    s->collect_cost = collect_cost;
-    if (collect_latency) {
-        int cap = cap_hint;
-        if (cap < 1024) cap = 1024;
-        tsq_init(&s->q, cap + 1); /* +1 for ring buffer sentinel */
-        lat_init(&s->ls, cap);
-    }
-}
-
-static void stage_free(struct stage_ctx *s) {
-    tsq_free(&s->q);
-    /* caller frees latency samples after aggregation */
-}
-
-static int load_layout(unsigned char *mm, struct layout *lo) {
-    const char *magic = (const char *)mm;
-    if (memcmp(magic, MAGIC, 8) != 0) return -1;
-    uint32_t ver = 0;
-    memcpy(&ver, mm + 8, 4);
-    if (ver != VERSION) return -1;
-    uint32_t ring_count = 0;
-    memcpy(&ring_count, mm + 12, 4);
-    if (ring_count == 0 || ring_count > 8) return -1;
+    memset(lo, 0, sizeof(*lo));
     lo->ring_count = ring_count;
     for (uint32_t i = 0; i < ring_count; i++) {
-        uint64_t req_off = 0, req_sz = 0, resp_off = 0, resp_sz = 0;
-        memcpy(&req_off, mm + 24 + i * 32, 8);
-        memcpy(&req_sz, mm + 32 + i * 32, 8);
-        memcpy(&resp_off, mm + 40 + i * 32, 8);
-        memcpy(&resp_sz, mm + 48 + i * 32, 8);
-        lo->rings[i].req_off = (size_t)req_off;
-        lo->rings[i].req_sz = (size_t)req_sz;
-        lo->rings[i].resp_off = (size_t)resp_off;
-        lo->rings[i].resp_sz = (size_t)resp_sz;
-        lo->rings[i].slots = (req_sz > 16) ? (req_sz - 16) / SLOT_SIZE : 1;
+        size_t off = region_base + (size_t)i * region_size;
+        struct tdx_shm_region region;
+        if (tdx_region_attach(mm + off, region_size, &region) != 0) return -1;
+
+        lo->rings[i].req = region.q21;
+        lo->rings[i].resp = region.q12;
         lo->rings[i].ring_idx = i;
+        lo->rings[i].slots = TDX_SHM_QUEUE_CAPACITY > 0 ? (TDX_SHM_QUEUE_CAPACITY - 1U) : 0U;
     }
     return 0;
 }
 
-static int layout_fits(const struct layout *lo, size_t map_size) {
-    if (!lo || lo->ring_count == 0) return -1;
-    for (uint32_t i = 0; i < lo->ring_count; i++) {
-        size_t req_off = lo->rings[i].req_off;
-        size_t req_sz = lo->rings[i].req_sz;
-        size_t resp_off = lo->rings[i].resp_off;
-        size_t resp_sz = lo->rings[i].resp_sz;
-        if (req_off == 0 || resp_off == 0) return -1;
-        if ((req_off % 4096) || (resp_off % 4096)) return -1;
-        if ((req_sz % 4096) || (resp_sz % 4096)) return -1;
-        if (req_off + req_sz > map_size) return -1;
-        if (resp_off + resp_sz > map_size) return -1;
-        if (resp_off < req_off + req_sz) return -1;
-    }
-    return 0;
+static uint32_t ring_next(uint32_t v, uint32_t cap) {
+    return (v + 1U) % cap;
 }
 
 static int ring_push(unsigned char *mm, const struct ring_info *ri, uint32_t cid, uint16_t type, const unsigned char *payload, uint32_t len) {
+    (void)mm;
     shm_delay();
-    uint64_t head = 0, tail = 0;
-    memcpy(&head, mm + ri->req_off, 8);
-    memcpy(&tail, mm + ri->req_off + 8, 8);
-    if (head - tail >= ri->slots) return 0; /* full */
-    if (len > SLOT_SIZE - 16) return -1;
-    uint64_t idx = head % ri->slots;
-    size_t slot_off = ri->req_off + 16 + idx * SLOT_SIZE;
-    uint32_t flags = 0, reserved = 0;
-    memcpy(mm + slot_off, &cid, 4);
-    memcpy(mm + slot_off + 4, &type, 2);
-    memcpy(mm + slot_off + 6, &flags, 2);
-    memcpy(mm + slot_off + 8, &len, 4);
-    memcpy(mm + slot_off + 12, &reserved, 4);
-    memcpy(mm + slot_off + 16, payload, len);
-    if (SLOT_SIZE > 16 + len) memset(mm + slot_off + 16 + len, 0, SLOT_SIZE - 16 - len);
-    if (sec_enabled) {
-        uint64_t payload_off = (uint64_t)(slot_off + 16);
-        size_t crypt_len = SLOT_SIZE - 16;
-        if (sec_ensure_access(mm, payload_off, crypt_len) != 0) return -1;
-        const CxlSecEntry *e = sec_find_entry(mm, payload_off, crypt_len);
-        if (!e || !sec_entry_has_principal(e, sec_principal)) return -1;
-        sec_crypt(mm + payload_off, crypt_len, 1 /* REQ */, (uint8_t)ri->ring_idx, head, e->key);
-    }
-    head++;
-    memcpy(mm + ri->req_off, &head, 8);
+
+    if (!ri || !ri->req.q || !ri->req.data || !payload) return -1;
+    if (len > RING_MAX_PAYLOAD) return -1;
+
+    struct tdx_shm_queue *q = ri->req.q;
+    uint32_t cap = q->capacity;
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_acquire);
+    uint32_t tail = atomic_load_explicit(&q->tail, memory_order_relaxed);
+    uint32_t next = ring_next(tail, cap);
+    if (next == head) return 0; /* full */
+
+    uint8_t *slot = ri->req.data + ((size_t)tail * q->slot_size);
+    uint16_t msg_len = (uint16_t)(RING_SLOT_HDR_SIZE + len);
+    memcpy(slot, &msg_len, sizeof(msg_len));
+
+    struct ring_slot_hdr hdr;
+    hdr.cid = cid;
+    hdr.type = type;
+    hdr.flags = 0;
+    hdr.len = len;
+    hdr.reserved = 0;
+    memcpy(slot + sizeof(msg_len), &hdr, sizeof(hdr));
+    if (len) memcpy(slot + sizeof(msg_len) + sizeof(hdr), payload, len);
+
+    atomic_store_explicit(&q->tail, next, memory_order_release);
     return 1;
 }
 
 static int ring_pop(unsigned char *mm, const struct ring_info *ri, uint32_t *cid, uint16_t *type, unsigned char **payload, uint32_t *len) {
+    (void)mm;
     shm_delay();
-    uint64_t head = 0, tail = 0;
-    memcpy(&head, mm + ri->resp_off, 8);
-    memcpy(&tail, mm + ri->resp_off + 8, 8);
-    if (tail == head) return 0;
-    uint64_t idx = tail % ri->slots;
-    size_t slot_off = ri->resp_off + 16 + idx * SLOT_SIZE;
-    memcpy(cid, mm + slot_off, 4);
-    memcpy(type, mm + slot_off + 4, 2);
-    memcpy(len, mm + slot_off + 8, 4);
-    if (sec_enabled) {
-        uint64_t payload_off = (uint64_t)(slot_off + 16);
-        size_t crypt_len = SLOT_SIZE - 16;
-        if (sec_ensure_access(mm, payload_off, crypt_len) != 0) return -1;
-        const CxlSecEntry *e = sec_find_entry(mm, payload_off, crypt_len);
-        if (!e || !sec_entry_has_principal(e, sec_principal)) return -1;
-        sec_crypt(mm + payload_off, crypt_len, 2 /* RESP */, (uint8_t)ri->ring_idx, tail, e->key);
-    }
-    if (*len > SLOT_SIZE - 16) *len = SLOT_SIZE - 16;
-    *payload = mm + slot_off + 16;
-    tail++;
-    memcpy(mm + ri->resp_off + 8, &tail, 8);
+
+    if (!ri || !ri->resp.q || !ri->resp.data || !cid || !type || !payload || !len) return -1;
+
+    struct tdx_shm_queue *q = ri->resp.q;
+    uint32_t cap = q->capacity;
+    uint32_t head = atomic_load_explicit(&q->head, memory_order_relaxed);
+    uint32_t tail = atomic_load_explicit(&q->tail, memory_order_acquire);
+    if (head == tail) return 0; /* empty */
+
+    uint8_t *slot = ri->resp.data + ((size_t)head * q->slot_size);
+    uint16_t msg_len = 0;
+    memcpy(&msg_len, slot, sizeof(msg_len));
+    if (msg_len < sizeof(struct ring_slot_hdr) || msg_len > TDX_SHM_MSG_MAX) return -1;
+
+    struct ring_slot_hdr hdr;
+    memcpy(&hdr, slot + sizeof(msg_len), sizeof(hdr));
+    if (hdr.len > (uint32_t)(msg_len - sizeof(hdr))) return -1;
+    if (hdr.len > RING_MAX_PAYLOAD) return -1;
+
+    *cid = hdr.cid;
+    *type = hdr.type;
+    *len = hdr.len;
+    *payload = slot + sizeof(msg_len) + sizeof(hdr);
+
+    atomic_store_explicit(&q->head, ring_next(head, cap), memory_order_release);
     return 1;
 }
 
@@ -584,9 +361,11 @@ static int push_set(unsigned char *mm, const struct ring_info *ri, uint32_t cid,
     snprintf(val, sizeof(val), "v%d", idx);
     uint8_t klen = (uint8_t)strlen(key);
     uint16_t vlen = (uint16_t)strlen(val);
-    unsigned char buf[SLOT_SIZE];
+
+    unsigned char buf[TDX_SHM_SLOT_SIZE];
     size_t need = 4 + klen + vlen;
-    if (need > SLOT_SIZE - 16) return -1;
+    if (need > RING_MAX_PAYLOAD) return -1;
+
     buf[0] = OP_SET;
     buf[1] = klen;
     buf[2] = (uint8_t)(vlen & 0xff);
@@ -600,8 +379,11 @@ static int push_get(unsigned char *mm, const struct ring_info *ri, uint32_t cid,
     char key[32];
     snprintf(key, sizeof(key), "k%d", idx);
     uint8_t klen = (uint8_t)strlen(key);
-    unsigned char buf[SLOT_SIZE];
+
+    unsigned char buf[TDX_SHM_SLOT_SIZE];
     size_t need = 4 + klen;
+    if (need > RING_MAX_PAYLOAD) return -1;
+
     buf[0] = OP_GET;
     buf[1] = klen;
     buf[2] = 0;
@@ -610,14 +392,104 @@ static int push_get(unsigned char *mm, const struct ring_info *ri, uint32_t cid,
     return ring_push_safe(mm, ri, cid, MSG_DATA, buf, (uint32_t)need);
 }
 
+static int tsq_init(struct ts_queue *q, int cap) {
+    if (!q || cap <= 0) return -1;
+    q->buf = (uint64_t *)calloc((size_t)cap, sizeof(uint64_t));
+    if (!q->buf) return -1;
+    q->cap = cap;
+    q->head = q->tail = 0;
+    return 0;
+}
+
+static void tsq_free(struct ts_queue *q) {
+    if (!q) return;
+    free(q->buf);
+    q->buf = NULL;
+    q->cap = q->head = q->tail = 0;
+}
+
+static int tsq_push(struct ts_queue *q, uint64_t v) {
+    int next = (q->tail + 1) % q->cap;
+    if (next == q->head) return -1;
+    q->buf[q->tail] = v;
+    q->tail = next;
+    return 0;
+}
+
+static int tsq_pop(struct ts_queue *q, uint64_t *out) {
+    if (q->head == q->tail) return -1;
+    *out = q->buf[q->head];
+    q->head = (q->head + 1) % q->cap;
+    return 0;
+}
+
+static void lat_init(struct latency_stats *ls, int cap) {
+    ls->samples = (double *)malloc(sizeof(double) * (size_t)cap);
+    ls->cap = cap;
+    ls->count = 0;
+    ls->sum = 0.0;
+}
+
+static void lat_record(struct latency_stats *ls, double us) {
+    if (ls->count < ls->cap) {
+        ls->samples[ls->count++] = us;
+        ls->sum += us;
+    }
+}
+
+static int cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a;
+    double y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+static double percentile(double *a, int n, double p) {
+    if (!a || n <= 0) return 0.0;
+    double idx = p * (n - 1);
+    int i = (int)idx;
+    int j = i + 1;
+    if (j >= n) return a[n - 1];
+    double frac = idx - i;
+    return a[i] * (1.0 - frac) + a[j] * frac;
+}
+
+static void compute_agg_latency(struct latency_stats *ls, struct agg_latency *out) {
+    if (!ls || !out || ls->count <= 0) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    qsort(ls->samples, (size_t)ls->count, sizeof(double), cmp_double);
+    out->count = ls->count;
+    out->avg = ls->sum / (double)ls->count;
+    out->p50 = percentile(ls->samples, ls->count, 0.50);
+    out->p75 = percentile(ls->samples, ls->count, 0.75);
+    out->p90 = percentile(ls->samples, ls->count, 0.90);
+    out->p99 = percentile(ls->samples, ls->count, 0.99);
+    out->p999 = percentile(ls->samples, ls->count, 0.999);
+    out->p9999 = percentile(ls->samples, ls->count, 0.9999);
+}
+
+static void stage_init(struct stage_ctx *stage, int collect_latency, int collect_cost, int cap) {
+    memset(stage, 0, sizeof(*stage));
+    stage->collect_latency = collect_latency;
+    stage->collect_cost = collect_cost;
+    tsq_init(&stage->q, cap);
+    if (collect_latency) lat_init(&stage->ls, cap);
+}
+
+static void stage_free(struct stage_ctx *stage) {
+    tsq_free(&stage->q);
+    /* NOTE: latency samples ownership is moved into bench_result; don't free here. */
+}
+
 static int drain_one(unsigned char *mm, const struct ring_info *ri, struct stage_ctx *stage) {
-    uint32_t cid, len;
+    uint32_t cid, rlen;
     uint16_t type;
     unsigned char *pl;
-    int r = ring_pop_safe(mm, ri, &cid, &type, &pl, &len);
+    int r = ring_pop_safe(mm, ri, &cid, &type, &pl, &rlen);
     if (r == 0) return 0;
     if (r < 0) return -1;
-    if (type != MSG_DATA || len < 3) return 1;
+    if (type != MSG_DATA || rlen < 3) return 1;
     if (stage && stage->collect_latency) {
         uint64_t t0 = 0;
         if (tsq_pop(&stage->q, &t0) == 0) {
@@ -800,7 +672,7 @@ static void aggregate_latency_stats(struct latency_stats *dst, struct bench_resu
         dst->sum = 0.0;
         return;
     }
-    dst->samples = (double *)malloc(sizeof(double) * total);
+    dst->samples = (double *)malloc(sizeof(double) * (size_t)total);
     dst->cap = total;
     dst->count = total;
     dst->sum = 0.0;
@@ -808,7 +680,7 @@ static void aggregate_latency_stats(struct latency_stats *dst, struct bench_resu
     for (int i = 0; i < threads; i++) {
         struct latency_stats *src = is_get ? &res[i].get_lat : &res[i].set_lat;
         if (src->count == 0) continue;
-        memcpy(dst->samples + off, src->samples, sizeof(double) * src->count);
+        memcpy(dst->samples + off, src->samples, sizeof(double) * (size_t)src->count);
         off += src->count;
         dst->sum += src->sum;
     }
@@ -854,7 +726,7 @@ static void write_csv_row(FILE *f, const char *label, const char *op, int thread
 }
 
 static void run_bench(unsigned char *mm, struct layout *lo, int n, int pipeline, int threads, int max_inflight, int collect_latency, int collect_cost, const char *csv_path, const char *label) {
-    int ring_count = lo->ring_count ? lo->ring_count : 1;
+    int ring_count = lo->ring_count ? (int)lo->ring_count : 1;
     if (threads < 1) threads = 1;
     if (ring_count < threads) use_lock = 1;
     if (collect_latency && use_lock) {
@@ -862,9 +734,16 @@ static void run_bench(unsigned char *mm, struct layout *lo, int n, int pipeline,
         collect_latency = 0;
     }
 
-    pthread_t *ths = calloc(threads, sizeof(pthread_t));
-    struct bench_result *res = calloc(threads, sizeof(struct bench_result));
-    struct thread_arg *args = calloc(threads, sizeof(struct thread_arg));
+    pthread_t *ths = calloc((size_t)threads, sizeof(pthread_t));
+    struct bench_result *res = calloc((size_t)threads, sizeof(struct bench_result));
+    struct thread_arg *args = calloc((size_t)threads, sizeof(struct thread_arg));
+    if (!ths || !res || !args) {
+        fprintf(stderr, "[!] alloc failed\n");
+        free(ths);
+        free(res);
+        free(args);
+        return;
+    }
 
     for (int i = 0; i < threads; i++) {
         int ring_idx = i % ring_count;
@@ -944,14 +823,11 @@ int main(int argc, char **argv) {
     int pipeline = 0;
     int threads = 1;
     int ring_idx = 0;
-    int max_inflight = 0; /* 0 = auto (slots/4) */
+    int max_inflight = 0;
     int collect_latency = 0;
     int collect_cost = 0;
     const char *csv_path = "results/ring_metrics.csv";
     const char *label = "ring";
-    int secure = 0;
-    const char *sec_mgr = getenv("CXL_SEC_MGR");
-    unsigned sec_timeout_ms = 10000;
     unsigned ping_timeout_ms = 0;
 
     const char *delay_env = getenv("CXL_SHM_DELAY_NS");
@@ -967,9 +843,6 @@ int main(int argc, char **argv) {
         if (v > 0) map_offset = (size_t)v;
     }
 
-    const char *sec_node_env = getenv("CXL_SEC_NODE_ID");
-    uint32_t sec_node = sec_node_env ? (uint32_t)strtoul(sec_node_env, NULL, 0) : 0;
-
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--path") && i + 1 < argc) path = argv[++i];
         else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) map_size = strtoull(argv[++i], NULL, 0);
@@ -977,22 +850,24 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) map_offset = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--pipeline")) pipeline = 1;
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--ring") && i + 1 < argc) ring_idx = atoi(argv[++i]); /* kept for single ring mode */
+        else if (!strcmp(argv[i], "--ring") && i + 1 < argc) ring_idx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-inflight") && i + 1 < argc) max_inflight = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--latency")) collect_latency = 1;
         else if (!strcmp(argv[i], "--cost")) collect_cost = 1;
         else if (!strcmp(argv[i], "--csv") && i + 1 < argc) csv_path = argv[++i];
         else if (!strcmp(argv[i], "--label") && i + 1 < argc) label = argv[++i];
-        else if (!strcmp(argv[i], "--secure")) secure = 1;
-        else if (!strcmp(argv[i], "--sec-mgr") && i + 1 < argc) sec_mgr = argv[++i];
-        else if (!strcmp(argv[i], "--sec-node-id") && i + 1 < argc) sec_node = (uint32_t)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--sec-timeout-ms") && i + 1 < argc) sec_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--ping-timeout-ms") && i + 1 < argc) ping_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--secure")) {
+            fprintf(stderr, "[!] --secure is not supported with the new TDX SHM layout.\n");
+            return 1;
+        } else if (!strcmp(argv[i], "--ping-timeout-ms") && i + 1 < argc) ping_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            printf("Usage: %s [--path <ring>] [--map-size <bytes>] [--map-offset <bytes>] [--bench N] [--pipeline] [--threads N]\n"
+            printf("Usage: %s [--path <bar2|uio>] [--map-size <bytes>] [--map-offset <bytes>] [--bench N] [--pipeline] [--threads N]\n"
                    "          [--max-inflight N] [--latency] [--cost] [--csv <path>] [--label <name>]\n"
-                   "          [--secure --sec-mgr <ip:port> --sec-node-id <n>]\n"
-                   "          [--ping-timeout-ms <ms>] (ping mode only; 0=wait forever)\n",
+                   "          [--ping-timeout-ms <ms>] (ping mode only; 0=wait forever)\n"
+                   "Env:\n"
+                   "  CXL_RING_COUNT        : number of rings/regions (default: 1)\n"
+                   "  CXL_RING_REGION_SIZE  : bytes per ring region (default: 16M)\n"
+                   "  CXL_RING_REGION_BASE  : base offset within the mmap (default: 0)\n",
                    argv[0]);
             return 0;
         }
@@ -1015,8 +890,7 @@ int main(int argc, char **argv) {
     struct stat st;
     if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
         if ((size_t)st.st_size <= map_offset) {
-            fprintf(stderr, "[!] map offset %zu exceeds file size %zu\n",
-                    map_offset, (size_t)st.st_size);
+            fprintf(stderr, "[!] map offset %zu exceeds file size %zu\n", map_offset, (size_t)st.st_size);
             close(fd);
             return 1;
         }
@@ -1029,76 +903,33 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
+
     unsigned char *mm = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)map_offset);
     if (mm == MAP_FAILED) {
         perror("mmap");
         close(fd);
         return 1;
     }
-    struct layout lo;
-    if (load_layout(mm, &lo) != 0) {
-        fprintf(stderr, "invalid ring layout; start redis with cxl ring (version 2) first\n");
-        munmap(mm, map_size);
-        close(fd);
-        return 1;
-    }
-    if (layout_fits(&lo, map_size) != 0) {
-        fprintf(stderr, "[!] ring layout exceeds map size (%zu); check RING_MAP_SIZE/CXL_SIZE\n", map_size);
-        munmap(mm, map_size);
-        close(fd);
-        return 1;
-    }
-    if (ring_idx < 0 || ring_idx >= (int)lo.ring_count) ring_idx = 0;
-    printf("[*] ring direct: path=%s map=%zu offset=%zu ring_count=%u using_ring=%d slots=%u secure=%d shm_delay_ns=%llu\n",
-           path, map_size, map_offset, lo.ring_count, ring_idx, lo.rings[ring_idx].slots, secure,
-           (unsigned long long)shm_delay_ns);
 
-    if (secure) {
-        if (!sec_mgr || !sec_mgr[0]) {
-            fprintf(stderr, "[!] --secure requires --sec-mgr <ip:port> (or set CXL_SEC_MGR)\n");
-            munmap(mm, map_size);
-            close(fd);
-            return 1;
-        }
-        if (sodium_init() < 0) {
-            fprintf(stderr, "[!] sodium_init failed\n");
-            munmap(mm, map_size);
-            close(fd);
-            return 1;
-        }
-        sec_enabled = 1;
-        sec_node_id = sec_node;
-        sec_principal = ((uint64_t)sec_node_id << 32) | (uint32_t)getpid();
-        sec_fd = sec_connect_mgr(sec_mgr);
-        if (sec_fd < 0) {
-            fprintf(stderr, "[!] failed to connect sec mgr: %s\n", sec_mgr);
-            munmap(mm, map_size);
-            close(fd);
-            return 1;
-        }
-        if (sec_wait_table_ready(mm, sec_timeout_ms) != 0) {
-            fprintf(stderr, "[!] timeout waiting for sec table (offset=%u)\n", (unsigned)CXL_SEC_TABLE_OFF);
-            close(sec_fd);
-            sec_fd = -1;
-            munmap(mm, map_size);
-            close(fd);
-            return 1;
-        }
-        /* Pre-grant access for all req/resp regions to avoid concurrent first-touch across threads. */
-        for (uint32_t i = 0; i < lo.ring_count; i++) {
-            (void)sec_request_access((uint64_t)lo.rings[i].req_off, 1);
-            (void)sec_request_access((uint64_t)lo.rings[i].resp_off, 1);
-        }
-        fprintf(stderr, "[*] secure ring: enabled (mgr=%s node_id=%u principal=%llu)\n",
-                sec_mgr,
-                sec_node_id,
-                (unsigned long long)sec_principal);
+    struct layout lo;
+    if (load_layout(mm, map_size, &lo) != 0) {
+        fprintf(stderr, "[!] TDX SHM layout not ready.\n");
+        fprintf(stderr, "    Start ring-enabled redis-server first, and ensure CXL_RING_COUNT/REGION_SIZE match.\n");
+        munmap(mm, map_size);
+        close(fd);
+        return 1;
     }
+
+    if (ring_idx < 0 || ring_idx >= (int)lo.ring_count) ring_idx = 0;
+    size_t region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
+    size_t region_base = env_size("CXL_RING_REGION_BASE", 0);
+
+    printf("[*] tdx shm ring direct: path=%s map=%zu offset=%zu ring_count=%u region_base=%zu region_size=%zu slots=%u shm_delay_ns=%" PRIu64 "\n",
+           path, map_size, map_offset, lo.ring_count, region_base, region_size, lo.rings[ring_idx].slots, shm_delay_ns);
 
     if (bench_n > 0) {
         run_bench(mm, &lo, bench_n, pipeline, threads, max_inflight, collect_latency, collect_cost, csv_path, label);
     } else {
-        /* simple GET ping (for readiness checks) */
         uint64_t start_ns = nowns();
         int pushed = 0;
         int ok = 0;
@@ -1137,17 +968,16 @@ int main(int argc, char **argv) {
             struct timespec ts = {0, 1000000};
             nanosleep(&ts, NULL);
         }
+
         if (ok) printf("PING done\n");
         else {
             munmap(mm, map_size);
             close(fd);
-            if (sec_fd >= 0) close(sec_fd);
             return 1;
         }
     }
 
     munmap(mm, map_size);
     close(fd);
-    if (sec_fd >= 0) close(sec_fd);
     return 0;
 }

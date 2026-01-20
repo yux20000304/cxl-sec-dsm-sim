@@ -2,6 +2,8 @@ infra/images/
 tmp/
 results/*.log
 results/*.csv
+results/**/*.log
+results/**/*.csv
 cxl_ring_shared.bin
 
 # Gramine outputs are environment-specific; keep only *.manifest.template in git.
@@ -18,6 +20,9 @@ gramine/gapbs-ring-secure
 
 ring_client/cxl_ring_client
 ring_client/cxl_ring_direct
+tdx_shm/tdx_shm_init
+tdx_shm/tdx_shm_agent
+tdx_shm/tdx_shm_ping_pong
 sodium_tunnel/cxl_sodium_tunnel
 cxl_sec_mgr/cxl_sec_mgr
 *.img

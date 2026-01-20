@@ -43,6 +43,8 @@ set -euo pipefail
 #   CXL_SIZE       : ivshmem backing file size (default: RING_MAP_SIZE)
 #   RING_PATH_OVERRIDE: use this path inside guests for ring mmap (skip BAR2/UIO detection)
 #   RING_COUNT     : number of rings (default: 4)
+#   RING_REGION_SIZE: bytes per TDX SHM ring region (default: 16M)
+#   RING_REGION_BASE: base offset within BAR2 mmap (default: 0)
 #   MAX_INFLIGHT   : ring client inflight limit (default: 512)
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr inside vm1 (default: 19001)
 #   TDX_BIOS       : firmware file passed to QEMU `-bios` (default auto-detected)
@@ -53,7 +55,7 @@ set -euo pipefail
 #   RING_ONLY_PIPELINE : 1 to enable pipelined ring-only bench (default: 1)
 #   RING_ONLY_PING_TIMEOUT_MS : ping timeout for ring-only (default: 5000)
 #   RING_REDIS_PORT : TCP port for ring-enabled redis-server (default: 0 to disable TCP)
-#   SSH_ALLOW_FALLBACK   : 1 to try multiple users during SSH probe (default: 0 with seed, 1 without)
+#   SSH_ALLOW_FALLBACK   : 1 to try multiple users during SSH probe (default: 1)
 #   SSH_PROBE_INITIAL_DELAY : initial wait between SSH probe attempts (seconds, default: 2)
 #   SSH_PROBE_MAX_DELAY  : max wait between SSH probe attempts (seconds, default: 10)
 #   SSH_PROBE_BACKOFF_FACTOR : backoff multiplier between attempts (default: 2)
@@ -119,6 +121,8 @@ SSH_PROBE_BACKOFF_FACTOR="${SSH_PROBE_BACKOFF_FACTOR:-2}"
 
 RING_MAP_SIZE="${RING_MAP_SIZE:-4294967296}" # 4GB
 RING_COUNT="${RING_COUNT:-4}"
+RING_REGION_SIZE="${RING_REGION_SIZE:-16M}"
+RING_REGION_BASE="${RING_REGION_BASE:-0}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
 RING_MAP_OFFSET_VM1="${RING_MAP_OFFSET_VM1:-0}"
 RING_MAP_OFFSET_VM2="${RING_MAP_OFFSET_VM2:-0}"
@@ -152,7 +156,11 @@ TDX_BIOS="${TDX_BIOS:-}"
 # If TDX_BIOS is not explicitly set, prefer the system-provided TDX firmware.
 pick_default_tdx_bios() {
   local c
+  # On Canonical TDX stacks, /usr/share/ovmf/OVMF.fd is TDX-capable and tends
+  # to have fewer early-boot quirks than some OVMF.tdx.fd builds.
   for c in \
+    /usr/share/ovmf/OVMF.fd \
+    /usr/share/OVMF/OVMF.fd \
     /usr/share/ovmf/OVMF.tdx.fd \
     /usr/share/OVMF/OVMF.tdx.fd; do
     [[ -f "${c}" ]] && { echo "${c}"; return; }
@@ -189,6 +197,27 @@ if [[ "${HOST_NUMA_NODES}" -lt 2 && -z "${CXL_SHM_DELAY_NS}" ]]; then
   echo "[*] Host has ${HOST_NUMA_NODES} NUMA node(s); enabling simulated CXL shared-memory latency: CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} (ns)."
   echo "    Override: CXL_SHM_DELAY_NS=0 (disable) or set a custom ns value."
 fi
+
+size_to_bytes() {
+  local v="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --from=iec "${v}" 2>/dev/null && return 0
+  fi
+  if [[ "${v}" =~ ^([0-9]+)([KkMmGgTt])?$ ]]; then
+    local n="${BASH_REMATCH[1]}"
+    local s="${BASH_REMATCH[2]}"
+    case "${s}" in
+      K|k) echo $((n * 1024)) ;;
+      M|m) echo $((n * 1024 * 1024)) ;;
+      G|g) echo $((n * 1024 * 1024 * 1024)) ;;
+      T|t) echo $((n * 1024 * 1024 * 1024 * 1024)) ;;
+      "") echo "${n}" ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  return 1
+}
 
 need_cmd() {
   local cmd="$1"
@@ -541,6 +570,7 @@ VM2_SSH_AUTH_MODE="${VM2_SSH_AUTH_MODE:-}"
 ssh_key_opts=(
   -i "${sshkey}"
   -o BatchMode=yes
+  -o IdentitiesOnly=yes
   -o ConnectionAttempts=1
   -o ConnectTimeout=5
   -o ServerAliveInterval=5
@@ -571,6 +601,35 @@ ssh_do() {
   fi
 }
 
+SSH_CMD_RETRIES="${SSH_CMD_RETRIES:-20}"
+SSH_CMD_RETRY_DELAY_SECS="${SSH_CMD_RETRY_DELAY_SECS:-2}"
+
+ssh_do_retry() {
+  local port="$1"; shift
+  local out=""
+  local rc=0
+  for i in $(seq 1 "${SSH_CMD_RETRIES}"); do
+    set +e
+    out="$(ssh_do "${port}" "$@" 2>&1)"
+    rc=$?
+    set -e
+    if [[ "${rc}" -eq 0 ]]; then
+      [[ -n "${out}" ]] && printf '%s\n' "${out}"
+      return 0
+    fi
+    # SSH transport errors return 255; retry those (guest can be temporarily busy).
+    if [[ "${rc}" -eq 255 ]]; then
+      echo "[*] SSH transient failure on port ${port} (attempt ${i}/${SSH_CMD_RETRIES}), retrying..." >&2
+      sleep "${SSH_CMD_RETRY_DELAY_SECS}"
+      continue
+    fi
+    printf '%s\n' "${out}" >&2
+    return "${rc}"
+  done
+  printf '%s\n' "${out}" >&2
+  return "${rc}"
+}
+
 ssh_vm1() {
   local saved_user="${SSH_USER}"
   local saved_pass="${SSH_PASS}"
@@ -580,7 +639,7 @@ ssh_vm1() {
     SSH_PASS="${VM1_SSH_PASS}"
     SSH_AUTH_MODE="${VM1_SSH_AUTH_MODE:-${SSH_AUTH_MODE}}"
   fi
-  ssh_do "${VM1_SSH}" "$@"
+  ssh_do_retry "${VM1_SSH}" "$@"
   local rc=$?
   SSH_USER="${saved_user}"
   SSH_PASS="${saved_pass}"
@@ -597,7 +656,7 @@ ssh_vm2() {
     SSH_PASS="${VM2_SSH_PASS}"
     SSH_AUTH_MODE="${VM2_SSH_AUTH_MODE:-${SSH_AUTH_MODE}}"
   fi
-  ssh_do "${VM2_SSH}" "$@"
+  ssh_do_retry "${VM2_SSH}" "$@"
   local rc=$?
   SSH_USER="${saved_user}"
   SSH_PASS="${saved_pass}"
@@ -605,8 +664,9 @@ ssh_vm2() {
   return "${rc}"
 }
 
-# Shorter default waits; override via environment variables as needed.
-WAIT_SSH_SECS="${WAIT_SSH_SECS:-120}"
+# TDX guests can be slow to boot (especially with first-boot cloud-init).
+# Use a conservative default; override via environment variables as needed.
+WAIT_SSH_SECS="${WAIT_SSH_SECS:-600}"
 WAIT_CLOUD_INIT_SECS="${WAIT_CLOUD_INIT_SECS:-120}"
 
 # Detect whether this is a TD image built by TDX tools (different login defaults).
@@ -629,11 +689,10 @@ if [[ -z "${SSH_USER}" && "${SKIP_SEED}" != "1" ]]; then
   SSH_USER="ubuntu"
 fi
 if [[ -z "${SSH_ALLOW_FALLBACK}" ]]; then
-  if [[ "${SKIP_SEED}" == "1" ]]; then
-    SSH_ALLOW_FALLBACK="1"
-  else
-    SSH_ALLOW_FALLBACK="0"
-  fi
+  # Even with our cloud-init seed, SSH key injection can be flaky in some
+  # environments. Default to allowing fallback probes (ubuntu password, etc.)
+  # to avoid hard failures during bring-up.
+  SSH_ALLOW_FALLBACK="1"
 fi
 
 # Auto-pick SSH user/auth: try configured user first; fallback only if enabled.
@@ -831,6 +890,7 @@ echo "[*] Building Redis (ring version) in vm1 ..."
 ssh_vm1 "sudo systemctl disable --now redis-server >/dev/null 2>&1 || true"
 # Build inside /tmp to avoid virtio-9p open-file limitations, then copy artifacts back
 ssh_vm1 "sudo -n bash -lc 'set -euo pipefail; \
+  rm -rf /tmp/tdx_shm && cp -a /mnt/hostshare/tdx_shm /tmp/tdx_shm; \
   tmp=/tmp/redis_ring_build; \
   rm -rf \"\$tmp\" && mkdir -p \"\$tmp\"; \
   cp -a /mnt/hostshare/redis/. \"\$tmp\"/; \
@@ -841,7 +901,7 @@ ssh_vm1 "sudo -n bash -lc 'set -euo pipefail; \
 '"
 
 echo "[*] Building ring client in vm2 (/tmp/cxl_ring_direct) ..."
-ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c -lsodium"
+ssh_vm2 "cd /mnt/hostshare/ring_client && gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c"
 
 echo "[*] Re-checking SSH connectivity after builds ..."
 wait_ssh "vm1" "${VM1_SSH}"
@@ -958,9 +1018,17 @@ bind_ivshmem_uio() {
   if [[ "${size2}" -lt "${min_size}" ]]; then
     min_size="${size2}"
   fi
-  local min_needed=$((4096 + RING_COUNT * 2 * 8192))
+  local region_size_bytes=""
+  region_size_bytes="$(size_to_bytes "${RING_REGION_SIZE}" 2>/dev/null || true)"
+  local region_base_bytes=""
+  region_base_bytes="$(size_to_bytes "${RING_REGION_BASE}" 2>/dev/null || true)"
+  if [[ -z "${region_size_bytes}" || -z "${region_base_bytes}" ]]; then
+    echo "[!] Failed to parse RING_REGION_SIZE='${RING_REGION_SIZE}' or RING_REGION_BASE='${RING_REGION_BASE}'" >&2
+    exit 1
+  fi
+  local min_needed=$((region_base_bytes + RING_COUNT * region_size_bytes))
   if [[ "${min_size}" -lt "${min_needed}" ]]; then
-    echo "[!] UIO map is too small (${min_size} bytes); need at least ${min_needed} bytes for ring layout." >&2
+    echo "[!] UIO map is too small (${min_size} bytes); need at least ${min_needed} bytes for TDX SHM ring regions." >&2
     echo "    This usually means the ivshmem shared-memory BAR isn't exposed via UIO." >&2
     echo "    Try kernel module uio_ivshmem or disable guest lockdown to mmap resource2." >&2
     exit 1
@@ -1007,6 +1075,13 @@ echo "[*] Internal VM network (cxl0):"
 ssh_vm1 "ip -brief addr show cxl0 2>/dev/null || true"
 ssh_vm2 "ip -brief addr show cxl0 2>/dev/null || true"
 
+ring_redis_sock_args=""
+if [[ "${RING_REDIS_PORT}" == "0" ]]; then
+  # Redis refuses to start when configured to listen nowhere. Keep TCP disabled
+  # but bind a local unix socket so the process stays alive to serve the ring.
+  ring_redis_sock_args="--unixsocket /tmp/redis_ring.sock --unixsocketperm 777"
+fi
+
 if [[ "${RING_ONLY}" == "1" ]]; then
   echo "[*] RING_ONLY=1: running ring-only quick validation."
   ring_only_log="${RESULTS_DIR}/tdx_ring_only_${ts}.log"
@@ -1021,15 +1096,15 @@ if [[ "${RING_ONLY}" == "1" ]]; then
   echo "[*] Ring-only: starting Redis ring in vm1 ..."
   ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
   ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
-  ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} ./redis-server --port ${RING_REDIS_PORT} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
+  ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} ./redis-server --port ${RING_REDIS_PORT} ${ring_redis_sock_args} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
 
   for _ in $(seq 1 200); do
-    if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms ${RING_ONLY_PING_TIMEOUT_MS} >/dev/null 2>&1"; then
+    if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms ${RING_ONLY_PING_TIMEOUT_MS} >/dev/null 2>&1"; then
       break
     fi
     sleep 0.25
   done
-  if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms ${RING_ONLY_PING_TIMEOUT_MS} >/dev/null 2>&1"; then
+  if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms ${RING_ONLY_PING_TIMEOUT_MS} >/dev/null 2>&1"; then
     echo "[!] ring transport not ready. Dumping diagnostics..." >&2
     ssh_vm1 "tail -n 200 /tmp/redis_ring_tdx.log" >&2 || true
     if [[ -n "${RING_PATH_OVERRIDE}" ]]; then
@@ -1039,14 +1114,14 @@ if [[ "${RING_ONLY}" == "1" ]]; then
     echo "    Trying UIO-backed ivshmem mapping ..."
     bind_ivshmem_uio
     ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
-    ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} ./redis-server --port ${RING_REDIS_PORT} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
+    ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} ./redis-server --port ${RING_REDIS_PORT} ${ring_redis_sock_args} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
     for _ in $(seq 1 200); do
-      if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms ${RING_ONLY_PING_TIMEOUT_MS} >/dev/null 2>&1"; then
+      if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms ${RING_ONLY_PING_TIMEOUT_MS} >/dev/null 2>&1"; then
         break
       fi
       sleep 0.25
     done
-    if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms ${RING_ONLY_PING_TIMEOUT_MS} >/dev/null 2>&1"; then
+    if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms ${RING_ONLY_PING_TIMEOUT_MS} >/dev/null 2>&1"; then
       echo "[!] ring transport still not ready after UIO fallback." >&2
       ssh_vm1 "tail -n 200 /tmp/redis_ring_tdx.log" >&2 || true
       exit 1
@@ -1054,7 +1129,7 @@ if [[ "${RING_ONLY}" == "1" ]]; then
   fi
 
   echo "[*] Ring-only: tiny bench (n=${RING_ONLY_BENCH_N}, threads=${RING_ONLY_THREADS}) ..."
-  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_only_n_per_thread} ${ring_only_pipeline_flag} --threads ${RING_ONLY_THREADS} --max-inflight ${RING_ONLY_MAX_INFLIGHT} --csv /tmp/${ring_only_label}.csv --label ${ring_only_label}" | tee "${ring_only_log}"
+  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_only_n_per_thread} ${ring_only_pipeline_flag} --threads ${RING_ONLY_THREADS} --max-inflight ${RING_ONLY_MAX_INFLIGHT} --csv /tmp/${ring_only_label}.csv --label ${ring_only_label}" | tee "${ring_only_log}"
   ssh_vm2 "cat /tmp/${ring_only_label}.csv" > "${ring_only_csv}"
 
   ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
@@ -1082,15 +1157,15 @@ ssh_vm1 "tmux kill-session -t redis_native_tdx >/dev/null 2>&1 || true"
 echo "[*] Benchmark 2/3: ring Redis (shared-memory) inside TDX guests"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
-ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} ./redis-server --port ${RING_REDIS_PORT} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
+ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} ./redis-server --port ${RING_REDIS_PORT} ${ring_redis_sock_args} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
 
 for _ in $(seq 1 200); do
-  if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
+  if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
     break
   fi
   sleep 0.25
 done
-if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
+if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
   echo "[!] ring transport not ready. Dumping diagnostics..." >&2
   ssh_vm1 "tail -n 200 /tmp/redis_ring_tdx.log" >&2 || true
   if [[ -n "${RING_PATH_OVERRIDE}" ]]; then
@@ -1100,15 +1175,15 @@ if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RI
   echo "    Trying UIO-backed ivshmem mapping ..."
   bind_ivshmem_uio
   ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
-  ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} ./redis-server --port ${RING_REDIS_PORT} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
+  ssh_vm1 "tmux new-session -d -s redis_ring_tdx \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} ./redis-server --port ${RING_REDIS_PORT} ${ring_redis_sock_args} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx.log 2>&1\""
   # Re-check with fallback
   for _ in $(seq 1 200); do
-    if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
+    if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
       break
     fi
     sleep 0.25
   done
-  if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
+  if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} timeout 2 /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
     echo "[!] ring transport still not ready after UIO fallback." >&2
     ssh_vm1 "tail -n 200 /tmp/redis_ring_tdx.log" >&2 || true
     exit 1
@@ -1117,7 +1192,7 @@ fi
 
 ring_label="tdx_ring_${ts}"
 ring_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
-ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
+ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
 ssh_vm2 "cat /tmp/${ring_label}.csv" > "${ring_csv}"
 
 ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
@@ -1125,52 +1200,7 @@ ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 
 RUN_SECURE=0
 if [[ "${ENABLE_SECURE}" == "1" ]]; then
-  RUN_SECURE=1
-  echo "[*] Benchmark 3/3: secure ring Redis inside TDX guests (ACL + software crypto)"
-  ssh_vm1 "tmux kill-session -t cxl_sec_mgr_tdx >/dev/null 2>&1 || true"
-  ssh_vm1 "tmux kill-session -t redis_ring_tdx_secure >/dev/null 2>&1 || true"
-  ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
-
-  ssh_vm1 "tmux new-session -d -s cxl_sec_mgr_tdx \"sudo env CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} /tmp/cxl_sec_mgr --ring ${RING_PATH_VM1} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} >/tmp/cxl_sec_mgr_tdx_${ts}.log 2>&1\""
-  ssh_vm1 "tmux new-session -d -s redis_ring_tdx_secure \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_SEC_ENABLE=1 CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 ./redis-server --port ${RING_REDIS_PORT} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx_secure.log 2>&1\""
-
-  for _ in $(seq 1 200); do
-    if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
-      break
-    fi
-    sleep 0.25
-  done
-  if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
-    echo "[!] secure ring transport not ready. Dumping diagnostics..." >&2
-    ssh_vm1 "tail -n 200 /tmp/cxl_sec_mgr_tdx_${ts}.log" >&2 || true
-    ssh_vm1 "tail -n 200 /tmp/redis_ring_tdx_secure.log" >&2 || true
-    if [[ -n "${RING_PATH_OVERRIDE}" ]]; then
-      echo "[!] secure ring not ready with RING_PATH_OVERRIDE; skipping UIO fallback." >&2
-      exit 1
-    fi
-    echo "    Trying UIO-backed ivshmem mapping for secure ring ..."
-    bind_ivshmem_uio
-    # Re-check with fallback path
-    for _ in $(seq 1 200); do
-      if ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
-        break
-      fi
-      sleep 0.25
-    done
-    if ! ssh_vm2 "sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} timeout 2 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} >/dev/null 2>&1"; then
-      echo "[!] secure ring transport still not ready after UIO fallback." >&2
-      exit 1
-    fi
-  fi
-
-  ring_secure_label="tdx_ring_secure_${ts}"
-  ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
-  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
-  ssh_vm2 "cat /tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
-
-  ssh_vm1 "tmux kill-session -t redis_ring_tdx_secure >/dev/null 2>&1 || true"
-  ssh_vm1 "tmux kill-session -t cxl_sec_mgr_tdx >/dev/null 2>&1 || true"
-  ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
+  echo "[*] Skipping secure ring Redis: the new TDX SHM layout does not support --secure/cxl_sec_mgr yet."
 else
   echo "[*] Skipping secure ring Redis (ENABLE_SECURE=0)"
 fi

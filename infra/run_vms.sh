@@ -523,7 +523,7 @@ run_vm() {
     $( [[ -n "${cxl_opts}" ]] && echo -n "-device ivshmem-plain,memdev=cxlmem-${name},id=ivshmem0" )
     -drive if=none,file="${disk}",format=qcow2,id=vd0
     -device virtio-blk-pci,drive=vd0
-    -netdev user,id=net0,hostfwd=tcp::${ssh_port}-:22
+    -netdev user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22
     -device virtio-net-pci,netdev=net0
     "${vmnet_opts[@]}"
     $( [[ "${attach_hostshare}" == "1" ]] && echo -n "-virtfs local,path=${HOSTSHARE},mount_tag=hostshare,security_model=none,id=hostshare" )
@@ -604,7 +604,7 @@ run_vm() {
       $( [[ -n "${cxl_opts}" ]] && echo -n "-device ivshmem-plain,memdev=cxlmem-${name},id=ivshmem0" )
       -drive if=none,file="${disk}",format=qcow2,id=vd0
       -device virtio-blk-pci,drive=vd0
-      -netdev user,id=net0,hostfwd=tcp::${ssh_port}-:22
+      -netdev user,id=net0,hostfwd=tcp:127.0.0.1:${ssh_port}-:22
       -device virtio-net-pci,netdev=net0
       "${vmnet_opts[@]}"
       $( [[ "${attach_hostshare}" == "1" ]] && echo -n "-virtfs local,path=${HOSTSHARE},mount_tag=hostshare,security_model=none,id=hostshare" )
