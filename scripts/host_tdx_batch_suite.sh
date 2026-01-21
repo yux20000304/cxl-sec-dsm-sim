@@ -15,7 +15,7 @@ set -euo pipefail
 # Tunables (env):
 #   THREAD_LIST          : comma-separated (default: 1,2,4,8)
 #   RING_REGION_SIZE     : per-ring region size (default: 256M)
-#   RING_REGION_BASE     : base offset (default: 0)
+#   RING_REGION_BASE     : base offset (default: 4096; keeps page 0 unused for fair ring vs ring-secure)
 #   RING_MAP_SIZE        : BAR2 map size (default: 4G)
 #   YCSB_WORKLOADS       : comma-separated workloads (default: workloada..workloade)
 #   GAPBS_KERNEL_LIST    : comma-separated kernels (default: bfs,sssp,pr,cc,bc,tc)
@@ -28,7 +28,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 THREAD_LIST="${THREAD_LIST:-1,2,4,8}"
 RING_REGION_SIZE="${RING_REGION_SIZE:-256M}"
-RING_REGION_BASE="${RING_REGION_BASE:-0}"
+RING_REGION_BASE="${RING_REGION_BASE:-4096}"
 RING_MAP_SIZE="${RING_MAP_SIZE:-4G}"
 
 YCSB_ENABLE="${YCSB_ENABLE:-0}"

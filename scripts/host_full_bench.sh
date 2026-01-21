@@ -19,7 +19,7 @@ set -euo pipefail
 #   VM1_MEM/VM2_MEM  : override per-VM RAM (default: VM_MEM)
 #   RING_COUNT       : number of ring regions (default: 4)
 #   RING_REGION_SIZE : bytes per ring region (default: 16M)
-#   RING_REGION_BASE : base offset within BAR2 mmap (default: 0)
+#   RING_REGION_BASE : base offset within BAR2 mmap (default: 4096; keeps page 0 unused for fair ring vs ring-secure)
 #   RING_MAP_SIZE    : BAR2 mmap size (bytes or IEC like 4G; default: 4294967296)
 #   YCSB_WORKLOADS   : comma-separated workloads (default: workloada,workloadb)
 #   YCSB_RECORDS     : records (default: 100000)
@@ -59,7 +59,7 @@ RING_COUNT="${RING_COUNT:-4}"
 RING_COUNT_LIST="${RING_COUNT_LIST:-}"
 RING_REGION_SIZE="${RING_REGION_SIZE:-128M}"
 RING_REGION_SIZE_LIST="${RING_REGION_SIZE_LIST:-}"
-RING_REGION_BASE="${RING_REGION_BASE:-0}"
+RING_REGION_BASE="${RING_REGION_BASE:-4096}"
 RING_MAP_SIZE="${RING_MAP_SIZE:-4294967296}"
 RING_MAP_SIZE_LIST="${RING_MAP_SIZE_LIST:-}"
 CXL_SIZE="${CXL_SIZE:-}"

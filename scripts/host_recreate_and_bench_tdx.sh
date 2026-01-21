@@ -45,7 +45,7 @@ set -euo pipefail
 #   RING_PATH_OVERRIDE: use this path inside guests for ring mmap (skip BAR2/UIO detection)
 #   RING_COUNT     : number of rings (default: 4)
 #   RING_REGION_SIZE: bytes per TDX SHM ring region (default: 16M)
-#   RING_REGION_BASE: base offset within BAR2 mmap (default: 0)
+#   RING_REGION_BASE: base offset within BAR2 mmap (default: 4096; keeps page 0 unused for fair ring vs ring-secure)
 #   MAX_INFLIGHT   : ring client inflight limit (default: 512)
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr inside vm1 (default: 19001)
 #   SODIUM_KEY_HEX : pre-shared key for libsodium tunnel (hex64, default: deterministic test key)
@@ -128,7 +128,7 @@ SSH_PROBE_BACKOFF_FACTOR="${SSH_PROBE_BACKOFF_FACTOR:-2}"
 RING_MAP_SIZE="${RING_MAP_SIZE:-4294967296}" # 4GB
 RING_COUNT="${RING_COUNT:-4}"
 RING_REGION_SIZE="${RING_REGION_SIZE:-16M}"
-RING_REGION_BASE="${RING_REGION_BASE:-0}"
+RING_REGION_BASE="${RING_REGION_BASE:-4096}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
 RING_MAP_OFFSET_VM1="${RING_MAP_OFFSET_VM1:-0}"
 RING_MAP_OFFSET_VM2="${RING_MAP_OFFSET_VM2:-0}"
