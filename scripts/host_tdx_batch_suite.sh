@@ -26,13 +26,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-THREAD_LIST="${THREAD_LIST:-1,2,4,8}"
+THREAD_LIST="${THREAD_LIST:-1,2,4,8,16}"
 RING_REGION_SIZE="${RING_REGION_SIZE:-256M}"
 RING_REGION_BASE="${RING_REGION_BASE:-4096}"
 RING_MAP_SIZE="${RING_MAP_SIZE:-4G}"
 
 YCSB_ENABLE="${YCSB_ENABLE:-0}"
-YCSB_WORKLOADS="${YCSB_WORKLOADS:-workloada,workloadb,workloadc,workloadd,workloade}"
+YCSB_WORKLOADS="${YCSB_WORKLOADS:-workloada,workloadb,workloadc,workloadd}"
 GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-bfs,sssp,pr,cc,bc,tc}"
 
 IFS=',' read -r -a threads_arr <<< "${THREAD_LIST}"
