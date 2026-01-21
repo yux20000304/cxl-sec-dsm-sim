@@ -118,6 +118,11 @@ static pthread_mutex_t resp_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t shm_delay_ns = 0;
 static uint64_t shm_pause_iters_per_ns_x1024 = 0;
+/* Backoff policy for polling an empty response queue / full request queue.
+ * Defaults are tuned for throughput benchmarking (avoid coarse scheduler sleeps)
+ * while still allowing the CPU to back off under prolonged emptiness. */
+static uint64_t poll_spin_ns = 5000;   /* pause-loop time before sleeping (ns) */
+static uint64_t poll_sleep_ns = 50000; /* nanosleep time after spinning (ns) */
 
 static volatile int running = 1;
 static void handle_sig(int sig) {
@@ -231,6 +236,25 @@ static inline void shm_delay(void) {
     }
 }
 
+static inline void pause_ns(uint64_t ns) {
+    if (!ns) return;
+    if (!shm_pause_iters_per_ns_x1024) shm_delay_calibrate();
+    uint64_t iters = (ns * shm_pause_iters_per_ns_x1024 + 1023ULL) / 1024ULL;
+    if (iters == 0) iters = 1;
+    for (uint64_t i = 0; i < iters; i++) {
+        __asm__ __volatile__("pause");
+    }
+}
+
+static inline void bench_sleep_ns(uint64_t ns, struct cost_stats *cs, int collect_cost) {
+    if (!ns) return;
+    struct timespec ts;
+    ts.tv_sec = (time_t)(ns / 1000000000ULL);
+    ts.tv_nsec = (long)(ns % 1000000000ULL);
+    nanosleep(&ts, NULL);
+    if (collect_cost && cs) cs->sleep_ns += ns;
+}
+
 static int parse_size(const char *arg, size_t *out) {
     if (!arg || !out) return -1;
     errno = 0;
@@ -273,6 +297,15 @@ static uint32_t env_u32(const char *key, uint32_t def) {
     if (errno != 0) return def;
     if (x > 0xffffffffULL) return def;
     return (uint32_t)x;
+}
+
+static uint64_t env_u64(const char *key, uint64_t def) {
+    const char *v = getenv(key);
+    if (!v || !v[0]) return def;
+    errno = 0;
+    unsigned long long x = strtoull(v, NULL, 0);
+    if (errno != 0) return def;
+    return (uint64_t)x;
 }
 
 static size_t env_size(const char *key, size_t def) {
@@ -1024,9 +1057,17 @@ static void drain_many(unsigned char *mm, const struct ring_info *ri, int *outst
             running = 0;
             return;
         } else {
-            struct timespec ts = {0, 500000};
-            nanosleep(&ts, NULL);
-            if (stage && stage->collect_cost) stage->cs.sleep_ns += 500000;
+            pause_ns(poll_spin_ns);
+            int r2 = drain_one(mm, ri, stage);
+            if (r2 > 0) {
+                (*outstanding)--;
+            } else if (r2 < 0) {
+                fprintf(stderr, "[!] ring_pop error while draining responses\n");
+                running = 0;
+                return;
+            } else {
+                bench_sleep_ns(poll_sleep_ns, stage ? &stage->cs : NULL, stage && stage->collect_cost);
+            }
         }
     }
 }
@@ -1060,9 +1101,18 @@ static void run_bench_internal(unsigned char *mm, const struct ring_info *ri, in
                 running = 0;
                 break;
             }
-            struct timespec ts = {0, 500000};
-            nanosleep(&ts, NULL);
-            if (collect_cost) set_stage.cs.sleep_ns += 500000;
+            pause_ns(poll_spin_ns);
+            pr = push_set(mm, ri, cid_set, i);
+            if (pr > 0) {
+                pushed = 1;
+                break;
+            }
+            if (pr < 0) {
+                fprintf(stderr, "[!] push_set failed (ring write error)\n");
+                running = 0;
+                break;
+            }
+            bench_sleep_ns(poll_sleep_ns, &set_stage.cs, collect_cost);
             set_stage.cs.push_retries++;
         }
         if (!running || !pushed) break;
@@ -1077,9 +1127,15 @@ static void run_bench_internal(unsigned char *mm, const struct ring_info *ri, in
                     running = 0;
                     break;
                 }
-                struct timespec ts = {0, 500000};
-                nanosleep(&ts, NULL);
-                if (collect_cost) set_stage.cs.sleep_ns += 500000;
+                pause_ns(poll_spin_ns);
+                dr = drain_one(mm, ri, &set_stage);
+                if (dr > 0) break;
+                if (dr < 0) {
+                    fprintf(stderr, "[!] ring_pop failed while waiting for SET response\n");
+                    running = 0;
+                    break;
+                }
+                bench_sleep_ns(poll_sleep_ns, &set_stage.cs, collect_cost);
             }
         }
     }
@@ -1102,9 +1158,18 @@ static void run_bench_internal(unsigned char *mm, const struct ring_info *ri, in
                 running = 0;
                 break;
             }
-            struct timespec ts = {0, 500000};
-            nanosleep(&ts, NULL);
-            if (collect_cost) get_stage.cs.sleep_ns += 500000;
+            pause_ns(poll_spin_ns);
+            pr = push_get(mm, ri, cid_get, i);
+            if (pr > 0) {
+                pushed = 1;
+                break;
+            }
+            if (pr < 0) {
+                fprintf(stderr, "[!] push_get failed (ring write error)\n");
+                running = 0;
+                break;
+            }
+            bench_sleep_ns(poll_sleep_ns, &get_stage.cs, collect_cost);
             get_stage.cs.push_retries++;
         }
         if (!running || !pushed) break;
@@ -1119,9 +1184,15 @@ static void run_bench_internal(unsigned char *mm, const struct ring_info *ri, in
                     running = 0;
                     break;
                 }
-                struct timespec ts = {0, 500000};
-                nanosleep(&ts, NULL);
-                if (collect_cost) get_stage.cs.sleep_ns += 500000;
+                pause_ns(poll_spin_ns);
+                dr = drain_one(mm, ri, &get_stage);
+                if (dr > 0) break;
+                if (dr < 0) {
+                    fprintf(stderr, "[!] ring_pop failed while waiting for GET response\n");
+                    running = 0;
+                    break;
+                }
+                bench_sleep_ns(poll_sleep_ns, &get_stage.cs, collect_cost);
             }
         }
     }
@@ -1349,6 +1420,8 @@ int main(int argc, char **argv) {
         unsigned long long v = strtoull(delay_env, NULL, 0);
         if (errno == 0) shm_delay_ns = (uint64_t)v;
     }
+    poll_spin_ns = env_u64("CXL_RING_POLL_SPIN_NS", poll_spin_ns);
+    poll_sleep_ns = env_u64("CXL_RING_POLL_SLEEP_NS", poll_sleep_ns);
     const char *offset_env = getenv("CXL_RING_OFFSET");
     if (!offset_env || !offset_env[0]) offset_env = getenv("CXL_SHM_OFFSET");
     if (offset_env && offset_env[0]) {
@@ -1386,7 +1459,9 @@ int main(int argc, char **argv) {
                    "Env:\n"
                    "  CXL_RING_COUNT        : number of rings/regions (default: 1)\n"
                    "  CXL_RING_REGION_SIZE  : bytes per ring region (default: 16M)\n"
-                   "  CXL_RING_REGION_BASE  : base offset within the mmap (default: 0)\n",
+                   "  CXL_RING_REGION_BASE  : base offset within the mmap (default: 0)\n"
+                   "  CXL_RING_POLL_SPIN_NS : spin-wait before sleeping when empty/full (default: 5000)\n"
+                   "  CXL_RING_POLL_SLEEP_NS: nanosleep after spinning when empty/full (default: 50000)\n",
                    argv[0]);
             return 0;
         }
@@ -1461,8 +1536,8 @@ int main(int argc, char **argv) {
     size_t region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
     size_t region_base = env_size("CXL_RING_REGION_BASE", 0);
 
-    printf("[*] tdx shm ring direct: path=%s map=%zu offset=%zu ring_count=%u region_base=%zu region_size=%zu slots=%u shm_delay_ns=%" PRIu64 "\n",
-           path, map_size, map_offset, lo.ring_count, region_base, region_size, lo.rings[ring_idx].slots, shm_delay_ns);
+    printf("[*] tdx shm ring direct: path=%s map=%zu offset=%zu ring_count=%u region_base=%zu region_size=%zu slots=%u shm_delay_ns=%" PRIu64 " poll_spin_ns=%" PRIu64 " poll_sleep_ns=%" PRIu64 "\n",
+           path, map_size, map_offset, lo.ring_count, region_base, region_size, lo.rings[ring_idx].slots, shm_delay_ns, poll_spin_ns, poll_sleep_ns);
 
     if (bench_n > 0) {
         run_bench(mm, &lo, bench_n, pipeline, threads, max_inflight, collect_latency, collect_cost, csv_path, label);
