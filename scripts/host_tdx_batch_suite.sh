@@ -33,7 +33,7 @@ RING_MAP_SIZE="${RING_MAP_SIZE:-4G}"
 
 YCSB_ENABLE="${YCSB_ENABLE:-0}"
 YCSB_WORKLOADS="${YCSB_WORKLOADS:-workloada,workloadb,workloadc,workloadd,workloade}"
-GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-bfs,sssp,pr,cc,bc}"
+GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-bfs,sssp,pr,cc,bc,tc}"
 
 IFS=',' read -r -a threads_arr <<< "${THREAD_LIST}"
 
