@@ -67,6 +67,7 @@ set -euo pipefail
 #
 # GAPBS tunables:
 #   GAPBS_KERNEL      : bfs|cc|pr|... (default: bfs)
+#   GAPBS_KERNEL_LIST : comma-separated kernels to run (overrides GAPBS_KERNEL), e.g. "bfs,sssp,pr,cc,bc,tc"
 #   SCALE             : -g scale for Kronecker graph (default: 22)
 #   DEGREE            : -k degree for synthetic graph (default: 16)
 #   TRIALS            : -n trials (default: 3)
@@ -144,16 +145,27 @@ REDIS_MAKE_JOBS="${REDIS_MAKE_JOBS:-2}"
 ULIMIT_NOFILE="${ULIMIT_NOFILE:-65535}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
 SEC_MGR_TIMEOUT_MS="${SEC_MGR_TIMEOUT_MS:-600000}"
-ENABLE_SECURE="${ENABLE_SECURE:-0}"
+ENABLE_SECURE="${ENABLE_SECURE:-1}"
 SODIUM_KEY_HEX="${SODIUM_KEY_HEX:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
 SODIUM_PORT="${SODIUM_PORT:-6380}"
 SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
 RING_SECURE_REGION_BASE="${RING_SECURE_REGION_BASE:-4096}"
 
+# YCSB (optional; runs inside VM2 against TCP endpoints)
+YCSB_ENABLE="${YCSB_ENABLE:-0}"
+YCSB_RECORDS="${YCSB_RECORDS:-100000}"
+YCSB_OPS="${YCSB_OPS:-100000}"
+YCSB_THREADS="${YCSB_THREADS:-4}"
+YCSB_TARGET="${YCSB_TARGET:-}"
+YCSB_WORKLOADS="${YCSB_WORKLOADS:-workloada}"
+YCSB_PASSWORD="${YCSB_PASSWORD:-}"
+YCSB_CLUSTER="${YCSB_CLUSTER:-false}"
+
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
+GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-}"
 SCALE="${SCALE:-22}"
 DEGREE="${DEGREE:-16}"
-TRIALS="${TRIALS:-3}"
+TRIALS="${TRIALS:-1}"
 OMP_THREADS="${OMP_THREADS:-4}"
 GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-2147483648}"
 GAPBS_CXL_MAP_OFFSET_VM1="${GAPBS_CXL_MAP_OFFSET_VM1:-0}"
@@ -187,7 +199,7 @@ if [[ -z "${TDX_BIOS}" ]]; then
 fi
 
 CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS:-}"
-CXL_SHM_DELAY_NS_DEFAULT="${CXL_SHM_DELAY_NS_DEFAULT:-150}"
+CXL_SHM_DELAY_NS_DEFAULT="${CXL_SHM_DELAY_NS_DEFAULT:-70}"
 
 host_numa_node_count() {
   local n=0
@@ -227,6 +239,27 @@ size_to_bytes() {
   fi
   return 1
 }
+
+# Normalize size-like inputs early so the rest of the script can safely use
+# numeric comparisons and pass byte counts to ring clients.
+if ! RING_MAP_SIZE_BYTES="$(size_to_bytes "${RING_MAP_SIZE}")"; then
+  echo "[!] Invalid RING_MAP_SIZE='${RING_MAP_SIZE}' (expected bytes or IEC like 4G)." >&2
+  exit 1
+fi
+RING_MAP_SIZE="${RING_MAP_SIZE_BYTES}"
+
+if [[ -n "${CXL_SIZE}" ]]; then
+  if ! CXL_SIZE_BYTES="$(size_to_bytes "${CXL_SIZE}")"; then
+    echo "[!] Invalid CXL_SIZE='${CXL_SIZE}' (expected bytes or IEC like 4G)." >&2
+    exit 1
+  fi
+  if [[ "${CXL_SIZE_BYTES}" -lt "${RING_MAP_SIZE}" ]]; then
+    echo "[!] Invalid config: CXL_SIZE(${CXL_SIZE}) < RING_MAP_SIZE(${RING_MAP_SIZE})." >&2
+    exit 1
+  fi
+else
+  CXL_SIZE="${RING_MAP_SIZE}"
+fi
 
 need_cmd() {
   local cmd="$1"
@@ -890,6 +923,9 @@ ssh_retry_lock ssh_vm1 "vm1 apt-get install deps" "sudo env DEBIAN_FRONTEND=noni
 
 ssh_retry_lock ssh_vm2 "vm2 apt-get update" "sudo env DEBIAN_FRONTEND=noninteractive apt-get update"
 ssh_retry_lock ssh_vm2 "vm2 apt-get install deps" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl lsb-release redis-tools net-tools tmux pciutils libsodium-dev pkg-config"
+if [[ "${YCSB_ENABLE}" == "1" ]]; then
+  ssh_retry_lock ssh_vm2 "vm2 apt-get install openjdk" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-11-jre-headless || sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jre-headless"
+fi
 
 echo "[*] Ensuring SSH service is running in guests ..."
 ssh_vm1 "sudo systemctl enable --now ssh.service >/dev/null 2>&1 || sudo systemctl enable --now sshd.service >/dev/null 2>&1 || true"
@@ -1069,24 +1105,6 @@ ring_secure_log="${RESULTS_DIR}/tdx_ring_secure_${ts}.log"
 ring_secure_csv="${RESULTS_DIR}/tdx_ring_secure_${ts}.csv"
 compare_csv="${RESULTS_DIR}/tdx_compare_${ts}.csv"
 
-gapbs_native_vm1_log="${RESULTS_DIR}/tdx_gapbs_native_vm1_${GAPBS_KERNEL}_${ts}.log"
-gapbs_native_vm2_log="${RESULTS_DIR}/tdx_gapbs_native_vm2_${GAPBS_KERNEL}_${ts}.log"
-
-gapbs_ring_pub_log="${RESULTS_DIR}/tdx_gapbs_ring_publish_${GAPBS_KERNEL}_${ts}.log"
-gapbs_ring_vm1_log="${RESULTS_DIR}/tdx_gapbs_ring_vm1_${GAPBS_KERNEL}_${ts}.log"
-gapbs_ring_vm2_log="${RESULTS_DIR}/tdx_gapbs_ring_vm2_${GAPBS_KERNEL}_${ts}.log"
-
-gapbs_crypto_pub_log="${RESULTS_DIR}/tdx_gapbs_crypto_publish_${GAPBS_KERNEL}_${ts}.log"
-gapbs_crypto_vm1_log="${RESULTS_DIR}/tdx_gapbs_crypto_vm1_${GAPBS_KERNEL}_${ts}.log"
-gapbs_crypto_vm2_log="${RESULTS_DIR}/tdx_gapbs_crypto_vm2_${GAPBS_KERNEL}_${ts}.log"
-
-gapbs_secure_mgr_log="${RESULTS_DIR}/tdx_gapbs_secure_mgr_${GAPBS_KERNEL}_${ts}.log"
-gapbs_secure_pub_log="${RESULTS_DIR}/tdx_gapbs_secure_publish_${GAPBS_KERNEL}_${ts}.log"
-gapbs_secure_vm1_log="${RESULTS_DIR}/tdx_gapbs_secure_vm1_${GAPBS_KERNEL}_${ts}.log"
-gapbs_secure_vm2_log="${RESULTS_DIR}/tdx_gapbs_secure_vm2_${GAPBS_KERNEL}_${ts}.log"
-
-gapbs_compare_csv="${RESULTS_DIR}/tdx_gapbs_compare_${GAPBS_KERNEL}_${ts}.csv"
-
 echo "[*] Internal VM network (cxl0):"
 ssh_vm1 "ip -brief addr show cxl0 2>/dev/null || true"
 ssh_vm2 "ip -brief addr show cxl0 2>/dev/null || true"
@@ -1167,6 +1185,18 @@ ssh_vm1 "for i in \$(seq 1 200); do redis-cli -p 6379 ping >/dev/null 2>&1 && ex
 ssh_vm2 "for i in \$(seq 1 200); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${native_log}"
 
+# Optional: run YCSB against native TCP endpoint
+if [[ "${YCSB_ENABLE}" == "1" ]]; then
+  echo "[*] YCSB: native TCP (VM2 -> VM1:${VMNET_VM1_IP}:6379)"
+  ycsb_args=("--host" "${VMNET_VM1_IP}" "--port" "6379" "--workloads" "${YCSB_WORKLOADS}" \
+             "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
+             "--threads" "${YCSB_THREADS}")
+  if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
+  if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
+  ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
+  ssh_vm2 "bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+fi
+
 echo "[*] Benchmark 2/8: native Redis over libsodium-encrypted TCP (tunnel)"
 ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
 ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
@@ -1184,6 +1214,18 @@ if ! ssh_vm2 "for i in \$(seq 1 600); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCA
 fi
 
 ssh_vm2 "redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${sodium_log}"
+
+# Optional: run YCSB against libsodium-encrypted TCP tunnel
+if [[ "${YCSB_ENABLE}" == "1" ]]; then
+  echo "[*] YCSB: sodium TCP (VM2 127.0.0.1:${SODIUM_LOCAL_PORT} -> VM1 ${VMNET_VM1_IP}:${SODIUM_PORT})"
+  ycsb_args=("--host" "127.0.0.1" "--port" "${SODIUM_LOCAL_PORT}" "--workloads" "${YCSB_WORKLOADS}" \
+             "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
+             "--threads" "${YCSB_THREADS}")
+  if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
+  if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
+  ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
+  ssh_vm2 "bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+fi
 
 ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
@@ -1235,6 +1277,18 @@ ssh_vm2 "cat /tmp/${ring_label}.csv" > "${ring_csv}"
 ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
 ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 
+# Optional: run YCSB against ring via local RESP proxy inside VM2
+if [[ "${YCSB_ENABLE}" == "1" ]]; then
+  echo "[*] YCSB: ring via RESP proxy (VM2 127.0.0.1:6381 -> ring BAR2)"
+  ycsb_args=("--host" "127.0.0.1" "--port" "6381" "--workloads" "${YCSB_WORKLOADS}" \
+             "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
+             "--threads" "${YCSB_THREADS}")
+  if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
+  if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
+  ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
+  ssh_vm2 "RING_RESP_PROXY=1 RING_PATH=${RING_PATH_VM2} RING_MAP_SIZE=${RING_MAP_SIZE} RING_MAP_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} RING_RESP_LISTEN=127.0.0.1:6381 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+fi
+
 RUN_SECURE=0
 if [[ "${ENABLE_SECURE}" == "1" ]]; then
   echo "[*] Benchmark 4/8: secure ring Redis (ACL + software crypto via cxl_sec_mgr)"
@@ -1253,8 +1307,20 @@ if [[ "${ENABLE_SECURE}" == "1" ]]; then
 
   ring_secure_label="tdx_ring_secure_${ts}"
   ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
-  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --sec-timeout-ms ${SEC_MGR_TIMEOUT_MS} --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
-  ssh_vm2 "cat /tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
+ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --sec-timeout-ms ${SEC_MGR_TIMEOUT_MS} --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
+ssh_vm2 "cat /tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
+
+# Optional: run YCSB against secure ring via local RESP proxy inside VM2
+if [[ "${YCSB_ENABLE}" == "1" ]]; then
+  echo "[*] YCSB: secure ring via RESP proxy (VM2 127.0.0.1:6382 -> ring BAR2)"
+  ycsb_args=("--host" "127.0.0.1" "--port" "6382" "--workloads" "${YCSB_WORKLOADS}" \
+             "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
+             "--threads" "${YCSB_THREADS}")
+  if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
+  if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
+  ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
+  ssh_vm2 "RING_RESP_PROXY=1 RING_RESP_SECURE=1 RING_RESP_SEC_MGR=${VMNET_VM1_IP}:${SEC_MGR_PORT} RING_RESP_SEC_NODE_ID=2 RING_RESP_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} RING_PATH=${RING_PATH_VM2} RING_MAP_SIZE=${RING_MAP_SIZE} RING_MAP_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} RING_RESP_LISTEN=127.0.0.1:6382 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+fi
 
   ssh_vm1 "tmux kill-session -t redis_ring_tdx_secure >/dev/null 2>&1 || true"
   ssh_vm1 "tmux kill-session -t cxl_sec_mgr_ring_tdx >/dev/null 2>&1 || true"
@@ -1290,117 +1356,6 @@ fi
     echo "TDXRingSecure,GET,${ring_secure_get}"
   fi
 } > "${compare_csv}"
-
-echo "[*] Benchmark 5/8: GAPBS native in vm1"
-ssh_vm1 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' ./'${GAPBS_KERNEL}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
-  | tee "${gapbs_native_vm1_log}"
-
-echo "[*] Benchmark 5/8: GAPBS native in vm2"
-ssh_vm2 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' ./'${GAPBS_KERNEL}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
-  | tee "${gapbs_native_vm2_log}"
-
-echo "[*] Benchmark 6/8: GAPBS multihost ring publish in vm1"
-ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 ./'${GAPBS_KERNEL}-ring' -g '${SCALE}' -k '${DEGREE}' -n 1" \
-  | tee "${gapbs_ring_pub_log}"
-
-echo "[*] Benchmark 6/8: GAPBS multihost ring attach+run in vm1+vm2 (concurrent)"
-(
-  ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach ./'${GAPBS_KERNEL}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
-    >"${gapbs_ring_vm1_log}" 2>&1
-) &
-pid_gapbs_ring_vm1=$!
-
-(
-  ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach ./'${GAPBS_KERNEL}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
-    >"${gapbs_ring_vm2_log}" 2>&1
-) &
-pid_gapbs_ring_vm2=$!
-
-wait "${pid_gapbs_ring_vm1}"
-wait "${pid_gapbs_ring_vm2}"
-
-if [[ "${ENABLE_SECURE}" == "1" ]]; then
-crypto_key_vm1_hex="$(openssl rand -hex 32)"
-crypto_key_vm2_hex="$(openssl rand -hex 32)"
-crypto_key_common_hex="$(openssl rand -hex 32)"
-
-echo "[*] Benchmark 7/8: GAPBS multihost crypto publish in vm1 (libsodium; per-VM key + common key; no mgr)"
-ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
-  | tee "${gapbs_crypto_pub_log}"
-
-echo "[*] Benchmark 7/8: GAPBS multihost crypto attach+run in vm1+vm2 (concurrent)"
-(
-  ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
-    >"${gapbs_crypto_vm1_log}" 2>&1
-) &
-pid_gapbs_crypto_vm1=$!
-
-(
-  ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX='${crypto_key_vm2_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
-    >"${gapbs_crypto_vm2_log}" 2>&1
-) &
-pid_gapbs_crypto_vm2=$!
-
-wait "${pid_gapbs_crypto_vm1}"
-wait "${pid_gapbs_crypto_vm2}"
-
-echo "[*] Benchmark 8/8: GAPBS multihost secure publish in vm1 (ACL/key table via cxl_sec_mgr)"
-# Ensure the security manager doesn't latch onto an older valid header (resource2 may reject write(2); use mmap).
-ssh_vm1 "sudo -n env CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} python3 -c 'import mmap, os; off=int(os.environ.get(\"CXL_RING_OFFSET\", \"0\"), 0); fd=os.open(\"${RING_PATH_VM1}\", os.O_RDWR); m=mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off); m[:] = b\"\\0\"*4096; m.flush(); m.close(); os.close(fd)'"
-
-gapbs_sec_mgr_remote="/tmp/cxl_sec_mgr_gapbs_tdx_${ts}.log"
-gapbs_sec_mgr_pid="$(ssh_vm1 "sudo -n bash -lc 'CXL_RING_OFFSET=${GAPBS_CXL_MAP_OFFSET_VM1} nohup /tmp/cxl_sec_mgr --ring ${RING_PATH_VM1} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${GAPBS_CXL_MAP_SIZE} --timeout-ms ${SEC_MGR_TIMEOUT_MS} >${gapbs_sec_mgr_remote} 2>&1 & echo \$!'" | tr -d '\r')"
-if [[ -z "${gapbs_sec_mgr_pid}" || ! "${gapbs_sec_mgr_pid}" =~ ^[0-9]+$ ]]; then
-  echo "[!] Failed to start cxl_sec_mgr (GAPBS) in vm1 (pid='${gapbs_sec_mgr_pid}')." >&2
-  ssh_vm1 "sudo -n tail -n 200 '${gapbs_sec_mgr_remote}'" >&2 || true
-  exit 1
-fi
-
-echo "[*] Waiting for cxl_sec_mgr (GAPBS) on vm1 to accept connections (port ${SEC_MGR_PORT}) ..."
-ssh_vm1 "sudo -n bash -lc '
-set -e
-for _ in {1..300}; do
-  if ! kill -0 \"${gapbs_sec_mgr_pid}\" 2>/dev/null; then
-    echo \"[!] cxl_sec_mgr exited (pid=${gapbs_sec_mgr_pid})\" >&2
-    tail -n 200 \"${gapbs_sec_mgr_remote}\" >&2 || true
-    exit 1
-  fi
-  if command -v ss >/dev/null 2>&1; then
-    ss -H -ltn sport = :${SEC_MGR_PORT} 2>/dev/null | grep -q . && exit 0
-  elif (echo > /dev/tcp/127.0.0.1/${SEC_MGR_PORT}) >/dev/null 2>&1; then
-    exit 0
-  fi
-  sleep 0.1
-done
-echo \"[!] timeout waiting for cxl_sec_mgr on :${SEC_MGR_PORT}\" >&2
-tail -n 200 \"${gapbs_sec_mgr_remote}\" >&2 || true
-exit 1
-'"
-
-ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
-  | tee "${gapbs_secure_pub_log}"
-
-echo "[*] Benchmark 8/8: GAPBS multihost secure attach+run in vm1+vm2 (concurrent)"
-(
-  ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
-    >"${gapbs_secure_vm1_log}" 2>&1
-) &
-pid_gapbs_secure_vm1=$!
-
-(
-  ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${VMNET_VM1_IP}:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=2 ./'${GAPBS_KERNEL}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
-    >"${gapbs_secure_vm2_log}" 2>&1
-) &
-pid_gapbs_secure_vm2=$!
-
-wait "${pid_gapbs_secure_vm1}"
-wait "${pid_gapbs_secure_vm2}"
-
-ssh_vm1 "sudo -n cat '${gapbs_sec_mgr_remote}'" | tee "${gapbs_secure_mgr_log}" || true
-ssh_vm1 "sudo -n kill ${gapbs_sec_mgr_pid} >/dev/null 2>&1 || true"
-else
-  echo "[*] Skipping GAPBS secure/crypto (ENABLE_SECURE=0)"
-fi
 
 avg_from_log() {
   local log="$1"
@@ -1478,65 +1433,219 @@ avg2_int() {
   }'
 }
 
-gapbs_native_vm1_avg="$(avg_from_log "${gapbs_native_vm1_log}")"
-gapbs_native_vm2_avg="$(avg_from_log "${gapbs_native_vm2_log}")"
-gapbs_ring_vm1_avg="$(avg_from_log "${gapbs_ring_vm1_log}")"
-gapbs_ring_vm2_avg="$(avg_from_log "${gapbs_ring_vm2_log}")"
-gapbs_crypto_vm1_avg="$(avg_from_log "${gapbs_crypto_vm1_log}")"
-gapbs_crypto_vm2_avg="$(avg_from_log "${gapbs_crypto_vm2_log}")"
-gapbs_secure_vm1_avg="$(avg_from_log "${gapbs_secure_vm1_log}")"
-gapbs_secure_vm2_avg="$(avg_from_log "${gapbs_secure_vm2_log}")"
-
-gapbs_native_vm1_edges="$(edges_for_teps_from_log "${gapbs_native_vm1_log}")"
-gapbs_native_vm2_edges="$(edges_for_teps_from_log "${gapbs_native_vm2_log}")"
-gapbs_ring_vm1_edges="$(edges_for_teps_from_log "${gapbs_ring_vm1_log}")"
-gapbs_ring_vm2_edges="$(edges_for_teps_from_log "${gapbs_ring_vm2_log}")"
-gapbs_crypto_vm1_edges="$(edges_for_teps_from_log "${gapbs_crypto_vm1_log}")"
-gapbs_crypto_vm2_edges="$(edges_for_teps_from_log "${gapbs_crypto_vm2_log}")"
-gapbs_secure_vm1_edges="$(edges_for_teps_from_log "${gapbs_secure_vm1_log}")"
-gapbs_secure_vm2_edges="$(edges_for_teps_from_log "${gapbs_secure_vm2_log}")"
-
-gapbs_native_vm1_teps="$(teps_from_edges_time "${gapbs_native_vm1_edges}" "${gapbs_native_vm1_avg}")"
-gapbs_native_vm2_teps="$(teps_from_edges_time "${gapbs_native_vm2_edges}" "${gapbs_native_vm2_avg}")"
-gapbs_ring_vm1_teps="$(teps_from_edges_time "${gapbs_ring_vm1_edges}" "${gapbs_ring_vm1_avg}")"
-gapbs_ring_vm2_teps="$(teps_from_edges_time "${gapbs_ring_vm2_edges}" "${gapbs_ring_vm2_avg}")"
-gapbs_crypto_vm1_teps="$(teps_from_edges_time "${gapbs_crypto_vm1_edges}" "${gapbs_crypto_vm1_avg}")"
-gapbs_crypto_vm2_teps="$(teps_from_edges_time "${gapbs_crypto_vm2_edges}" "${gapbs_crypto_vm2_avg}")"
-gapbs_secure_vm1_teps="$(teps_from_edges_time "${gapbs_secure_vm1_edges}" "${gapbs_secure_vm1_avg}")"
-gapbs_secure_vm2_teps="$(teps_from_edges_time "${gapbs_secure_vm2_edges}" "${gapbs_secure_vm2_avg}")"
-
-gapbs_native_avg_edges="$(pick_nonempty "${gapbs_native_vm1_edges}" "${gapbs_native_vm2_edges}")"
-gapbs_ring_avg_edges="$(pick_nonempty "${gapbs_ring_vm1_edges}" "${gapbs_ring_vm2_edges}")"
-gapbs_crypto_avg_edges="$(pick_nonempty "${gapbs_crypto_vm1_edges}" "${gapbs_crypto_vm2_edges}")"
-gapbs_secure_avg_edges="$(pick_nonempty "${gapbs_secure_vm1_edges}" "${gapbs_secure_vm2_edges}")"
-
-gapbs_native_avg_time="$(avg2_float "${gapbs_native_vm1_avg}" "${gapbs_native_vm2_avg}")"
-gapbs_ring_avg_time="$(avg2_float "${gapbs_ring_vm1_avg}" "${gapbs_ring_vm2_avg}")"
-gapbs_crypto_avg_time="$(avg2_float "${gapbs_crypto_vm1_avg}" "${gapbs_crypto_vm2_avg}")"
-gapbs_secure_avg_time="$(avg2_float "${gapbs_secure_vm1_avg}" "${gapbs_secure_vm2_avg}")"
-
-gapbs_native_avg_teps="$(avg2_int "${gapbs_native_vm1_teps}" "${gapbs_native_vm2_teps}")"
-gapbs_ring_avg_teps="$(avg2_int "${gapbs_ring_vm1_teps}" "${gapbs_ring_vm2_teps}")"
-gapbs_crypto_avg_teps="$(avg2_int "${gapbs_crypto_vm1_teps}" "${gapbs_crypto_vm2_teps}")"
-gapbs_secure_avg_teps="$(avg2_int "${gapbs_secure_vm1_teps}" "${gapbs_secure_vm2_teps}")"
-
-{
-  echo "label,vm,kernel,scale,degree,trials,omp_threads,edge_traversals,avg_time_s,throughput_teps"
-  echo "TDXGapbsNative,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_vm1_edges},${gapbs_native_vm1_avg},${gapbs_native_vm1_teps}"
-  echo "TDXGapbsNative,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_vm2_edges},${gapbs_native_vm2_avg},${gapbs_native_vm2_teps}"
-  echo "TDXGapbsNative,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_avg_edges},${gapbs_native_avg_time},${gapbs_native_avg_teps}"
-  echo "TDXGapbsMultihostRing,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm1_edges},${gapbs_ring_vm1_avg},${gapbs_ring_vm1_teps}"
-  echo "TDXGapbsMultihostRing,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm2_edges},${gapbs_ring_vm2_avg},${gapbs_ring_vm2_teps}"
-  echo "TDXGapbsMultihostRing,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_avg_edges},${gapbs_ring_avg_time},${gapbs_ring_avg_teps}"
-  if [[ "${ENABLE_SECURE}" == "1" ]]; then
-    echo "TDXGapbsMultihostCrypto,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm1_edges},${gapbs_crypto_vm1_avg},${gapbs_crypto_vm1_teps}"
-    echo "TDXGapbsMultihostCrypto,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm2_edges},${gapbs_crypto_vm2_avg},${gapbs_crypto_vm2_teps}"
-    echo "TDXGapbsMultihostCrypto,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_avg_edges},${gapbs_crypto_avg_time},${gapbs_crypto_avg_teps}"
-    echo "TDXGapbsMultihostSecure,vm1,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm1_edges},${gapbs_secure_vm1_avg},${gapbs_secure_vm1_teps}"
-    echo "TDXGapbsMultihostSecure,vm2,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm2_edges},${gapbs_secure_vm2_avg},${gapbs_secure_vm2_teps}"
-    echo "TDXGapbsMultihostSecure,avg,${GAPBS_KERNEL},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_avg_edges},${gapbs_secure_avg_time},${gapbs_secure_avg_teps}"
+run_gapbs_kernel() {
+  local kernel="$1"
+  if [[ -z "${kernel}" ]]; then
+    return 0
   fi
-} > "${gapbs_compare_csv}"
+
+  local gapbs_native_vm1_log="${RESULTS_DIR}/tdx_gapbs_native_vm1_${kernel}_${ts}.log"
+  local gapbs_native_vm2_log="${RESULTS_DIR}/tdx_gapbs_native_vm2_${kernel}_${ts}.log"
+
+  local gapbs_ring_pub_log="${RESULTS_DIR}/tdx_gapbs_ring_publish_${kernel}_${ts}.log"
+  local gapbs_ring_vm1_log="${RESULTS_DIR}/tdx_gapbs_ring_vm1_${kernel}_${ts}.log"
+  local gapbs_ring_vm2_log="${RESULTS_DIR}/tdx_gapbs_ring_vm2_${kernel}_${ts}.log"
+
+  local gapbs_crypto_pub_log="${RESULTS_DIR}/tdx_gapbs_crypto_publish_${kernel}_${ts}.log"
+  local gapbs_crypto_vm1_log="${RESULTS_DIR}/tdx_gapbs_crypto_vm1_${kernel}_${ts}.log"
+  local gapbs_crypto_vm2_log="${RESULTS_DIR}/tdx_gapbs_crypto_vm2_${kernel}_${ts}.log"
+
+  local gapbs_secure_mgr_log="${RESULTS_DIR}/tdx_gapbs_secure_mgr_${kernel}_${ts}.log"
+  local gapbs_secure_pub_log="${RESULTS_DIR}/tdx_gapbs_secure_publish_${kernel}_${ts}.log"
+  local gapbs_secure_vm1_log="${RESULTS_DIR}/tdx_gapbs_secure_vm1_${kernel}_${ts}.log"
+  local gapbs_secure_vm2_log="${RESULTS_DIR}/tdx_gapbs_secure_vm2_${kernel}_${ts}.log"
+
+  local gapbs_compare_csv="${RESULTS_DIR}/tdx_gapbs_compare_${kernel}_${ts}.csv"
+
+  echo "[*] GAPBS kernel=${kernel}: native in vm1"
+  ssh_vm1 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' ./'${kernel}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+    | tee "${gapbs_native_vm1_log}"
+
+  echo "[*] GAPBS kernel=${kernel}: native in vm2"
+  ssh_vm2 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' ./'${kernel}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+    | tee "${gapbs_native_vm2_log}"
+
+  echo "[*] GAPBS kernel=${kernel}: multihost ring publish in vm1"
+  ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+    | tee "${gapbs_ring_pub_log}"
+
+  echo "[*] GAPBS kernel=${kernel}: multihost ring attach+run in vm1+vm2 (concurrent)"
+  (
+    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+      >"${gapbs_ring_vm1_log}" 2>&1
+  ) &
+  local pid_gapbs_ring_vm1=$!
+
+  (
+    ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+      >"${gapbs_ring_vm2_log}" 2>&1
+  ) &
+  local pid_gapbs_ring_vm2=$!
+
+  wait "${pid_gapbs_ring_vm1}"
+  wait "${pid_gapbs_ring_vm2}"
+
+  if [[ "${ENABLE_SECURE}" == "1" ]]; then
+    local crypto_key_vm1_hex crypto_key_vm2_hex crypto_key_common_hex
+    crypto_key_vm1_hex="$(openssl rand -hex 32)"
+    crypto_key_vm2_hex="$(openssl rand -hex 32)"
+    crypto_key_common_hex="$(openssl rand -hex 32)"
+
+    echo "[*] GAPBS kernel=${kernel}: multihost crypto publish in vm1 (libsodium; no mgr)"
+    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+      | tee "${gapbs_crypto_pub_log}"
+
+    echo "[*] GAPBS kernel=${kernel}: multihost crypto attach+run in vm1+vm2 (concurrent)"
+    (
+      ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+        >"${gapbs_crypto_vm1_log}" 2>&1
+    ) &
+    local pid_gapbs_crypto_vm1=$!
+
+    (
+      ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX='${crypto_key_vm2_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+        >"${gapbs_crypto_vm2_log}" 2>&1
+    ) &
+    local pid_gapbs_crypto_vm2=$!
+
+    wait "${pid_gapbs_crypto_vm1}"
+    wait "${pid_gapbs_crypto_vm2}"
+
+    echo "[*] GAPBS kernel=${kernel}: multihost secure publish in vm1 (ACL/key table via cxl_sec_mgr)"
+    ssh_vm1 "sudo -n env CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} python3 -c 'import mmap, os; off=int(os.environ.get(\"CXL_RING_OFFSET\", \"0\"), 0); fd=os.open(\"${RING_PATH_VM1}\", os.O_RDWR); m=mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off); m[:] = b\"\\0\"*4096; m.flush(); m.close(); os.close(fd)'"
+
+    local gapbs_sec_mgr_remote="/tmp/cxl_sec_mgr_gapbs_tdx_${kernel}_${ts}.log"
+    local gapbs_sec_mgr_pid
+    gapbs_sec_mgr_pid="$(ssh_vm1 "sudo -n bash -lc 'CXL_RING_OFFSET=${GAPBS_CXL_MAP_OFFSET_VM1} nohup /tmp/cxl_sec_mgr --ring ${RING_PATH_VM1} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${GAPBS_CXL_MAP_SIZE} --timeout-ms ${SEC_MGR_TIMEOUT_MS} >${gapbs_sec_mgr_remote} 2>&1 & echo \$!'" | tr -d '\r')"
+    if [[ -z "${gapbs_sec_mgr_pid}" || ! "${gapbs_sec_mgr_pid}" =~ ^[0-9]+$ ]]; then
+      echo "[!] Failed to start cxl_sec_mgr (GAPBS) in vm1 (pid='${gapbs_sec_mgr_pid}')." >&2
+      ssh_vm1 "sudo -n tail -n 200 '${gapbs_sec_mgr_remote}'" >&2 || true
+      exit 1
+    fi
+
+    echo "[*] Waiting for cxl_sec_mgr (GAPBS) on vm1 to accept connections (port ${SEC_MGR_PORT}) ..."
+    ssh_vm1 "sudo -n bash -lc '
+set -e
+for _ in {1..300}; do
+  if ! kill -0 \"${gapbs_sec_mgr_pid}\" 2>/dev/null; then
+    echo \"[!] cxl_sec_mgr exited (pid=${gapbs_sec_mgr_pid})\" >&2
+    tail -n 200 \"${gapbs_sec_mgr_remote}\" >&2 || true
+    exit 1
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn sport = :${SEC_MGR_PORT} 2>/dev/null | grep -q . && exit 0
+  elif (echo > /dev/tcp/127.0.0.1/${SEC_MGR_PORT}) >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 0.1
+done
+echo \"[!] timeout waiting for cxl_sec_mgr on :${SEC_MGR_PORT}\" >&2
+tail -n 200 \"${gapbs_sec_mgr_remote}\" >&2 || true
+exit 1
+'"
+
+    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+      | tee "${gapbs_secure_pub_log}"
+
+    echo "[*] GAPBS kernel=${kernel}: multihost secure attach+run in vm1+vm2 (concurrent)"
+    (
+      ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+        >"${gapbs_secure_vm1_log}" 2>&1
+    ) &
+    local pid_gapbs_secure_vm1=$!
+
+    (
+      ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${VMNET_VM1_IP}:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=2 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+        >"${gapbs_secure_vm2_log}" 2>&1
+    ) &
+    local pid_gapbs_secure_vm2=$!
+
+    wait "${pid_gapbs_secure_vm1}"
+    wait "${pid_gapbs_secure_vm2}"
+
+    ssh_vm1 "sudo -n cat '${gapbs_sec_mgr_remote}'" | tee "${gapbs_secure_mgr_log}" || true
+    ssh_vm1 "sudo -n kill ${gapbs_sec_mgr_pid} >/dev/null 2>&1 || true"
+  fi
+
+  local gapbs_native_vm1_avg gapbs_native_vm2_avg gapbs_ring_vm1_avg gapbs_ring_vm2_avg gapbs_crypto_vm1_avg gapbs_crypto_vm2_avg gapbs_secure_vm1_avg gapbs_secure_vm2_avg
+  gapbs_native_vm1_avg="$(avg_from_log "${gapbs_native_vm1_log}")"
+  gapbs_native_vm2_avg="$(avg_from_log "${gapbs_native_vm2_log}")"
+  gapbs_ring_vm1_avg="$(avg_from_log "${gapbs_ring_vm1_log}")"
+  gapbs_ring_vm2_avg="$(avg_from_log "${gapbs_ring_vm2_log}")"
+  gapbs_crypto_vm1_avg="$(avg_from_log "${gapbs_crypto_vm1_log}")"
+  gapbs_crypto_vm2_avg="$(avg_from_log "${gapbs_crypto_vm2_log}")"
+  gapbs_secure_vm1_avg="$(avg_from_log "${gapbs_secure_vm1_log}")"
+  gapbs_secure_vm2_avg="$(avg_from_log "${gapbs_secure_vm2_log}")"
+
+  local gapbs_native_vm1_edges gapbs_native_vm2_edges gapbs_ring_vm1_edges gapbs_ring_vm2_edges gapbs_crypto_vm1_edges gapbs_crypto_vm2_edges gapbs_secure_vm1_edges gapbs_secure_vm2_edges
+  gapbs_native_vm1_edges="$(edges_for_teps_from_log "${gapbs_native_vm1_log}")"
+  gapbs_native_vm2_edges="$(edges_for_teps_from_log "${gapbs_native_vm2_log}")"
+  gapbs_ring_vm1_edges="$(edges_for_teps_from_log "${gapbs_ring_vm1_log}")"
+  gapbs_ring_vm2_edges="$(edges_for_teps_from_log "${gapbs_ring_vm2_log}")"
+  gapbs_crypto_vm1_edges="$(edges_for_teps_from_log "${gapbs_crypto_vm1_log}")"
+  gapbs_crypto_vm2_edges="$(edges_for_teps_from_log "${gapbs_crypto_vm2_log}")"
+  gapbs_secure_vm1_edges="$(edges_for_teps_from_log "${gapbs_secure_vm1_log}")"
+  gapbs_secure_vm2_edges="$(edges_for_teps_from_log "${gapbs_secure_vm2_log}")"
+
+  local gapbs_native_vm1_teps gapbs_native_vm2_teps gapbs_ring_vm1_teps gapbs_ring_vm2_teps gapbs_crypto_vm1_teps gapbs_crypto_vm2_teps gapbs_secure_vm1_teps gapbs_secure_vm2_teps
+  gapbs_native_vm1_teps="$(teps_from_edges_time "${gapbs_native_vm1_edges}" "${gapbs_native_vm1_avg}")"
+  gapbs_native_vm2_teps="$(teps_from_edges_time "${gapbs_native_vm2_edges}" "${gapbs_native_vm2_avg}")"
+  gapbs_ring_vm1_teps="$(teps_from_edges_time "${gapbs_ring_vm1_edges}" "${gapbs_ring_vm1_avg}")"
+  gapbs_ring_vm2_teps="$(teps_from_edges_time "${gapbs_ring_vm2_edges}" "${gapbs_ring_vm2_avg}")"
+  gapbs_crypto_vm1_teps="$(teps_from_edges_time "${gapbs_crypto_vm1_edges}" "${gapbs_crypto_vm1_avg}")"
+  gapbs_crypto_vm2_teps="$(teps_from_edges_time "${gapbs_crypto_vm2_edges}" "${gapbs_crypto_vm2_avg}")"
+  gapbs_secure_vm1_teps="$(teps_from_edges_time "${gapbs_secure_vm1_edges}" "${gapbs_secure_vm1_avg}")"
+  gapbs_secure_vm2_teps="$(teps_from_edges_time "${gapbs_secure_vm2_edges}" "${gapbs_secure_vm2_avg}")"
+
+  local gapbs_native_avg_edges gapbs_ring_avg_edges gapbs_crypto_avg_edges gapbs_secure_avg_edges
+  gapbs_native_avg_edges="$(pick_nonempty "${gapbs_native_vm1_edges}" "${gapbs_native_vm2_edges}")"
+  gapbs_ring_avg_edges="$(pick_nonempty "${gapbs_ring_vm1_edges}" "${gapbs_ring_vm2_edges}")"
+  gapbs_crypto_avg_edges="$(pick_nonempty "${gapbs_crypto_vm1_edges}" "${gapbs_crypto_vm2_edges}")"
+  gapbs_secure_avg_edges="$(pick_nonempty "${gapbs_secure_vm1_edges}" "${gapbs_secure_vm2_edges}")"
+
+  local gapbs_native_avg_time gapbs_ring_avg_time gapbs_crypto_avg_time gapbs_secure_avg_time
+  gapbs_native_avg_time="$(avg2_float "${gapbs_native_vm1_avg}" "${gapbs_native_vm2_avg}")"
+  gapbs_ring_avg_time="$(avg2_float "${gapbs_ring_vm1_avg}" "${gapbs_ring_vm2_avg}")"
+  gapbs_crypto_avg_time="$(avg2_float "${gapbs_crypto_vm1_avg}" "${gapbs_crypto_vm2_avg}")"
+  gapbs_secure_avg_time="$(avg2_float "${gapbs_secure_vm1_avg}" "${gapbs_secure_vm2_avg}")"
+
+  local gapbs_native_avg_teps gapbs_ring_avg_teps gapbs_crypto_avg_teps gapbs_secure_avg_teps
+  gapbs_native_avg_teps="$(avg2_int "${gapbs_native_vm1_teps}" "${gapbs_native_vm2_teps}")"
+  gapbs_ring_avg_teps="$(avg2_int "${gapbs_ring_vm1_teps}" "${gapbs_ring_vm2_teps}")"
+  gapbs_crypto_avg_teps="$(avg2_int "${gapbs_crypto_vm1_teps}" "${gapbs_crypto_vm2_teps}")"
+  gapbs_secure_avg_teps="$(avg2_int "${gapbs_secure_vm1_teps}" "${gapbs_secure_vm2_teps}")"
+
+  {
+    echo "label,vm,kernel,scale,degree,trials,omp_threads,edge_traversals,avg_time_s,throughput_teps"
+    echo "TDXGapbsNative,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_vm1_edges},${gapbs_native_vm1_avg},${gapbs_native_vm1_teps}"
+    echo "TDXGapbsNative,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_vm2_edges},${gapbs_native_vm2_avg},${gapbs_native_vm2_teps}"
+    echo "TDXGapbsNative,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_avg_edges},${gapbs_native_avg_time},${gapbs_native_avg_teps}"
+    echo "TDXGapbsMultihostRing,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm1_edges},${gapbs_ring_vm1_avg},${gapbs_ring_vm1_teps}"
+    echo "TDXGapbsMultihostRing,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm2_edges},${gapbs_ring_vm2_avg},${gapbs_ring_vm2_teps}"
+    echo "TDXGapbsMultihostRing,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_avg_edges},${gapbs_ring_avg_time},${gapbs_ring_avg_teps}"
+    if [[ "${ENABLE_SECURE}" == "1" ]]; then
+      echo "TDXGapbsMultihostCrypto,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm1_edges},${gapbs_crypto_vm1_avg},${gapbs_crypto_vm1_teps}"
+      echo "TDXGapbsMultihostCrypto,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm2_edges},${gapbs_crypto_vm2_avg},${gapbs_crypto_vm2_teps}"
+      echo "TDXGapbsMultihostCrypto,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_avg_edges},${gapbs_crypto_avg_time},${gapbs_crypto_avg_teps}"
+      echo "TDXGapbsMultihostSecure,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm1_edges},${gapbs_secure_vm1_avg},${gapbs_secure_vm1_teps}"
+      echo "TDXGapbsMultihostSecure,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm2_edges},${gapbs_secure_vm2_avg},${gapbs_secure_vm2_teps}"
+      echo "TDXGapbsMultihostSecure,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_avg_edges},${gapbs_secure_avg_time},${gapbs_secure_avg_teps}"
+    fi
+  } > "${gapbs_compare_csv}"
+
+  echo "[*] GAPBS kernel=${kernel}: saved ${gapbs_compare_csv}"
+}
+
+gapbs_kernels=( )
+if [[ -n "${GAPBS_KERNEL_LIST}" ]]; then
+  IFS=',' read -r -a gapbs_kernels <<< "${GAPBS_KERNEL_LIST}"
+else
+  gapbs_kernels=("${GAPBS_KERNEL}")
+fi
+
+for k in "${gapbs_kernels[@]}"; do
+  run_gapbs_kernel "${k}"
+done
 
 echo "[+] Done."
 echo "    ${native_log}"
@@ -1546,16 +1655,4 @@ echo "    ${ring_csv}"
 echo "    ${ring_secure_log}"
 echo "    ${ring_secure_csv}"
 echo "    ${compare_csv}"
-echo "    ${gapbs_native_vm1_log}"
-echo "    ${gapbs_native_vm2_log}"
-echo "    ${gapbs_ring_pub_log}"
-echo "    ${gapbs_ring_vm1_log}"
-echo "    ${gapbs_ring_vm2_log}"
-echo "    ${gapbs_crypto_pub_log}"
-echo "    ${gapbs_crypto_vm1_log}"
-echo "    ${gapbs_crypto_vm2_log}"
-echo "    ${gapbs_secure_mgr_log}"
-echo "    ${gapbs_secure_pub_log}"
-echo "    ${gapbs_secure_vm1_log}"
-echo "    ${gapbs_secure_vm2_log}"
-echo "    ${gapbs_compare_csv}"
+echo "    GAPBS CSVs: ${RESULTS_DIR}/tdx_gapbs_compare_*_${ts}.csv"

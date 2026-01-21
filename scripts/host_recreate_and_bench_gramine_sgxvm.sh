@@ -68,6 +68,16 @@ SODIUM_PORT="${SODIUM_PORT:-6380}"
 SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
 
+# YCSB (optional; runs inside VM2 against TCP endpoints)
+YCSB_ENABLE="${YCSB_ENABLE:-0}"
+YCSB_RECORDS="${YCSB_RECORDS:-100000}"
+YCSB_OPS="${YCSB_OPS:-100000}"
+YCSB_THREADS="${YCSB_THREADS:-4}"
+YCSB_TARGET="${YCSB_TARGET:-}"
+YCSB_WORKLOADS="${YCSB_WORKLOADS:-workloada}"
+YCSB_PASSWORD="${YCSB_PASSWORD:-}"
+YCSB_CLUSTER="${YCSB_CLUSTER:-false}"
+
 VM1_SGX_EPC_SIZE="${VM1_SGX_EPC_SIZE:-512M}"
 SGX_TOKEN_MODE="${SGX_TOKEN_MODE:-auto}"
 
@@ -270,6 +280,18 @@ ssh_vm1 "tmux new-session -d -s redis_plain_sgxvm \"redis-server /mnt/hostshare/
 ssh_vm1 "for i in \$(seq 1 200); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'redis-server not ready' >&2; tail -n 200 /tmp/redis_plain_sgxvm.log >&2 || true; exit 1"
 ssh_vm2 "for i in \$(seq 1 200); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${plain_log}"
+
+# Optional: run YCSB against native TCP endpoint
+if [[ "${YCSB_ENABLE}" == "1" ]]; then
+  echo "[*] YCSB: native TCP (VM2 -> VM1:${VMNET_VM1_IP}:6379)"
+  ycsb_args=("--host" "${VMNET_VM1_IP}" "--port" "6379" "--workloads" "${YCSB_WORKLOADS}" \
+             "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
+             "--threads" "${YCSB_THREADS}")
+  if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
+  if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
+  ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
+  ssh_vm2 "bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+fi
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_plain_sgxvm >/dev/null 2>&1 || true"
 ssh_vm1 "rm -rf '${plain_dir_vm1}' >/dev/null 2>&1 || true"
@@ -284,6 +306,18 @@ ssh_vm1 "for i in \$(seq 1 200); do redis-cli -p 6379 ping >/dev/null 2>&1 && ex
 
 ssh_vm2 "for i in \$(seq 1 200); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
 ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${native_log}"
+
+# Optional: run YCSB against gramine-sgx native TCP endpoint
+if [[ "${YCSB_ENABLE}" == "1" ]]; then
+  echo "[*] YCSB: gramine-sgx native TCP (VM2 -> VM1:${VMNET_VM1_IP}:6379)"
+  ycsb_args=("--host" "${VMNET_VM1_IP}" "--port" "6379" "--workloads" "${YCSB_WORKLOADS}" \
+             "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
+             "--threads" "${YCSB_THREADS}")
+  if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
+  if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
+  ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
+  ssh_vm2 "bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+fi
 
 echo "[*] Benchmark 3/5: native Redis over libsodium-encrypted TCP (tunnel)"
 ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
@@ -300,6 +334,18 @@ if ! ssh_vm2 "for i in \$(seq 1 120); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCA
 fi
 
 ssh_vm2 "redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${sodium_log}"
+
+# Optional: run YCSB against libsodium-encrypted TCP tunnel
+if [[ "${YCSB_ENABLE}" == "1" ]]; then
+  echo "[*] YCSB: sodium TCP (VM2 127.0.0.1:${SODIUM_LOCAL_PORT} -> VM1 ${VMNET_VM1_IP}:${SODIUM_PORT})"
+  ycsb_args=("--host" "127.0.0.1" "--port" "${SODIUM_LOCAL_PORT}" "--workloads" "${YCSB_WORKLOADS}" \
+             "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
+             "--threads" "${YCSB_THREADS}")
+  if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
+  if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
+  ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
+  ssh_vm2 "bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+fi
 
 ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"

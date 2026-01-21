@@ -47,8 +47,10 @@
 #define MSG_DATA 1
 #define MSG_CLOSE 2
 
-#define OP_GET 1
-#define OP_SET 2
+#define OP_GET  1
+#define OP_SET  2
+#define OP_DEL  3
+#define OP_SCAN 4
 
 #define STATUS_OK 0
 #define STATUS_MISS 1
@@ -797,6 +799,83 @@ static int push_get(unsigned char *mm, const struct ring_info *ri, uint32_t cid,
     buf[2] = 0;
     buf[3] = 0;
     memcpy(buf + 4, key, klen);
+    if (g_secure) {
+        unsigned char enc[RING_MAX_PAYLOAD];
+        uint32_t enc_len = 0;
+        if (secure_encrypt(ri->ring_idx,
+                           cid,
+                           MSG_DATA,
+                           RING_FLAG_SECURE,
+                           (uint32_t)need,
+                           buf,
+                           SEC_DIR_REQ,
+                           enc,
+                           (uint32_t)sizeof(enc),
+                           &enc_len) != 0)
+            return -1;
+        return ring_push_safe(mm, ri, cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
+    }
+    return ring_push_safe(mm, ri, cid, MSG_DATA, 0, buf, (uint32_t)need);
+}
+
+/* Delete a key (DEL). Returns >0 on push, 0 if full, <0 on error. */
+static int __attribute__((unused)) push_del(unsigned char *mm, const struct ring_info *ri, uint32_t cid, int idx) {
+    char key[32];
+    snprintf(key, sizeof(key), "k%d", idx);
+    uint8_t klen = (uint8_t)strlen(key);
+
+    unsigned char buf[TDX_SHM_SLOT_SIZE];
+    size_t need = 4 + klen;
+    if (need > RING_MAX_PAYLOAD) return -1;
+
+    buf[0] = OP_DEL;
+    buf[1] = klen;
+    buf[2] = 0;
+    buf[3] = 0;
+    memcpy(buf + 4, key, klen);
+    if (g_secure) {
+        unsigned char enc[RING_MAX_PAYLOAD];
+        uint32_t enc_len = 0;
+        if (secure_encrypt(ri->ring_idx,
+                           cid,
+                           MSG_DATA,
+                           RING_FLAG_SECURE,
+                           (uint32_t)need,
+                           buf,
+                           SEC_DIR_REQ,
+                           enc,
+                           (uint32_t)sizeof(enc),
+                           &enc_len) != 0)
+            return -1;
+        return ring_push_safe(mm, ri, cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
+    }
+    return ring_push_safe(mm, ri, cid, MSG_DATA, 0, buf, (uint32_t)need);
+}
+
+/* SCAN request: pattern (key) + extras (val) with [u64 cursor][u16 count] */
+static int __attribute__((unused)) push_scan(unsigned char *mm, const struct ring_info *ri, uint32_t cid, const char *pattern, uint64_t cursor, uint16_t count) {
+    uint8_t klen = pattern ? (uint8_t)strlen(pattern) : 0;
+    unsigned char buf[TDX_SHM_SLOT_SIZE];
+    size_t need = 4 + klen + 10;
+    if (need > RING_MAX_PAYLOAD) return -1;
+
+    buf[0] = OP_SCAN;
+    buf[1] = klen;
+    buf[2] = 10; /* val length LE */
+    buf[3] = 0;
+    if (klen) memcpy(buf + 4, pattern, klen);
+    unsigned char *p = buf + 4 + klen;
+    p[0] = (uint8_t)(cursor & 0xff);
+    p[1] = (uint8_t)((cursor >> 8) & 0xff);
+    p[2] = (uint8_t)((cursor >> 16) & 0xff);
+    p[3] = (uint8_t)((cursor >> 24) & 0xff);
+    p[4] = (uint8_t)((cursor >> 32) & 0xff);
+    p[5] = (uint8_t)((cursor >> 40) & 0xff);
+    p[6] = (uint8_t)((cursor >> 48) & 0xff);
+    p[7] = (uint8_t)((cursor >> 56) & 0xff);
+    p[8] = (uint8_t)(count & 0xff);
+    p[9] = (uint8_t)((count >> 8) & 0xff);
+
     if (g_secure) {
         unsigned char enc[RING_MAX_PAYLOAD];
         uint32_t enc_len = 0;

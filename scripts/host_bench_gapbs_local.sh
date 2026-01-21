@@ -41,11 +41,11 @@ compare_csv="${RESULTS_DIR}/gapbs_compare_${GAPBS_KERNEL}_${ts}.csv"
 echo "[*] Building GAPBS (native + ring) ..."
 make -C "${ROOT}/gapbs" -j"$(nproc)" all ring
 
-echo "[*] Running GAPBS native: ${GAPBS_KERNEL} -g ${SCALE} -k ${DEGREE} -n ${TRIALS}"
-"${ROOT}/gapbs/${GAPBS_KERNEL}" -g "${SCALE}" -k "${DEGREE}" -n "${TRIALS}" | tee "${native_log}"
+echo "[*] Running GAPBS native: ${GAPBS_KERNEL} -g ${SCALE} -k ${DEGREE} -n ${TRIALS} ${GAPBS_EXTRA_ARGS:-}"
+"${ROOT}/gapbs/${GAPBS_KERNEL}" -g "${SCALE}" -k "${DEGREE}" -n "${TRIALS}" ${GAPBS_EXTRA_ARGS:-} | tee "${native_log}"
 
-echo "[*] Running GAPBS ring: ${GAPBS_KERNEL}-ring (GAPBS_CXL_PATH=${GAPBS_CXL_PATH}, GAPBS_CXL_MAP_SIZE=${GAPBS_CXL_MAP_SIZE})"
-"${ROOT}/gapbs/${GAPBS_KERNEL}-ring" -g "${SCALE}" -k "${DEGREE}" -n "${TRIALS}" | tee "${ring_log}"
+echo "[*] Running GAPBS ring: ${GAPBS_KERNEL}-ring (GAPBS_CXL_PATH=${GAPBS_CXL_PATH}, GAPBS_CXL_MAP_SIZE=${GAPBS_CXL_MAP_SIZE}) ${GAPBS_EXTRA_ARGS:-}"
+"${ROOT}/gapbs/${GAPBS_KERNEL}-ring" -g "${SCALE}" -k "${DEGREE}" -n "${TRIALS}" ${GAPBS_EXTRA_ARGS:-} | tee "${ring_log}"
 
 native_avg="$(awk '/^Average Time:/{print $3; exit}' "${native_log}" || true)"
 ring_avg="$(awk '/^Average Time:/{print $3; exit}' "${ring_log}" || true)"

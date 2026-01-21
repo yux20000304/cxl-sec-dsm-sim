@@ -18,7 +18,7 @@ Highlights
 - `ring_client/` – C direct client (binary ring, no RESP).
 - `cxl_sec_mgr/` – ACL/key table manager process for secure ring mode.
 - `sodium_tunnel/` – libsodium encrypted TCP tunnel (software encryption baseline for native Redis).
-- `redis/src/cxl_ring.c` – Redis-side ring driver (binary GET/SET).
+- `redis/src/cxl_ring.c` – Redis-side ring driver (binary ops: GET/SET/DEL/SCAN).
 - `results/` – saved benchmark logs/CSVs.
 
 ## Phase 1: Dual VMs + shared “CXL medium” (ivshmem)
@@ -356,3 +356,37 @@ sudo bash scripts/vm2_client.sh --path /sys/bus/pci/devices/0000:00:02.0/resourc
 
 ## KVM/EPT hooks (Phase 4 pointer)
 See `kvm/README.md` for where to intercept GPA faults (e.g., `kvm_mmu_page_fault` or `handle_ept_violation`) and how to hardcode a protected CXL GPA range plus an “attacker VM” check. Only guidance is provided; kernel build is not included here.
+
+## YCSB on Redis (TCP/RESP)
+- Script: `scripts/run_ycsb.sh` runs YCSB load+run for selected workloads against a Redis TCP endpoint.
+- TDX flow: set `YCSB_ENABLE=1` to run YCSB for native TCP / libsodium TCP / ring (via local RESP proxy) / secure-ring (via local RESP proxy).
+
+Inside VM2 (manual):
+```
+bash scripts/run_ycsb.sh --host 127.0.0.1 --port 6380 --workloads workloada,workloadb \
+  --recordcount 100000 --operationcount 100000 --threads 4
+```
+
+Host orchestration (TDX):
+```
+YCSB_ENABLE=1 YCSB_WORKLOADS=workloada,workloadb YCSB_RECORDS=100000 YCSB_OPS=100000 \
+  YCSB_THREADS=4 bash scripts/host_recreate_and_bench_tdx.sh
+```
+Notes:
+- Ring/secure-ring YCSB is enabled by exposing the ring backend as a local TCP/RESP endpoint via `ring_client/ring_resp_proxy.c` (RESP byte-stream tunneling over ring).
+- Results are saved under `results/` with timestamped filenames.
+
+## Batch benchmarking (TDX)
+- Script: `scripts/host_full_bench.sh` wraps `scripts/host_recreate_and_bench_tdx.sh` and supports sweep lists.
+- Example (sweep 1/2/4/8 threads, fixed clients=4):
+  ```
+  REDIS_THREADS_LIST=1,2,4,8 REDIS_CLIENTS=4 bash scripts/host_full_bench.sh
+  ```
+- Example (set VM resources + ring layout):
+  ```
+  VM_CPUS=8 VM_MEM=8G RING_COUNT=4 RING_REGION_SIZE=16M RING_MAP_SIZE=4G bash scripts/host_full_bench.sh
+  ```
+- Example (sweep VM vCPUs + ring count):
+  ```
+  VM_CPUS_LIST=2,4,8 RING_COUNT_LIST=1,2,4 bash scripts/host_full_bench.sh
+  ```
