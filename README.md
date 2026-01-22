@@ -1,393 +1,215 @@
-# CXL-DSM Multi-host Security (NUMA/QEMU/Gramine/Redis)
+# cxl-sec-dsm-sim (TDX-focused)
 
-Single-host PoC that uses NUMA + QEMU (two VMs) + shared memory to emulate a CXL-DSM multi-host environment. Redis is the target workload. The client talks to the server by writing directly into a shared-memory ring (binary protocol, no RESP). The repo covers Phases 1–3 of the original plan; Phase 4 gives KVM/EPT hook hints.
+This repository runs **Redis / YCSB / GAPBS** on top of a **2-VM Intel TDX setup** with an **ivshmem shared-memory device (PCI BAR2)** to emulate a multi-host CXL-DSM-like shared medium. It compares:
 
-Highlights
-- Two VMs share an ivshmem backing file (default `/tmp/cxl_shared.raw`), both can mmap PCI BAR2 directly.
-- Redis runs with a binary ring protocol (version=2, slot=4096B, rings=4, map=1GB). Client writes/reads shared memory; no TCP sockets on the hot path.
-- Benchmarks proven with 200k/500k requests, 4 threads, pipeline + client-side inflight throttling.
-- Optional secure-ring variant: address-range ACL table + software encrypt/decrypt (libsodium) managed by `cxl_sec_mgr`.
+- `ring`: direct shared-memory access (no crypto / no ACL)
+- `secure`: `cxl_sec_mgr`-managed ACL + per-payload crypto/auth (libsodium)
+- `crypto`: manager-less software crypto (used by GAPBS in this repo)
 
-## Repo layout
-- `infra/` – host scripts: create shared backing, cloud-init seeds, launch dual VMs.
-- `guest/` – guest-side helper scripts: bind ivshmem -> uio, basic install/start.
-- `shim/` – legacy Python shim (kept for reference; replaced by C direct path).
-- `gramine/` – Gramine manifest templates and build rules for Redis.
-- `gapbs/` – GAP Benchmark Suite (graph kernels); includes `*-ring` (shared-memory CSR) and `*-ring-secure` (ACL + libsodium encrypt-at-rest) builds.
-- `kvm/` – Phase 4 hints for KVM/EPT permission checks (no kernel build here).
-- `ring_client/` – C direct client (binary ring, no RESP).
-- `cxl_sec_mgr/` – ACL/key table manager process for secure ring mode.
-- `sodium_tunnel/` – libsodium encrypted TCP tunnel (software encryption baseline for native Redis).
-- `redis/src/cxl_ring.c` – Redis-side ring driver (binary ops: GET/SET/DEL/SCAN).
-- `results/` – saved benchmark logs/CSVs.
+Primary entry points:
 
-## Phase 1: Dual VMs + shared “CXL medium” (ivshmem)
-### Host prerequisites (Ubuntu 22.04/24.04)
-`qemu-system-x86`, `qemu-utils`, `numactl`, `cloud-image-utils`, `curl` (or `wget`)
+- `scripts/host_recreate_and_bench_tdx.sh`: recreate 2 TDX VMs and run the full suite
+- `scripts/host_tdx_batch_suite.sh`: batch sweep (threads, kernels, optional YCSB)
 
-### Create shared backing file (host)
-```bash
-sudo bash infra/create_cxl_shared.sh /tmp/cxl_shared.raw 4G
-```
+---
 
-### Prepare Ubuntu cloud image + VM disks
-Download a cloud image (e.g., `ubuntu-24.04-server-cloudimg-amd64.img`), then:
-```bash
-bash infra/create_vm_images.sh \
-  --base /path/to/ubuntu-24.04-server-cloudimg-amd64.img \
-  --outdir infra/images \
-  --vm1 vm1.qcow2 \
-  --vm2 vm2.qcow2
+## Repository layout (relevant parts)
 
-bash infra/create_cloud_init.sh --outdir infra/images
-```
-Or let `scripts/host_quickstart.sh` auto-download Ubuntu 24.04 into `../mirror/` (default).
+- `scripts/host_recreate_and_bench_tdx.sh`: **TDX: Redis + GAPBS (optional YCSB)**
+- `scripts/host_tdx_batch_suite.sh`: batch runner (Redis + GAPBS, optional YCSB)
+- `scripts/run_ycsb.sh`: run YCSB inside a VM (installs Java, downloads YCSB)
+- `scripts/tdx_build_guest_image.sh`: build a TDX guest image via the `tdx/` submodule
+- `ring_client/`: `cxl_ring_direct` (binary ring client) + `ring_resp_proxy` (RESP-over-ring for YCSB)
+- `redis/`: Redis with a ring backend (`redis/src/cxl_ring.c`)
+- `gapbs/`: GAPBS with multi-host shared-memory variants (`*-ring`, `*-ring-secure`)
+- `cxl_sec_mgr/`: secure-mode ACL/key manager
+- `tdx/`: canonical/tdx submodule (host/guest TDX enablement tools)
+- `results/`: logs/CSVs emitted by scripts
 
-### Launch dual VMs (host)
-User-mode networking with SSH forwards:
-- VM1 SSH: `127.0.0.1:2222`
-- VM2 SSH: `127.0.0.1:2223`
+---
+
+## 1. Host prerequisites (TDX)
+
+### 1.1 Hardware / BIOS
+
+You need a platform that supports Intel TDX, and TDX must be enabled in BIOS/firmware. If TDX is not enabled at the platform level, QEMU/KVM will fail to start a TDX guest.
+
+Use `tdx/README.md` as the canonical reference for supported platforms and host setup steps.
+
+### 1.2 Host OS + TDX stack (recommended via `tdx/`)
+
+This repo includes `tdx/` as a submodule (canonical/tdx). To prepare the host:
 
 ```bash
-bash infra/run_vms.sh \
-  --cxl /tmp/cxl_shared.raw --cxl-size 4G \
-  --vm1-disk infra/images/vm1.qcow2 --vm1-seed infra/images/seed-vm1.img \
-  --vm2-disk infra/images/vm2.qcow2 --vm2-seed infra/images/seed-vm2.img
+git submodule update --init --recursive
+
+cd tdx
+# Optional: edit setup-tdx-config before running
+sudo -E ./setup-tdx-host.sh
 ```
 
-Optional NUMA pinning (simulate “remote” CXL memory):
-```bash
-VM1_CPU_NODE=0 VM2_CPU_NODE=0 CXL_MEM_NODE=1 bash infra/run_vms.sh ...
-```
-This pins vCPUs to node0 and allocates shared memory on node1.
-If your host exposes only a single NUMA node, you can still simulate “remote CXL”
-latency by injecting artificial delay on each shared-memory ring access:
-```bash
-CXL_SHM_DELAY_NS=150 bash scripts/host_recreate_and_bench_gramine.sh
-```
-(`CXL_SHM_DELAY_NS` is in nanoseconds; set to `0` to disable. The benchmark scripts
-auto-default it to `150` on 1-NUMA hosts if unset.)
-
-### Mount host repo inside guests (convenience)
-```bash
-sudo mkdir -p /mnt/hostshare
-sudo mount -t 9p -o trans=virtio hostshare /mnt/hostshare
-```
-
-## Phase 2: VM1 with Gramine + Redis (SGX optional)
-### Bind ivshmem to `/dev/uioX` inside VM1
-```bash
-sudo bash guest/bind_ivshmem_uio.sh
-ls -la /dev/uio*
-```
-
-### Install Redis / Gramine (VM1)
-Install Gramine + SGX repo keys (Jammy/Noble) and update:
-```bash
-sudo curl -fsSLo /etc/apt/keyrings/gramine-keyring-$(lsb_release -sc).gpg https://packages.gramineproject.io/gramine-keyring-$(lsb_release -sc).gpg
-echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/gramine-keyring-$(lsb_release -sc).gpg] https://packages.gramineproject.io/ $(lsb_release -sc) main" \
-  | sudo tee /etc/apt/sources.list.d/gramine.list
-
-sudo curl -fsSLo /etc/apt/keyrings/intel-sgx-deb.asc https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key
-echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/intel-sgx-deb.asc] https://download.01.org/intel-sgx/sgx_repo/ubuntu $(lsb_release -sc) main" \
-  | sudo tee /etc/apt/sources.list.d/intel-sgx.list
-
-sudo apt-get update
-sudo apt-get install -y gramine
-```
-
-Use apt or the helper:
-```bash
-sudo bash guest/vm1_setup.sh   # optional helper
-```
-Gramine templates live in `gramine/`:
-```bash
-cd gramine
-# Build two manifests:
-# - `redis-native.manifest` for `/usr/bin/redis-server` (TCP/RESP baseline)
-# - `redis-ring.manifest`   for `/repo/redis/src/redis-server` (CXL ring enabled)
-make links native ring
-
-# Run native Redis under Gramine (direct mode).
-gramine-direct ./redis-native /repo/gramine/redis.conf
-
-# Run ring-enabled Redis under Gramine (direct mode, needs BAR2 access).
-sudo gramine-direct ./redis-ring /repo/gramine/redis.conf
-
-# Optional SGX artifacts:
-# - sign manifests (no SGX hardware required): make sgx-sign
-# - fetch launch tokens (requires SGX + AESM): make sgx-token
-#
-# Run under SGX (requires SGX hardware in the environment):
-# sudo gramine-sgx ./redis-native /repo/gramine/redis.conf
-```
-
-## Phase 3: CXL shim – direct binary ring (C)
-### VM1: Build + start Redis with ring (version 2, no RESP)
-```bash
-ssh -p 2222 ubuntu@127.0.0.1
-cd /mnt/hostshare/redis/src
-sudo rm -rf ../deps/cachedObjs cxl_ring.d cxl_ring.o
-sudo make MALLOC=libc USE_LTO=no CFLAGS='-O2 -fno-lto' LDFLAGS='-fno-lto' -j2
-sudo env CXL_RING_PATH=/sys/bus/pci/devices/0000:00:02.0/resource2 \
-    CXL_RING_MAP_SIZE=1073741824 CXL_RING_COUNT=4 \
-    nohup ./redis-server --port 7379 --protected-mode no --save '' --appendonly no \
-    >/tmp/redis_ring_direct.log 2>&1 &
-```
-Expect log: `cxl ring: enabled ... rings=4 slots_per_ring=26624`.
-
-### VM2: Build C client (version 2)
-```bash
-ssh -p 2223 ubuntu@127.0.0.1
-cd /mnt/hostshare/ring_client
-gcc -O2 -Wall -Wextra -std=gnu11 -pthread -o /tmp/cxl_ring_direct cxl_ring_direct.c -lsodium
-```
-
-### Benchmark examples
-200k requests, 4 threads, pipeline, inflight limit 5000:
-```bash
-sudo /tmp/cxl_ring_direct \
-  --path /sys/bus/pci/devices/0000:00:02.0/resource2 \
-  --map-size 1073741824 --bench 200000 --pipeline --threads 4 --max-inflight 5000 \
-  | tee /mnt/hostshare/results/ring_bench_threads4_c4_200k.log
-```
-Result (measured): SET ≈ 1,024,965 req/s; GET ≈ 1,852,467 req/s.
-
-500k requests, same params:
-```bash
-sudo /tmp/cxl_ring_direct \
-  --path /sys/bus/pci/devices/0000:00:02.0/resource2 \
-  --map-size 1073741824 --bench 500000 --pipeline --threads 4 --max-inflight 5000 \
-  | tee /mnt/hostshare/results/ring_bench_threads4_c4_500k.log
-```
-Result: SET ≈ 1,255,842 req/s; GET ≈ 1,605,614 req/s.
-
-### CSV export (latency + cost, optional)
-- `--latency`: per-op samples; outputs avg/p50/p75/p90/p99/p99.9/p99.99.
-- `--cost`: counts push retries and sleep time (coarse; off by default).
-- `--csv <path>`: CSV output (default `results/ring_metrics.csv`, append with header).
-- `--label <name>`: label for the run.
-
-Example with latency/cost on:
-```bash
-sudo /tmp/cxl_ring_direct \
-  --path /sys/bus/pci/devices/0000:00:02.0/resource2 \
-  --map-size 1073741824 --bench 200000 --pipeline --threads 4 --max-inflight 5000 \
-  --latency --cost --label ring_v2 \
-  | tee /mnt/hostshare/results/ring_bench_threads4_c4_200k.log
-# CSV written/appended to /mnt/hostshare/results/ring_metrics.csv
-```
-
-## Baseline: native Redis over TCP
-VM1 (6379):
-```bash
-cd /mnt/hostshare/redis/src
-nohup ./redis-server --port 6379 --protected-mode no --save '' --appendonly no >/tmp/redis_native.log 2>&1 &
-```
-Benchmark (4 threads, concurrency 4, 200k requests):
-```bash
-./redis-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 200000 -c 4 --threads 4 \
-  | tee /mnt/hostshare/results/redis_bench_native_threads4_c4_large.log
-```
-Result: SET/GET ≈ 199,800 req/s.
-
-## Key code notes
-- `redis/src/cxl_ring.c`
-  - `CXL_VERSION=2`, binary protocol (op/key_len/val_len + payload), bypasses RESP.
-  - Defaults: slot_size=4096, rings=4, map_size=1GB; head/tail in shared header, req/resp halves.
-  - `handle_request`: parses binary GET/SET, calls Redis internals `setKey/lookupKeyRead`, writes status/value.
-
-- `ring_client/cxl_ring_direct.c`
-  - Version 2 client, slot=4096, map=1GB default.
-  - `--threads` spreads across rings; `--pipeline` batches; `--max-inflight` caps outstanding to avoid ring overflow.
-  - `--latency/--cost/--csv/--label` capture metrics with minimal code overhead (off by default).
-  - `--secure` enables ACL+crypto over the shared-memory payload (requires `--sec-mgr ip:port` + `--sec-node-id N`).
-
-## One-command host bootstrap
-If you already have a cloud image (BASE_IMG) and host deps installed:
-```bash
-BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img \
-bash scripts/host_quickstart.sh
-```
-If you don't have one, `scripts/host_quickstart.sh` downloads Ubuntu 24.04 by default (set `DOWNLOAD_BASE_IMG=0` to disable).
-This creates the shared file, qcow2/seed, and boots both VMs (SSH: 2222/2223). Tune memory/CPU/NUMA via env vars if needed.
-
-If you switch the base image (e.g., Jammy -> Noble), recreate the VM disks:
-```bash
-FORCE_RECREATE=1 bash scripts/host_quickstart.sh
-```
-
-### One command: recreate VMs + Gramine benchmarks
-This rebuilds VM1/VM2 from the base image and runs:
-- Native Redis over TCP (no Gramine; VM2 -> VM1 via `cxl0` internal NIC)
-- Gramine + native Redis over TCP (VM2 -> VM1 via `cxl0` internal NIC)
-- Gramine + native Redis over libsodium-encrypted TCP (VM2 -> VM1 via user-space tunnel)
-- Gramine + ring-enabled Redis over BAR2 (VM2 uses `cxl_ring_direct`)
-- Gramine + secure ring Redis over BAR2 (VM2 uses `cxl_ring_direct --secure`, ACL managed by `cxl_sec_mgr`)
+Quick checks:
 
 ```bash
-bash scripts/host_recreate_and_bench_gramine.sh
-```
-Outputs are written to `results/` as timestamped `gramine_*.log` / `gramine_*.csv`.
-The compare CSV includes `NativeTCP`, `GramineNativeTCP`, `GramineSodiumTCP`, `GramineRing`, and `GramineRingSecure` labels.
-
-### Local GAPBS benchmark (no VMs)
-```bash
-bash scripts/host_bench_gapbs_local.sh
+ls -l /dev/kvm
+cat /sys/module/kvm_intel/parameters/tdx
+sudo dmesg | grep -i tdx | tail -n 50
+qemu-system-x86_64 -object help | rg -n "tdx-guest" || true
 ```
 
-### One command: recreate VMs + GAPBS multi-host compare (5 versions)
-This rebuilds VM1/VM2 and runs a GAPBS kernel across the two VMs in five modes:
-- `Native`: plain GAPBS (no Gramine, no shared memory)
-- `MultihostRing`: shared-memory ring (no Gramine)
-- `GramineMultihostRing`: shared-memory ring under `gramine-direct`
-- `GramineMultihostCrypto`: shared-memory ring encrypted-at-rest via libsodium (per-VM key + common key; no manager)
-- `GramineMultihostSecure`: shared-memory ring with `cxl_sec_mgr` ACL/key table (permission-managed crypto)
+### 1.3 Firmware (TDVF / OVMF)
+
+`scripts/host_recreate_and_bench_tdx.sh` passes a firmware file via `-bios`. You can override it:
 
 ```bash
-sudo bash scripts/host_recreate_and_bench_gapbs_multihost.sh
+TDX_BIOS=/usr/share/ovmf/OVMF.fd
+# or /usr/share/OVMF/OVMF_CODE_4M.fd, etc.
 ```
-If VM1/VM2 are already running, reuse them:
+
+If your distro QEMU does not expose `tdx-guest` in `-object help`, use a TDX-capable QEMU build and set `QEMU_BIN=/path/to/qemu-system-x86_64`.
+
+---
+
+## 2. Guest image preparation
+
+### Option A (recommended): let the script build a TD guest image
+
+With submodules initialized:
+
 ```bash
-SKIP_RECREATE=1 bash scripts/host_recreate_and_bench_gapbs_multihost.sh
+git submodule update --init --recursive
+sudo -E bash scripts/host_recreate_and_bench_tdx.sh
 ```
-Outputs are written to `results/` as timestamped `gapbs_*` logs plus a compare CSV (includes `throughput_teps`).
 
-## TEE benchmarks (TDX / SGX) quickstart
-This repo supports two TEEs:
-- **TDX**: VM-level TEE (confidential guests). No Gramine required.
-- **SGX**: process-level TEE (enclaves) via Gramine SGX.
+If `BASE_IMG` is unset, the script calls:
 
-Common knobs:
-- `CXL_SHM_DELAY_NS=<ns>` injects a per-access delay on shared-memory reads/writes (set `0` to disable). Useful when the host has only 1 NUMA node; the TEE scripts may auto-default it to `150` if unset.
-- `BASE_IMG=/path/to/ubuntu-24.04-server-cloudimg-amd64.img` for VM-based workflows.
-- `QEMU_BIN=/path/to/qemu-system-x86_64` to use a custom QEMU build (useful for TDX hosts).
-- `INSTALL_HOST_DEPS=1` lets scripts auto-install missing host packages via apt-get (Ubuntu/Debian).
+- `scripts/tdx_build_guest_image.sh` (uses `tdx/guest-tools/image/create-td-image.sh`)
+- default output: `infra/images/tdx-guest-ubuntu-24.04-generic.qcow2`
 
-### TDX: 2 confidential VMs + ivshmem (Redis + GAPBS)
-Host prereqs (quick check):
-- `/dev/kvm` available
-- `cat /sys/module/kvm_intel/parameters/tdx` is `Y`/`1` (TDX enabled in host KVM; if missing, your host kernel likely lacks TDX host support)
-- `qemu-system-x86_64 -object help | grep tdx-guest`
-- TDVF/OVMF firmware file for `-bios` (Ubuntu: `sudo apt-get install -y ovmf`, then set `TDX_BIOS=/usr/share/OVMF/OVMF_CODE_4M.fd`)
-If `tdx-guest` is missing, your distro QEMU build likely doesn't include TDX support; install a TDX-enabled QEMU and rerun with `QEMU_BIN=...` (or let the script try to build one via `INSTALL_TDX_QEMU=1` which uses `TDX_QEMU_REF=tdx-qemu-upstream` by default).
-If you see `qemu-system-x86_64: vm-type tdx not supported by KVM`, your host kernel/KVM does not support TDX guests (this is a platform/kernel/BIOS issue, not a missing package).
+### Option B: provide your own `BASE_IMG`
 
-Run:
+Build a 24.04 TD image:
+
+```bash
+git submodule update --init --recursive
+bash scripts/tdx_build_guest_image.sh
+```
+
+Run the suite using that image:
+
+```bash
+sudo -E BASE_IMG=infra/images/tdx-guest-ubuntu-24.04-generic.qcow2 \
+  bash scripts/host_recreate_and_bench_tdx.sh
+```
+
+Note: `host_recreate_and_bench_tdx.sh` attaches a cloud-init seed for the 2-VM topology (SSH, networking, etc.), so you typically do not need to manually tweak the guest image.
+
+---
+
+## 3. Run the suite (TDX)
+
+### 3.1 Redis + GAPBS (default)
+
 ```bash
 sudo -E bash scripts/host_recreate_and_bench_tdx.sh
 ```
-Outputs:
-- Redis: `results/tdx_compare_*.csv` (`TDXNativeTCP`, `TDXRing`, `TDXRingSecure`)
-- GAPBS: `results/tdx_gapbs_compare_*_*.csv` (`TDXGapbsNative`, `TDXGapbsMultihostRing`, `TDXGapbsMultihostCrypto`, `TDXGapbsMultihostSecure`, includes `vm=avg`)
-- GAPBS overhead: `results/tdx_gapbs_overhead_*_*.csv` (per-VM `attach_total_ms`, `wait_ms`, `decrypt_ms`, `pretouch_ms`)
 
-Note: the ivshmem-backed “shared CXL medium” is shared memory and not protected by TDX; use the `*Secure` variants if you need payload crypto/auth.
+High-level workflow:
 
-### SGX: host SGX (no VMs) via Gramine SGX
-Prereqs (quick check):
-- CPU flags include `aes` and `sgx`
-- SGX device exists (typically `/dev/sgx_enclave`)
+- boot 2 TDX guests (VM1/VM2) and attach ivshmem (shared “CXL medium”)
+- VM1 starts Redis endpoints (native TCP, libsodium TCP, ring, secure-ring)
+- VM2 runs the corresponding clients/benchmarks (`redis-benchmark`, `cxl_ring_direct`)
+- GAPBS: VM1 publishes a graph to shared memory; VM1/VM2 attach and run kernels
+- everything is written to `results/`
 
-Run Redis compare:
+For manual debugging (default SSH ports):
+
 ```bash
-sudo -E bash scripts/host_bench_gramine_sgx.sh
+ssh -p 2222 ubuntu@127.0.0.1  # VM1
+ssh -p 2223 ubuntu@127.0.0.1  # VM2
 ```
-Outputs: `results/sgx_*.csv` (`HostNativeTCP`, `GramineSGXNativeTCP`, `GramineSGXSodiumTCP`, `GramineSGXRing`, `GramineSGXRingSecure`).
-Tip: if you see missing tools/packages, rerun with `INSTALL_GRAMINE=1 INSTALL_LIBSODIUM=1`; if `gramine-sgx-get-token` is missing on an FLC platform, use `SGX_TOKEN_MODE=skip`.
 
-Run GAPBS compare:
+The repo is mounted inside the guests at `/mnt/hostshare` via 9p (the script mounts it automatically).
+
+### 3.2 Optional: enable YCSB
+
+YCSB requires RESP/TCP. For ring and secure-ring, the script starts a local proxy on VM2 (`ring_resp_proxy`) that exposes a TCP/RESP endpoint backed by the shared-memory ring.
+
 ```bash
-sudo -E bash scripts/host_bench_gapbs_gramine_sgx.sh
+sudo -E YCSB_ENABLE=1 YCSB_WORKLOADS=workloada,workloadb \
+  YCSB_RECORDS=100000 YCSB_OPS=100000 YCSB_THREADS=4 \
+  bash scripts/host_recreate_and_bench_tdx.sh
 ```
-Outputs: `results/gapbs_compare_sgx_*.csv`.
 
-### SGX virtualization: SGX inside guests (2 VMs + ivshmem)
-This requires SGX virtualization support; otherwise the guest won't have `/dev/sgx_enclave`.
+### 3.3 Batch sweep (threads / kernels)
 
-Host prereqs (quick check):
-- `/dev/kvm` available
-- `qemu-system-x86_64 -object help | grep memory-backend-epc`
-
-Run Redis compare:
 ```bash
-sudo -E bash scripts/host_recreate_and_bench_gramine_sgxvm.sh
-```
-Outputs: `results/sgxvm_*.csv` (`SGXVMNativeTCP`, `GramineSGXVMNativeTCP`, `GramineSGXVMSodiumTCP`, `GramineSGXVMRing`, `GramineSGXVMRingSecure`).
-
-Run GAPBS compare:
-```bash
-sudo -E bash scripts/host_recreate_and_bench_gapbs_gramine_sgxvm.sh
-```
-Outputs: `results/gapbs_sgxvm_compare_*.csv`.
-
-## Quick shared-memory sanity check
-VM1:
-```bash
-python3 shim/cxl_mem_test.py --uio /dev/uio0 --write --offset 0x1000 --data 'hello-from-vm1'
-```
-VM2:
-```bash
-python3 shim/cxl_mem_test.py --uio /dev/uio0 --read --offset 0x1000 --len 32
+YCSB_ENABLE=1 \
+THREAD_LIST=1,2,4,8 \
+GAPBS_KERNEL_LIST=bfs,sssp,pr,cc,bc,tc \
+bash scripts/host_tdx_batch_suite.sh
 ```
 
-## If /dev/uio0 only exposes 4KB (no shared region)
-Some kernels expose only BAR0 via `uio_pci_generic` (4KB doorbell). Use PCI BAR2 directly:
+---
 
-- VM1:
-  ```bash
-  sudo python3 shim/cxl_server_agent.py \
-    --path /sys/bus/pci/devices/0000:00:02.0/resource2 \
-    --map-size 134217728 \
-    --redis 127.0.0.1:6379
-  ```
-- VM2:
-  ```bash
-  sudo python3 shim/cxl_client_agent.py \
-    --path /sys/bus/pci/devices/0000:00:02.0/resource2 \
-    --map-size 134217728 \
-    --listen 0.0.0.0:6380
-  ```
-Or via helper scripts:
-```bash
-sudo bash scripts/vm1_server.sh --path /sys/bus/pci/devices/0000:00:02.0/resource2 --map-size 134217728 --redis 127.0.0.1:6379
-sudo bash scripts/vm2_client.sh --path /sys/bus/pci/devices/0000:00:02.0/resource2 --map-size 134217728 --listen 0.0.0.0:6380
-```
-`--map-size 134217728` = 128MB; ensure it is >= total ring footprint.
+## 4. Outputs (`results/`)
 
-## KVM/EPT hooks (Phase 4 pointer)
-See `kvm/README.md` for where to intercept GPA faults (e.g., `kvm_mmu_page_fault` or `handle_ept_violation`) and how to hardcode a protected CXL GPA range plus an “attacker VM” check. Only guidance is provided; kernel build is not included here.
+### 4.1 Redis
 
-## YCSB on Redis (TCP/RESP)
-- Script: `scripts/run_ycsb.sh` runs YCSB load+run for selected workloads against a Redis TCP endpoint.
-- TDX flow: set `YCSB_ENABLE=1` to run YCSB for native TCP / libsodium TCP / ring (via local RESP proxy) / secure-ring (via local RESP proxy).
+- `results/tdx_compare_<ts>.csv`: overview throughput (`TDXNativeTCP`, `TDXSodiumTCP`, `TDXRing`, `TDXRingSecure`)
+- `results/tdx_ring_<ts>.csv` / `results/tdx_ring_secure_<ts>.csv`: detailed ring metrics (throughput, latency percentiles, `sleep_ms`, etc.)
+- `results/tdx_*_tcp_<ts>.log`: raw `redis-benchmark` logs for native/sodium TCP
 
-Inside VM2 (manual):
-```
-bash scripts/run_ycsb.sh --host 127.0.0.1 --port 6380 --workloads workloada,workloadb \
-  --recordcount 100000 --operationcount 100000 --threads 4
-```
+### 4.2 GAPBS
 
-Host orchestration (TDX):
-```
-YCSB_ENABLE=1 YCSB_WORKLOADS=workloada,workloadb YCSB_RECORDS=100000 YCSB_OPS=100000 \
-  YCSB_THREADS=4 bash scripts/host_recreate_and_bench_tdx.sh
-```
-Notes:
-- Ring/secure-ring YCSB is enabled by exposing the ring backend as a local TCP/RESP endpoint via `ring_client/ring_resp_proxy.c` (RESP byte-stream tunneling over ring).
-- Results are saved under `results/` with timestamped filenames.
+- `results/tdx_gapbs_compare_<kernel>_<ts>.csv`: per-kernel end-to-end metrics for native/ring/crypto/secure (includes `vm=avg`)
+- `results/tdx_gapbs_overhead_<kernel>_<ts>.csv`: attach breakdown (`attach_total_ms`, `attach_decrypt_ms`, `attach_pretouch_ms`, etc.)
+- `results/tdx_gapbs_*_<kernel>_<ts>.log`: per-VM raw logs
 
-## Batch benchmarking (TDX)
-- Script: `scripts/host_full_bench.sh` wraps `scripts/host_recreate_and_bench_tdx.sh` and supports sweep lists.
-- Example (sweep 1/2/4/8 threads, fixed clients=4):
-  ```
-  REDIS_THREADS_LIST=1,2,4,8 REDIS_CLIENTS=4 bash scripts/host_full_bench.sh
-  ```
-- Example (set VM resources + ring layout):
-  ```
-  VM_CPUS=8 VM_MEM=8G RING_COUNT=4 RING_REGION_SIZE=16M RING_MAP_SIZE=4G bash scripts/host_full_bench.sh
-  ```
-- Example (sweep VM vCPUs + ring count):
-  ```
-  VM_CPUS_LIST=2,4,8 RING_COUNT_LIST=1,2,4 bash scripts/host_full_bench.sh
-  ```
+---
+
+## 5. Security model (important)
+
+### 5.1 Shared memory is not TD private memory
+
+TDX protects **TD private memory**. The ivshmem BAR2 region is **shared memory**, and it does not get the same confidentiality properties as private memory pages.
+
+Implications:
+
+- `ring` / `GAPBS ring`: data in the shared medium is plaintext
+- `secure` / `crypto`: software crypto/auth is used to protect payloads stored/transferred via the shared medium
+
+### 5.2 What “ring / secure / crypto” mean (conceptually)
+
+- `ring`: minimal overhead; shared-memory queues / shared CSR access only
+- `secure`: `cxl_sec_mgr` mediates ACL + key distribution; payload crypto/auth adds CPU overhead; attach may include decrypt/prepare work
+- `crypto` (GAPBS): manager-less crypto path; typically heavier attach-time decrypt cost on the consumer VM
+
+---
+
+## 6. Common environment knobs
+
+Frequently used knobs supported by `scripts/host_recreate_and_bench_tdx.sh`:
+
+- VMs: `VM1_MEM` `VM2_MEM` `VM1_CPUS` `VM2_CPUS` `TDX_BIOS` `QEMU_BIN`
+- Ring layout: `RING_MAP_SIZE` `RING_COUNT` `RING_REGION_SIZE` `RING_REGION_BASE` `RING_SECURE_REGION_BASE`
+- Latency injection: `CXL_SHM_DELAY_NS` (set `0` to disable)
+- Redis bench: `REQ_N` `CLIENTS` `THREADS` `PIPELINE` `MAX_INFLIGHT`
+- Ring polling: `CXL_RING_POLL_SPIN_NS` `CXL_RING_POLL_SLEEP_NS`
+- YCSB: `YCSB_ENABLE=1` `YCSB_WORKLOADS` `YCSB_RECORDS` `YCSB_OPS` `YCSB_THREADS`
+- GAPBS: `GAPBS_KERNEL_LIST` `SCALE` `DEGREE` `TRIALS` `OMP_THREADS` `GAPBS_DROP_FIRST_TRIAL`
+
+---
+
+## 7. Troubleshooting (TDX)
+
+- `qemu-system-x86_64: -object tdx-guest,...`: your QEMU is not TDX-capable; use a TDX build and set `QEMU_BIN=...`
+- `vm-type tdx not supported by KVM`: host kernel/BIOS/TDX module is not ready (platform issue, not a repo issue)
+- Cannot SSH into guests: first boot may be slow; increase `WAIT_SSH_SECS` or ensure ports `2222/2223` are free
+- YCSB fails: make sure `YCSB_ENABLE=1` and VM2 has network access to download dependencies, or run `scripts/run_ycsb.sh` manually in VM2
+
+---
+
+## Licenses / third-party
+
+- `tdx/` is the canonical/tdx submodule; refer to `tdx/README.md` and `tdx/LICENSE` for its license and usage terms.
