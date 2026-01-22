@@ -984,8 +984,21 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--path") && i + 1 < argc) path = argv[++i];
-        else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) map_size = strtoull(argv[++i], NULL, 0);
-        else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) map_offset = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) {
+            size_t v = 0;
+            if (parse_size(argv[++i], &v) != 0) {
+                fprintf(stderr, "[!] Invalid --map-size\n");
+                return 2;
+            }
+            map_size = v;
+        } else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) {
+            size_t v = 0;
+            if (parse_size(argv[++i], &v) != 0) {
+                fprintf(stderr, "[!] Invalid --map-offset\n");
+                return 2;
+            }
+            map_offset = v;
+        }
         else if (!strcmp(argv[i], "--listen") && i + 1 < argc) listen_addr = argv[++i];
         else if (!strcmp(argv[i], "--ring") && i + 1 < argc) ring_idx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--secure")) g_secure = 1;

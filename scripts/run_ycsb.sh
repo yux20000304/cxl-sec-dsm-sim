@@ -145,6 +145,12 @@ maybe_start_ring_proxy() {
   local ring_idx="${RING_RING_IDX:-0}"
   local listen_addr="${RING_RESP_LISTEN:-127.0.0.1:${PORT}}"
   local sudo_prefix=()
+  local proxy_env=(
+    "CXL_RING_COUNT=${CXL_RING_COUNT:-}"
+    "CXL_RING_REGION_SIZE=${CXL_RING_REGION_SIZE:-}"
+    "CXL_RING_REGION_BASE=${CXL_RING_REGION_BASE:-}"
+    "CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS:-}"
+  )
   if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
     sudo_prefix=(sudo -n)
   fi
@@ -167,7 +173,7 @@ maybe_start_ring_proxy() {
   fi
 
   echo "[*] Starting ring_resp_proxy at ${listen_addr} -> ${ring_path} (offset=${ring_offset} ring=${ring_idx})"
-  ( "${sudo_prefix[@]}" /tmp/ring_resp_proxy --path "${ring_path}" --map-size "${ring_size}" --map-offset "${ring_offset}" --ring "${ring_idx}" --listen "${listen_addr}" "${secure_args[@]}" >/tmp/ring_resp_proxy.log 2>&1 & echo $! > /tmp/ring_resp_proxy.pid )
+  ( "${sudo_prefix[@]}" env "${proxy_env[@]}" /tmp/ring_resp_proxy --path "${ring_path}" --map-size "${ring_size}" --map-offset "${ring_offset}" --ring "${ring_idx}" --listen "${listen_addr}" "${secure_args[@]}" >/tmp/ring_resp_proxy.log 2>&1 & echo $! > /tmp/ring_resp_proxy.pid )
   sleep 0.3
 }
 

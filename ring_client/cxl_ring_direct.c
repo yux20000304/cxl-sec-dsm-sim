@@ -248,6 +248,13 @@ static inline void pause_ns(uint64_t ns) {
 
 static inline void bench_sleep_ns(uint64_t ns, struct cost_stats *cs, int collect_cost) {
     if (!ns) return;
+    /* Avoid nanosleep() for tiny intervals: on many kernels this rounds up to
+     * coarse scheduler ticks (ms) and can dominate tail latency. */
+    if (ns <= 100000ULL) {
+        pause_ns(ns);
+        if (collect_cost && cs) cs->sleep_ns += ns;
+        return;
+    }
     struct timespec ts;
     ts.tv_sec = (time_t)(ns / 1000000000ULL);
     ts.tv_nsec = (long)(ns % 1000000000ULL);
@@ -1425,15 +1432,29 @@ int main(int argc, char **argv) {
     const char *offset_env = getenv("CXL_RING_OFFSET");
     if (!offset_env || !offset_env[0]) offset_env = getenv("CXL_SHM_OFFSET");
     if (offset_env && offset_env[0]) {
-        unsigned long long v = strtoull(offset_env, NULL, 0);
-        if (v > 0) map_offset = (size_t)v;
+        size_t v = 0;
+        if (parse_size(offset_env, &v) == 0 && v > 0) map_offset = v;
     }
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--path") && i + 1 < argc) path = argv[++i];
-        else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) map_size = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) {
+            size_t v = 0;
+            if (parse_size(argv[++i], &v) != 0) {
+                fprintf(stderr, "[!] Invalid --map-size\n");
+                return 2;
+            }
+            map_size = v;
+        }
         else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench_n = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) map_offset = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) {
+            size_t v = 0;
+            if (parse_size(argv[++i], &v) != 0) {
+                fprintf(stderr, "[!] Invalid --map-offset\n");
+                return 2;
+            }
+            map_offset = v;
+        }
         else if (!strcmp(argv[i], "--pipeline")) pipeline = 1;
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ring") && i + 1 < argc) ring_idx = atoi(argv[++i]);

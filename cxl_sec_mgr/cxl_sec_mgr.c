@@ -476,7 +476,7 @@ int main(int argc, char **argv) {
     const char *offset_env = getenv("CXL_RING_OFFSET");
     if (!offset_env || !offset_env[0]) offset_env = getenv("CXL_SHM_OFFSET");
     if (offset_env && offset_env[0]) {
-        map_offset = strtoull(offset_env, NULL, 0);
+        (void)parse_size_u64(offset_env, &map_offset);
     }
 
     const char *rc_env = getenv("CXL_RING_COUNT");
@@ -502,9 +502,15 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--listen") && i + 1 < argc) {
             listen = argv[++i];
         } else if (!strcmp(argv[i], "--map-size") && i + 1 < argc) {
-            map_size = strtoull(argv[++i], NULL, 0);
+            if (parse_size_u64(argv[++i], &map_size) != 0) {
+                fprintf(stderr, "[!] Invalid --map-size\n");
+                return 2;
+            }
         } else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) {
-            map_offset = strtoull(argv[++i], NULL, 0);
+            if (parse_size_u64(argv[++i], &map_offset) != 0) {
+                fprintf(stderr, "[!] Invalid --map-offset\n");
+                return 2;
+            }
         } else if (!strcmp(argv[i], "--tdx-ring")) {
             tdx_ring = 1;
         } else if (!strcmp(argv[i], "--ring-count") && i + 1 < argc) {

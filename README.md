@@ -280,6 +280,7 @@ sudo -E bash scripts/host_recreate_and_bench_tdx.sh
 Outputs:
 - Redis: `results/tdx_compare_*.csv` (`TDXNativeTCP`, `TDXRing`, `TDXRingSecure`)
 - GAPBS: `results/tdx_gapbs_compare_*_*.csv` (`TDXGapbsNative`, `TDXGapbsMultihostRing`, `TDXGapbsMultihostCrypto`, `TDXGapbsMultihostSecure`, includes `vm=avg`)
+- GAPBS overhead: `results/tdx_gapbs_overhead_*_*.csv` (per-VM `attach_total_ms`, `wait_ms`, `decrypt_ms`, `pretouch_ms`)
 
 Note: the ivshmem-backed “shared CXL medium” is shared memory and not protected by TDX; use the `*Secure` variants if you need payload crypto/auth.
 

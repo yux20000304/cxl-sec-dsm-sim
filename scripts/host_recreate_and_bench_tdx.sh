@@ -72,8 +72,12 @@ set -euo pipefail
 #   GAPBS_KERNEL_LIST : comma-separated kernels to run (overrides GAPBS_KERNEL), e.g. "bfs,sssp,pr,cc,bc,tc"
 #   SCALE             : -g scale for Kronecker graph (default: 22)
 #   DEGREE            : -k degree for synthetic graph (default: 16)
-#   TRIALS            : -n trials (default: 3)
+#   TRIALS            : -n trials (default: 5)
 #   OMP_THREADS       : OMP_NUM_THREADS (default: 4)
+#   OMP_PROC_BIND     : OpenMP thread pinning (default: true)
+#   OMP_PLACES        : OpenMP place list (default: cores)
+#   GAPBS_DROP_FIRST_TRIAL : drop the first Trial Time when computing avg_time_s (default: 1)
+#   GAPBS_CXL_PRETOUCH_RING : enable GAPBS_CXL_PRETOUCH for ring attach runs (default: 1)
 #   GAPBS_CXL_MAP_SIZE: mmap size in bytes for the GAPBS graph region (default: 2147483648 = 2GB)
 #   SEC_MGR_TIMEOUT_MS: cxl_sec_mgr wait timeout for graph header (default: 600000)
 #
@@ -169,8 +173,12 @@ GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
 GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-}"
 SCALE="${SCALE:-22}"
 DEGREE="${DEGREE:-16}"
-TRIALS="${TRIALS:-3}"
+TRIALS="${TRIALS:-5}"
 OMP_THREADS="${OMP_THREADS:-4}"
+OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
+OMP_PLACES="${OMP_PLACES:-cores}"
+GAPBS_DROP_FIRST_TRIAL="${GAPBS_DROP_FIRST_TRIAL:-1}"
+GAPBS_CXL_PRETOUCH_RING="${GAPBS_CXL_PRETOUCH_RING:-0}"
 GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-2147483648}"
 GAPBS_CXL_MAP_OFFSET_VM1="${GAPBS_CXL_MAP_OFFSET_VM1:-0}"
 GAPBS_CXL_MAP_OFFSET_VM2="${GAPBS_CXL_MAP_OFFSET_VM2:-0}"
@@ -202,8 +210,8 @@ if [[ -z "${TDX_BIOS}" ]]; then
   TDX_BIOS="$(pick_default_tdx_bios || true)"
 fi
 
-CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS:-100}"
-CXL_SHM_DELAY_NS_DEFAULT="${CXL_SHM_DELAY_NS_DEFAULT:-100}"
+CXL_SHM_DELAY_NS="${CXL_SHM_DELAY_NS:-70}"
+CXL_SHM_DELAY_NS_DEFAULT="${CXL_SHM_DELAY_NS_DEFAULT:-70}"
 
 host_numa_node_count() {
   local n=0
@@ -1367,7 +1375,78 @@ avg_from_log() {
     echo ""
     return 0
   fi
-  awk '/^Average Time:/{print $3; exit}' "${log}" | tr -d '\r' || true
+  if [[ "${GAPBS_DROP_FIRST_TRIAL}" == "1" ]]; then
+    awk '
+      /^Trial Time:/ { t[n++] = $3; next }
+      END {
+        if (n == 0) exit
+        start = (n > 1) ? 1 : 0
+        sum = 0
+        for (i = start; i < n; i++) sum += t[i]
+        cnt = n - start
+        if (cnt <= 0) exit
+        printf "%.5f", (sum / cnt)
+      }
+    ' "${log}" | tr -d '\r' || true
+  else
+    awk '/^Average Time:/{print $3; exit}' "${log}" | tr -d '\r' || true
+  fi
+}
+
+trials_in_log() {
+  local log="$1"
+  if [[ ! -f "${log}" ]]; then
+    echo ""
+    return 0
+  fi
+  awk 'BEGIN{n=0} /^Trial Time:/{n++} END{if (n>0) print n;}' "${log}" | tr -d '\r' || true
+}
+
+trials_used_for_avg_from_log() {
+  local log="$1"
+  local n
+  n="$(trials_in_log "${log}")"
+  if [[ -z "${n}" ]]; then
+    echo ""
+    return 0
+  fi
+  if [[ "${GAPBS_DROP_FIRST_TRIAL}" == "1" && "${n}" -gt 1 ]]; then
+    echo $((n - 1))
+  else
+    echo "${n}"
+  fi
+}
+
+e2e_avg_time_s_from_avg_attach_ms() {
+  local avg_s="$1"
+  local attach_ms="$2"
+  local trials_used="$3"
+  awk -v avg="${avg_s}" -v ms="${attach_ms}" -v n="${trials_used}" 'BEGIN{
+    if (avg == "" || n == "" || n == 0) { print ""; exit }
+    if (ms == "") ms = 0
+    printf "%.5f", (avg + (ms / 1000.0) / n)
+  }'
+}
+
+cxl_attach_field_from_log() {
+  local log="$1"
+  local key="$2"
+  if [[ ! -f "${log}" ]]; then
+    echo ""
+    return 0
+  fi
+  awk -v k="${key}" '
+    /^\[gapbs\] CXL attach:/ {
+      for (i = 1; i <= NF; i++) {
+        if (index($i, k"=") == 1) {
+          v = $i;
+          sub(k"=", "", v);
+          print v;
+          exit;
+        }
+      }
+    }
+  ' "${log}" | tr -d '\r' || true
 }
 
 edges_for_teps_from_log() {
@@ -1460,28 +1539,29 @@ run_gapbs_kernel() {
   local gapbs_secure_vm2_log="${RESULTS_DIR}/tdx_gapbs_secure_vm2_${kernel}_${ts}.log"
 
   local gapbs_compare_csv="${RESULTS_DIR}/tdx_gapbs_compare_${kernel}_${ts}.csv"
+  local gapbs_overhead_csv="${RESULTS_DIR}/tdx_gapbs_overhead_${kernel}_${ts}.csv"
 
   echo "[*] GAPBS kernel=${kernel}: native in vm1"
-  ssh_vm1 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' ./'${kernel}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm1 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' ./'${kernel}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     | tee "${gapbs_native_vm1_log}"
 
   echo "[*] GAPBS kernel=${kernel}: native in vm2"
-  ssh_vm2 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' ./'${kernel}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+  ssh_vm2 "cd /mnt/hostshare/gapbs && OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' ./'${kernel}' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
     | tee "${gapbs_native_vm2_log}"
 
   echo "[*] GAPBS kernel=${kernel}: multihost ring publish in vm1"
-  ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+  ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n 1" \
     | tee "${gapbs_ring_pub_log}"
 
   echo "[*] GAPBS kernel=${kernel}: multihost ring attach+run in vm1+vm2 (concurrent)"
   (
-    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PRETOUCH='${GAPBS_CXL_PRETOUCH_RING}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
       >"${gapbs_ring_vm1_log}" 2>&1
   ) &
   local pid_gapbs_ring_vm1=$!
 
   (
-    ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+    ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PRETOUCH='${GAPBS_CXL_PRETOUCH_RING}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach ./'${kernel}-ring' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
       >"${gapbs_ring_vm2_log}" 2>&1
   ) &
   local pid_gapbs_ring_vm2=$!
@@ -1496,18 +1576,18 @@ run_gapbs_kernel() {
     crypto_key_common_hex="$(openssl rand -hex 32)"
 
     echo "[*] GAPBS kernel=${kernel}: multihost crypto publish in vm1 (libsodium; no mgr)"
-    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
       | tee "${gapbs_crypto_pub_log}"
 
     echo "[*] GAPBS kernel=${kernel}: multihost crypto attach+run in vm1+vm2 (concurrent)"
     (
-      ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+      ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
         >"${gapbs_crypto_vm1_log}" 2>&1
     ) &
     local pid_gapbs_crypto_vm1=$!
 
     (
-      ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX='${crypto_key_vm2_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+      ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX='${crypto_key_vm2_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
         >"${gapbs_crypto_vm2_log}" 2>&1
     ) &
     local pid_gapbs_crypto_vm2=$!
@@ -1548,18 +1628,18 @@ tail -n 200 \"${gapbs_sec_mgr_remote}\" >&2 || true
 exit 1
 '"
 
-    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
       | tee "${gapbs_secure_pub_log}"
 
     echo "[*] GAPBS kernel=${kernel}: multihost secure attach+run in vm1+vm2 (concurrent)"
     (
-      ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+      ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='127.0.0.1:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=1 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
         >"${gapbs_secure_vm1_log}" 2>&1
     ) &
     local pid_gapbs_secure_vm1=$!
 
     (
-      ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${VMNET_VM1_IP}:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=2 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+      ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS='${SEC_MGR_TIMEOUT_MS}' CXL_SEC_MGR='${VMNET_VM1_IP}:${SEC_MGR_PORT}' CXL_SEC_NODE_ID=2 ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
         >"${gapbs_secure_vm2_log}" 2>&1
     ) &
     local pid_gapbs_secure_vm2=$!
@@ -1580,6 +1660,17 @@ exit 1
   gapbs_crypto_vm2_avg="$(avg_from_log "${gapbs_crypto_vm2_log}")"
   gapbs_secure_vm1_avg="$(avg_from_log "${gapbs_secure_vm1_log}")"
   gapbs_secure_vm2_avg="$(avg_from_log "${gapbs_secure_vm2_log}")"
+
+  local gapbs_native_vm1_trials_used gapbs_native_vm2_trials_used gapbs_ring_vm1_trials_used gapbs_ring_vm2_trials_used
+  local gapbs_crypto_vm1_trials_used gapbs_crypto_vm2_trials_used gapbs_secure_vm1_trials_used gapbs_secure_vm2_trials_used
+  gapbs_native_vm1_trials_used="$(trials_used_for_avg_from_log "${gapbs_native_vm1_log}")"
+  gapbs_native_vm2_trials_used="$(trials_used_for_avg_from_log "${gapbs_native_vm2_log}")"
+  gapbs_ring_vm1_trials_used="$(trials_used_for_avg_from_log "${gapbs_ring_vm1_log}")"
+  gapbs_ring_vm2_trials_used="$(trials_used_for_avg_from_log "${gapbs_ring_vm2_log}")"
+  gapbs_crypto_vm1_trials_used="$(trials_used_for_avg_from_log "${gapbs_crypto_vm1_log}")"
+  gapbs_crypto_vm2_trials_used="$(trials_used_for_avg_from_log "${gapbs_crypto_vm2_log}")"
+  gapbs_secure_vm1_trials_used="$(trials_used_for_avg_from_log "${gapbs_secure_vm1_log}")"
+  gapbs_secure_vm2_trials_used="$(trials_used_for_avg_from_log "${gapbs_secure_vm2_log}")"
 
   local gapbs_native_vm1_edges gapbs_native_vm2_edges gapbs_ring_vm1_edges gapbs_ring_vm2_edges gapbs_crypto_vm1_edges gapbs_crypto_vm2_edges gapbs_secure_vm1_edges gapbs_secure_vm2_edges
   gapbs_native_vm1_edges="$(edges_for_teps_from_log "${gapbs_native_vm1_log}")"
@@ -1619,25 +1710,134 @@ exit 1
   gapbs_crypto_avg_teps="$(avg2_int "${gapbs_crypto_vm1_teps}" "${gapbs_crypto_vm2_teps}")"
   gapbs_secure_avg_teps="$(avg2_int "${gapbs_secure_vm1_teps}" "${gapbs_secure_vm2_teps}")"
 
+  local gapbs_ring_vm1_attach_total_ms gapbs_ring_vm2_attach_total_ms gapbs_ring_vm1_attach_wait_ms gapbs_ring_vm2_attach_wait_ms
+  local gapbs_ring_vm1_attach_decrypt_ms gapbs_ring_vm2_attach_decrypt_ms gapbs_ring_vm1_attach_pretouch_ms gapbs_ring_vm2_attach_pretouch_ms
+  gapbs_ring_vm1_attach_total_ms="$(cxl_attach_field_from_log "${gapbs_ring_vm1_log}" total_ms)"
+  gapbs_ring_vm2_attach_total_ms="$(cxl_attach_field_from_log "${gapbs_ring_vm2_log}" total_ms)"
+  gapbs_ring_vm1_attach_wait_ms="$(cxl_attach_field_from_log "${gapbs_ring_vm1_log}" wait_ms)"
+  gapbs_ring_vm2_attach_wait_ms="$(cxl_attach_field_from_log "${gapbs_ring_vm2_log}" wait_ms)"
+  gapbs_ring_vm1_attach_decrypt_ms="$(cxl_attach_field_from_log "${gapbs_ring_vm1_log}" decrypt_ms)"
+  gapbs_ring_vm2_attach_decrypt_ms="$(cxl_attach_field_from_log "${gapbs_ring_vm2_log}" decrypt_ms)"
+  gapbs_ring_vm1_attach_pretouch_ms="$(cxl_attach_field_from_log "${gapbs_ring_vm1_log}" pretouch_ms)"
+  gapbs_ring_vm2_attach_pretouch_ms="$(cxl_attach_field_from_log "${gapbs_ring_vm2_log}" pretouch_ms)"
+
+  local gapbs_ring_avg_attach_total_ms gapbs_ring_avg_attach_wait_ms gapbs_ring_avg_attach_decrypt_ms gapbs_ring_avg_attach_pretouch_ms
+  gapbs_ring_avg_attach_total_ms="$(avg2_int "${gapbs_ring_vm1_attach_total_ms}" "${gapbs_ring_vm2_attach_total_ms}")"
+  gapbs_ring_avg_attach_wait_ms="$(avg2_int "${gapbs_ring_vm1_attach_wait_ms}" "${gapbs_ring_vm2_attach_wait_ms}")"
+  gapbs_ring_avg_attach_decrypt_ms="$(avg2_int "${gapbs_ring_vm1_attach_decrypt_ms}" "${gapbs_ring_vm2_attach_decrypt_ms}")"
+  gapbs_ring_avg_attach_pretouch_ms="$(avg2_int "${gapbs_ring_vm1_attach_pretouch_ms}" "${gapbs_ring_vm2_attach_pretouch_ms}")"
+
+  local gapbs_native_vm1_e2e_avg gapbs_native_vm2_e2e_avg gapbs_native_avg_e2e_time
+  local gapbs_ring_vm1_e2e_avg gapbs_ring_vm2_e2e_avg gapbs_ring_avg_e2e_time
+  local gapbs_crypto_vm1_e2e_avg gapbs_crypto_vm2_e2e_avg gapbs_crypto_avg_e2e_time
+  local gapbs_secure_vm1_e2e_avg gapbs_secure_vm2_e2e_avg gapbs_secure_avg_e2e_time
+
+  local gapbs_native_vm1_e2e_teps gapbs_native_vm2_e2e_teps gapbs_native_avg_e2e_teps
+  local gapbs_ring_vm1_e2e_teps gapbs_ring_vm2_e2e_teps gapbs_ring_avg_e2e_teps
+  local gapbs_crypto_vm1_e2e_teps gapbs_crypto_vm2_e2e_teps gapbs_crypto_avg_e2e_teps
+  local gapbs_secure_vm1_e2e_teps gapbs_secure_vm2_e2e_teps gapbs_secure_avg_e2e_teps
+
+  gapbs_native_vm1_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_native_vm1_avg}" 0 "${gapbs_native_vm1_trials_used}")"
+  gapbs_native_vm2_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_native_vm2_avg}" 0 "${gapbs_native_vm2_trials_used}")"
+  gapbs_native_avg_e2e_time="$(avg2_float "${gapbs_native_vm1_e2e_avg}" "${gapbs_native_vm2_e2e_avg}")"
+  gapbs_native_vm1_e2e_teps="$(teps_from_edges_time "${gapbs_native_vm1_edges}" "${gapbs_native_vm1_e2e_avg}")"
+  gapbs_native_vm2_e2e_teps="$(teps_from_edges_time "${gapbs_native_vm2_edges}" "${gapbs_native_vm2_e2e_avg}")"
+  gapbs_native_avg_e2e_teps="$(avg2_int "${gapbs_native_vm1_e2e_teps}" "${gapbs_native_vm2_e2e_teps}")"
+
+  gapbs_ring_vm1_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_ring_vm1_avg}" "${gapbs_ring_vm1_attach_total_ms}" "${gapbs_ring_vm1_trials_used}")"
+  gapbs_ring_vm2_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_ring_vm2_avg}" "${gapbs_ring_vm2_attach_total_ms}" "${gapbs_ring_vm2_trials_used}")"
+  gapbs_ring_avg_e2e_time="$(avg2_float "${gapbs_ring_vm1_e2e_avg}" "${gapbs_ring_vm2_e2e_avg}")"
+  gapbs_ring_vm1_e2e_teps="$(teps_from_edges_time "${gapbs_ring_vm1_edges}" "${gapbs_ring_vm1_e2e_avg}")"
+  gapbs_ring_vm2_e2e_teps="$(teps_from_edges_time "${gapbs_ring_vm2_edges}" "${gapbs_ring_vm2_e2e_avg}")"
+  gapbs_ring_avg_e2e_teps="$(avg2_int "${gapbs_ring_vm1_e2e_teps}" "${gapbs_ring_vm2_e2e_teps}")"
+
+  local gapbs_crypto_vm1_attach_total_ms gapbs_crypto_vm2_attach_total_ms gapbs_crypto_vm1_attach_wait_ms gapbs_crypto_vm2_attach_wait_ms
+  local gapbs_crypto_vm1_attach_decrypt_ms gapbs_crypto_vm2_attach_decrypt_ms gapbs_crypto_vm1_attach_pretouch_ms gapbs_crypto_vm2_attach_pretouch_ms
+  local gapbs_crypto_avg_attach_total_ms gapbs_crypto_avg_attach_wait_ms gapbs_crypto_avg_attach_decrypt_ms gapbs_crypto_avg_attach_pretouch_ms
+
+  local gapbs_secure_vm1_attach_total_ms gapbs_secure_vm2_attach_total_ms gapbs_secure_vm1_attach_wait_ms gapbs_secure_vm2_attach_wait_ms
+  local gapbs_secure_vm1_attach_decrypt_ms gapbs_secure_vm2_attach_decrypt_ms gapbs_secure_vm1_attach_pretouch_ms gapbs_secure_vm2_attach_pretouch_ms
+  local gapbs_secure_avg_attach_total_ms gapbs_secure_avg_attach_wait_ms gapbs_secure_avg_attach_decrypt_ms gapbs_secure_avg_attach_pretouch_ms
+
+  if [[ "${ENABLE_SECURE}" == "1" ]]; then
+    gapbs_crypto_vm1_attach_total_ms="$(cxl_attach_field_from_log "${gapbs_crypto_vm1_log}" total_ms)"
+    gapbs_crypto_vm2_attach_total_ms="$(cxl_attach_field_from_log "${gapbs_crypto_vm2_log}" total_ms)"
+    gapbs_crypto_vm1_attach_wait_ms="$(cxl_attach_field_from_log "${gapbs_crypto_vm1_log}" wait_ms)"
+    gapbs_crypto_vm2_attach_wait_ms="$(cxl_attach_field_from_log "${gapbs_crypto_vm2_log}" wait_ms)"
+    gapbs_crypto_vm1_attach_decrypt_ms="$(cxl_attach_field_from_log "${gapbs_crypto_vm1_log}" decrypt_ms)"
+    gapbs_crypto_vm2_attach_decrypt_ms="$(cxl_attach_field_from_log "${gapbs_crypto_vm2_log}" decrypt_ms)"
+    gapbs_crypto_vm1_attach_pretouch_ms="$(cxl_attach_field_from_log "${gapbs_crypto_vm1_log}" pretouch_ms)"
+    gapbs_crypto_vm2_attach_pretouch_ms="$(cxl_attach_field_from_log "${gapbs_crypto_vm2_log}" pretouch_ms)"
+
+    gapbs_crypto_avg_attach_total_ms="$(avg2_int "${gapbs_crypto_vm1_attach_total_ms}" "${gapbs_crypto_vm2_attach_total_ms}")"
+    gapbs_crypto_avg_attach_wait_ms="$(avg2_int "${gapbs_crypto_vm1_attach_wait_ms}" "${gapbs_crypto_vm2_attach_wait_ms}")"
+    gapbs_crypto_avg_attach_decrypt_ms="$(avg2_int "${gapbs_crypto_vm1_attach_decrypt_ms}" "${gapbs_crypto_vm2_attach_decrypt_ms}")"
+    gapbs_crypto_avg_attach_pretouch_ms="$(avg2_int "${gapbs_crypto_vm1_attach_pretouch_ms}" "${gapbs_crypto_vm2_attach_pretouch_ms}")"
+
+    gapbs_secure_vm1_attach_total_ms="$(cxl_attach_field_from_log "${gapbs_secure_vm1_log}" total_ms)"
+    gapbs_secure_vm2_attach_total_ms="$(cxl_attach_field_from_log "${gapbs_secure_vm2_log}" total_ms)"
+    gapbs_secure_vm1_attach_wait_ms="$(cxl_attach_field_from_log "${gapbs_secure_vm1_log}" wait_ms)"
+    gapbs_secure_vm2_attach_wait_ms="$(cxl_attach_field_from_log "${gapbs_secure_vm2_log}" wait_ms)"
+    gapbs_secure_vm1_attach_decrypt_ms="$(cxl_attach_field_from_log "${gapbs_secure_vm1_log}" decrypt_ms)"
+    gapbs_secure_vm2_attach_decrypt_ms="$(cxl_attach_field_from_log "${gapbs_secure_vm2_log}" decrypt_ms)"
+    gapbs_secure_vm1_attach_pretouch_ms="$(cxl_attach_field_from_log "${gapbs_secure_vm1_log}" pretouch_ms)"
+    gapbs_secure_vm2_attach_pretouch_ms="$(cxl_attach_field_from_log "${gapbs_secure_vm2_log}" pretouch_ms)"
+
+    gapbs_secure_avg_attach_total_ms="$(avg2_int "${gapbs_secure_vm1_attach_total_ms}" "${gapbs_secure_vm2_attach_total_ms}")"
+    gapbs_secure_avg_attach_wait_ms="$(avg2_int "${gapbs_secure_vm1_attach_wait_ms}" "${gapbs_secure_vm2_attach_wait_ms}")"
+    gapbs_secure_avg_attach_decrypt_ms="$(avg2_int "${gapbs_secure_vm1_attach_decrypt_ms}" "${gapbs_secure_vm2_attach_decrypt_ms}")"
+    gapbs_secure_avg_attach_pretouch_ms="$(avg2_int "${gapbs_secure_vm1_attach_pretouch_ms}" "${gapbs_secure_vm2_attach_pretouch_ms}")"
+
+    gapbs_crypto_vm1_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_crypto_vm1_avg}" "${gapbs_crypto_vm1_attach_total_ms}" "${gapbs_crypto_vm1_trials_used}")"
+    gapbs_crypto_vm2_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_crypto_vm2_avg}" "${gapbs_crypto_vm2_attach_total_ms}" "${gapbs_crypto_vm2_trials_used}")"
+    gapbs_crypto_avg_e2e_time="$(avg2_float "${gapbs_crypto_vm1_e2e_avg}" "${gapbs_crypto_vm2_e2e_avg}")"
+    gapbs_crypto_vm1_e2e_teps="$(teps_from_edges_time "${gapbs_crypto_vm1_edges}" "${gapbs_crypto_vm1_e2e_avg}")"
+    gapbs_crypto_vm2_e2e_teps="$(teps_from_edges_time "${gapbs_crypto_vm2_edges}" "${gapbs_crypto_vm2_e2e_avg}")"
+    gapbs_crypto_avg_e2e_teps="$(avg2_int "${gapbs_crypto_vm1_e2e_teps}" "${gapbs_crypto_vm2_e2e_teps}")"
+
+    gapbs_secure_vm1_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_secure_vm1_avg}" "${gapbs_secure_vm1_attach_total_ms}" "${gapbs_secure_vm1_trials_used}")"
+    gapbs_secure_vm2_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_secure_vm2_avg}" "${gapbs_secure_vm2_attach_total_ms}" "${gapbs_secure_vm2_trials_used}")"
+    gapbs_secure_avg_e2e_time="$(avg2_float "${gapbs_secure_vm1_e2e_avg}" "${gapbs_secure_vm2_e2e_avg}")"
+    gapbs_secure_vm1_e2e_teps="$(teps_from_edges_time "${gapbs_secure_vm1_edges}" "${gapbs_secure_vm1_e2e_avg}")"
+    gapbs_secure_vm2_e2e_teps="$(teps_from_edges_time "${gapbs_secure_vm2_edges}" "${gapbs_secure_vm2_e2e_avg}")"
+    gapbs_secure_avg_e2e_teps="$(avg2_int "${gapbs_secure_vm1_e2e_teps}" "${gapbs_secure_vm2_e2e_teps}")"
+  fi
+
+  {
+    echo "label,vm,kernel,scale,degree,trials,omp_threads,attach_total_ms,attach_wait_ms,attach_decrypt_ms,attach_pretouch_ms"
+    echo "TDXGapbsMultihostRing,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm1_attach_total_ms},${gapbs_ring_vm1_attach_wait_ms},${gapbs_ring_vm1_attach_decrypt_ms},${gapbs_ring_vm1_attach_pretouch_ms}"
+    echo "TDXGapbsMultihostRing,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm2_attach_total_ms},${gapbs_ring_vm2_attach_wait_ms},${gapbs_ring_vm2_attach_decrypt_ms},${gapbs_ring_vm2_attach_pretouch_ms}"
+    echo "TDXGapbsMultihostRing,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_avg_attach_total_ms},${gapbs_ring_avg_attach_wait_ms},${gapbs_ring_avg_attach_decrypt_ms},${gapbs_ring_avg_attach_pretouch_ms}"
+    if [[ "${ENABLE_SECURE}" == "1" ]]; then
+      echo "TDXGapbsMultihostCrypto,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm1_attach_total_ms},${gapbs_crypto_vm1_attach_wait_ms},${gapbs_crypto_vm1_attach_decrypt_ms},${gapbs_crypto_vm1_attach_pretouch_ms}"
+      echo "TDXGapbsMultihostCrypto,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm2_attach_total_ms},${gapbs_crypto_vm2_attach_wait_ms},${gapbs_crypto_vm2_attach_decrypt_ms},${gapbs_crypto_vm2_attach_pretouch_ms}"
+      echo "TDXGapbsMultihostCrypto,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_avg_attach_total_ms},${gapbs_crypto_avg_attach_wait_ms},${gapbs_crypto_avg_attach_decrypt_ms},${gapbs_crypto_avg_attach_pretouch_ms}"
+      echo "TDXGapbsMultihostSecure,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm1_attach_total_ms},${gapbs_secure_vm1_attach_wait_ms},${gapbs_secure_vm1_attach_decrypt_ms},${gapbs_secure_vm1_attach_pretouch_ms}"
+      echo "TDXGapbsMultihostSecure,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm2_attach_total_ms},${gapbs_secure_vm2_attach_wait_ms},${gapbs_secure_vm2_attach_decrypt_ms},${gapbs_secure_vm2_attach_pretouch_ms}"
+      echo "TDXGapbsMultihostSecure,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_avg_attach_total_ms},${gapbs_secure_avg_attach_wait_ms},${gapbs_secure_avg_attach_decrypt_ms},${gapbs_secure_avg_attach_pretouch_ms}"
+    fi
+  } > "${gapbs_overhead_csv}"
+
   {
     echo "label,vm,kernel,scale,degree,trials,omp_threads,edge_traversals,avg_time_s,throughput_teps"
-    echo "TDXGapbsNative,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_vm1_edges},${gapbs_native_vm1_avg},${gapbs_native_vm1_teps}"
-    echo "TDXGapbsNative,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_vm2_edges},${gapbs_native_vm2_avg},${gapbs_native_vm2_teps}"
-    echo "TDXGapbsNative,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_avg_edges},${gapbs_native_avg_time},${gapbs_native_avg_teps}"
-    echo "TDXGapbsMultihostRing,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm1_edges},${gapbs_ring_vm1_avg},${gapbs_ring_vm1_teps}"
-    echo "TDXGapbsMultihostRing,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm2_edges},${gapbs_ring_vm2_avg},${gapbs_ring_vm2_teps}"
-    echo "TDXGapbsMultihostRing,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_avg_edges},${gapbs_ring_avg_time},${gapbs_ring_avg_teps}"
+    echo "TDXGapbsNative,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_vm1_edges},${gapbs_native_vm1_e2e_avg},${gapbs_native_vm1_e2e_teps}"
+    echo "TDXGapbsNative,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_vm2_edges},${gapbs_native_vm2_e2e_avg},${gapbs_native_vm2_e2e_teps}"
+    echo "TDXGapbsNative,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_native_avg_edges},${gapbs_native_avg_e2e_time},${gapbs_native_avg_e2e_teps}"
+    echo "TDXGapbsMultihostRing,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm1_edges},${gapbs_ring_vm1_e2e_avg},${gapbs_ring_vm1_e2e_teps}"
+    echo "TDXGapbsMultihostRing,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_vm2_edges},${gapbs_ring_vm2_e2e_avg},${gapbs_ring_vm2_e2e_teps}"
+    echo "TDXGapbsMultihostRing,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_ring_avg_edges},${gapbs_ring_avg_e2e_time},${gapbs_ring_avg_e2e_teps}"
     if [[ "${ENABLE_SECURE}" == "1" ]]; then
-      echo "TDXGapbsMultihostCrypto,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm1_edges},${gapbs_crypto_vm1_avg},${gapbs_crypto_vm1_teps}"
-      echo "TDXGapbsMultihostCrypto,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm2_edges},${gapbs_crypto_vm2_avg},${gapbs_crypto_vm2_teps}"
-      echo "TDXGapbsMultihostCrypto,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_avg_edges},${gapbs_crypto_avg_time},${gapbs_crypto_avg_teps}"
-      echo "TDXGapbsMultihostSecure,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm1_edges},${gapbs_secure_vm1_avg},${gapbs_secure_vm1_teps}"
-      echo "TDXGapbsMultihostSecure,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm2_edges},${gapbs_secure_vm2_avg},${gapbs_secure_vm2_teps}"
-      echo "TDXGapbsMultihostSecure,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_avg_edges},${gapbs_secure_avg_time},${gapbs_secure_avg_teps}"
+      echo "TDXGapbsMultihostCrypto,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm1_edges},${gapbs_crypto_vm1_e2e_avg},${gapbs_crypto_vm1_e2e_teps}"
+      echo "TDXGapbsMultihostCrypto,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_vm2_edges},${gapbs_crypto_vm2_e2e_avg},${gapbs_crypto_vm2_e2e_teps}"
+      echo "TDXGapbsMultihostCrypto,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_crypto_avg_edges},${gapbs_crypto_avg_e2e_time},${gapbs_crypto_avg_e2e_teps}"
+      echo "TDXGapbsMultihostSecure,vm1,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm1_edges},${gapbs_secure_vm1_e2e_avg},${gapbs_secure_vm1_e2e_teps}"
+      echo "TDXGapbsMultihostSecure,vm2,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_vm2_edges},${gapbs_secure_vm2_e2e_avg},${gapbs_secure_vm2_e2e_teps}"
+      echo "TDXGapbsMultihostSecure,avg,${kernel},${SCALE},${DEGREE},${TRIALS},${OMP_THREADS},${gapbs_secure_avg_edges},${gapbs_secure_avg_e2e_time},${gapbs_secure_avg_e2e_teps}"
     fi
   } > "${gapbs_compare_csv}"
 
   echo "[*] GAPBS kernel=${kernel}: saved ${gapbs_compare_csv}"
+  echo "[*] GAPBS kernel=${kernel}: saved ${gapbs_overhead_csv}"
 }
 
 gapbs_kernels=( )
@@ -1660,3 +1860,4 @@ echo "    ${ring_secure_log}"
 echo "    ${ring_secure_csv}"
 echo "    ${compare_csv}"
 echo "    GAPBS CSVs: ${RESULTS_DIR}/tdx_gapbs_compare_*_${ts}.csv"
+echo "    GAPBS overhead CSVs: ${RESULTS_DIR}/tdx_gapbs_overhead_*_${ts}.csv"
