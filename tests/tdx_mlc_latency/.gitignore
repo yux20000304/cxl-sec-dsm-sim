@@ -1,0 +1,8 @@
+# Do not commit Intel MLC binaries/tarballs (license) or local build outputs.
+mlc/
+*.tgz
+*.tar.gz
+*.zip
+*.bin
+*.out
+
