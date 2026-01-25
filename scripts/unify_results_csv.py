@@ -262,6 +262,7 @@ def build_rows_for_ts(results_dir: Path, ts: str) -> List[Dict[str, str]]:
     # Redis: ring/ring-secure from CSV.
     for scenario, csv_name in [
         ("TDXRing", f"tdx_ring_{ts}.csv"),
+        ("TDXRingCrypto", f"tdx_ring_crypto_{ts}.csv"),
         ("TDXRingSecure", f"tdx_ring_secure_{ts}.csv"),
     ]:
         p = results_dir / csv_name
@@ -405,4 +406,3 @@ def main(argv: List[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-

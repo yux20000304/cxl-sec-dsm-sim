@@ -4,7 +4,7 @@ This repository runs **Redis / YCSB / GAPBS** on top of a **2-VM Intel TDX setup
 
 - `ring`: direct shared-memory access (no crypto / no ACL)
 - `secure`: `cxl_sec_mgr`-managed ACL + per-payload crypto/auth (libsodium)
-- `crypto`: manager-less software crypto (used by GAPBS in this repo)
+- `crypto`: manager-less software crypto (used by GAPBS and Redis ring-crypto in this repo)
 
 Primary entry points:
 
@@ -156,8 +156,8 @@ bash scripts/host_tdx_batch_suite.sh
 
 ### 4.1 Redis
 
-- `results/tdx_compare_<ts>.csv`: overview throughput (`TDXNativeTCP`, `TDXSodiumTCP`, `TDXRing`, `TDXRingSecure`)
-- `results/tdx_ring_<ts>.csv` / `results/tdx_ring_secure_<ts>.csv`: detailed ring metrics (throughput, latency percentiles, `sleep_ms`, etc.)
+- `results/tdx_compare_<ts>.csv`: overview throughput (`TDXNativeTCP`, `TDXSodiumTCP`, `TDXRing`, `TDXRingCrypto`, `TDXRingSecure`)
+- `results/tdx_ring_<ts>.csv` / `results/tdx_ring_crypto_<ts>.csv` / `results/tdx_ring_secure_<ts>.csv`: detailed ring metrics (throughput, latency percentiles, `sleep_ms`, etc.)
 - `results/tdx_*_tcp_<ts>.log`: raw `redis-benchmark` logs for native/sodium TCP
 
 ### 4.2 GAPBS
@@ -198,6 +198,7 @@ Frequently used knobs supported by `scripts/host_recreate_and_bench_tdx.sh`:
 - Ring polling: `CXL_RING_POLL_SPIN_NS` `CXL_RING_POLL_SLEEP_NS`
 - YCSB: `YCSB_ENABLE=1` `YCSB_WORKLOADS` `YCSB_RECORDS` `YCSB_OPS` `YCSB_THREADS`
 - GAPBS: `GAPBS_KERNEL_LIST` `SCALE` `DEGREE` `TRIALS` `OMP_THREADS` `GAPBS_DROP_FIRST_TRIAL`
+- Crypto ring: `ENABLE_CRYPTO=1` `CXL_SEC_KEY_HEX` `CXL_SEC_COMMON_KEY_HEX` `CXL_CRYPTO_PRIV_REGION_BASE` `CXL_CRYPTO_PRIV_REGION_SIZE`
 
 ---
 

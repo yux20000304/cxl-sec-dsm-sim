@@ -8,7 +8,8 @@ set -euo pipefail
 # 1) TDXNativeTCP:      native Redis (TCP/RESP) baseline (VM2 -> VM1 via internal NIC cxl0).
 # 2) TDXSodiumTCP:      native Redis over libsodium-encrypted TCP (user-space tunnel) (VM2 -> VM1 via cxl0).
 # 3) TDXRing:           ring-enabled Redis (shared-memory ring, no RESP) (VM2 -> VM1 via ivshmem BAR2).
-# 4) TDXRingSecure:     ring-enabled Redis + ACL + software crypto (cxl_sec_mgr + libsodium).
+# 4) TDXRingCrypto:     ring-enabled Redis + software crypto (per-VM key + common key; no mgr).
+# 5) TDXRingSecure:     ring-enabled Redis + ACL + software crypto (cxl_sec_mgr + libsodium).
 #
 # GAPBS:
 # 4) TDXGapbsNative:           native GAPBS binary (vm1 + vm2).
@@ -37,6 +38,7 @@ set -euo pipefail
 #   CLIENTS        : redis-benchmark concurrency (default: 4)
 #   THREADS        : redis-benchmark threads (default: 4)
 #   PIPELINE       : redis-benchmark pipeline depth (-P) (default: 256)
+#   REDIS_BENCH_DATASIZE: redis-benchmark value size in bytes (-d) (default: 3)
 #   VMNET_VM1_IP   : VM1 internal IP on cxl0 (default: 192.168.100.1)
 #   VM1_MEM/VM2_MEM: guest memory (default: 4G)
 #   VM1_CPUS/VM2_CPUS: guest vCPUs (default: 4)
@@ -47,6 +49,8 @@ set -euo pipefail
 #   RING_REGION_SIZE: bytes per TDX SHM ring region (default: 16M)
 #   RING_REGION_BASE: base offset within BAR2 mmap (default: 4096; keeps page 0 unused for fair ring vs ring-secure)
 #   MAX_INFLIGHT   : ring client inflight limit (default: 512)
+#   RING_BENCH_KEY_SIZE  : ring benchmark fixed key size (bytes; 0=use k%d; optional K/M/G suffix) (default: 0)
+#   RING_BENCH_VALUE_SIZE: ring benchmark fixed value size (bytes; 0=use v%d; optional K/M/G suffix) (default: 0)
 #   CXL_RING_POLL_SPIN_NS : cxl_ring_direct spin before sleep (default: 5000)
 #   CXL_RING_POLL_SLEEP_NS: cxl_ring_direct sleep after spin (default: 50000)
 #   SEC_MGR_PORT   : TCP port for cxl_sec_mgr inside vm1 (default: 19001)
@@ -62,6 +66,7 @@ set -euo pipefail
 #   RING_ONLY_PING_TIMEOUT_MS : ping timeout for ring-only (default: 5000)
 #   RING_REDIS_PORT : TCP port for ring-enabled redis-server (default: 0 to disable TCP)
 #   RING_SECURE_REGION_BASE: base offset for secure ring regions (default: 4096; keeps first page for CXLSEC table)
+#   CXL_CRYPTO_PRIV_REGION_SIZE: per-node private region size for ring-crypto (default: 1G)
 #   SSH_ALLOW_FALLBACK   : 1 to try multiple users during SSH probe (default: 1)
 #   SSH_PROBE_INITIAL_DELAY : initial wait between SSH probe attempts (seconds, default: 2)
 #   SSH_PROBE_MAX_DELAY  : max wait between SSH probe attempts (seconds, default: 10)
@@ -78,7 +83,7 @@ set -euo pipefail
 #   OMP_PLACES        : OpenMP place list (default: cores)
 #   GAPBS_DROP_FIRST_TRIAL : drop the first Trial Time when computing avg_time_s (default: 1)
 #   GAPBS_CXL_PRETOUCH_RING : enable GAPBS_CXL_PRETOUCH for ring attach runs (default: 1)
-#   GAPBS_CXL_MAP_SIZE: mmap size in bytes for the GAPBS graph region (default: 2147483648 = 2GB)
+#   GAPBS_CXL_MAP_SIZE: mmap size in bytes for the GAPBS graph region (default: 4294967296 = 4GB)
 #   SEC_MGR_TIMEOUT_MS: cxl_sec_mgr wait timeout for graph header (default: 600000)
 #
 # Shared-memory (CXL) latency simulation:
@@ -120,6 +125,7 @@ REQ_N="${REQ_N:-200000}"
 CLIENTS="${CLIENTS:-4}"
 THREADS="${THREADS:-4}"
 PIPELINE="${PIPELINE:-256}"
+REDIS_BENCH_DATASIZE="${REDIS_BENCH_DATASIZE:-3}"
 VMNET_VM1_IP="${VMNET_VM1_IP:-192.168.100.1}"
 VM1_MEM="${VM1_MEM:-16G}"
 VM2_MEM="${VM2_MEM:-16G}"
@@ -136,6 +142,8 @@ RING_COUNT="${RING_COUNT:-4}"
 RING_REGION_SIZE="${RING_REGION_SIZE:-16M}"
 RING_REGION_BASE="${RING_REGION_BASE:-4096}"
 MAX_INFLIGHT="${MAX_INFLIGHT:-512}"
+RING_BENCH_KEY_SIZE="${RING_BENCH_KEY_SIZE:-8}"
+RING_BENCH_VALUE_SIZE="${RING_BENCH_VALUE_SIZE:-1024}"
 CXL_RING_POLL_SPIN_NS="${CXL_RING_POLL_SPIN_NS:-100}"
 CXL_RING_POLL_SLEEP_NS="${CXL_RING_POLL_SLEEP_NS:-100}"
 RING_MAP_OFFSET_VM1="${RING_MAP_OFFSET_VM1:-0}"
@@ -154,6 +162,8 @@ ULIMIT_NOFILE="${ULIMIT_NOFILE:-65535}"
 SEC_MGR_PORT="${SEC_MGR_PORT:-19001}"
 SEC_MGR_TIMEOUT_MS="${SEC_MGR_TIMEOUT_MS:-600000}"
 ENABLE_SECURE="${ENABLE_SECURE:-1}"
+ENABLE_CRYPTO="${ENABLE_CRYPTO:-1}"
+CXL_CRYPTO_PRIV_REGION_SIZE="${CXL_CRYPTO_PRIV_REGION_SIZE:-1G}"
 SODIUM_KEY_HEX="${SODIUM_KEY_HEX:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
 SODIUM_PORT="${SODIUM_PORT:-6380}"
 SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
@@ -173,13 +183,13 @@ GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
 GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-}"
 SCALE="${SCALE:-22}"
 DEGREE="${DEGREE:-16}"
-TRIALS="${TRIALS:-5}"
+TRIALS="${TRIALS:-3}"
 OMP_THREADS="${OMP_THREADS:-4}"
 OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 OMP_PLACES="${OMP_PLACES:-cores}"
 GAPBS_DROP_FIRST_TRIAL="${GAPBS_DROP_FIRST_TRIAL:-1}"
-GAPBS_CXL_PRETOUCH_RING="${GAPBS_CXL_PRETOUCH_RING:-0}"
-GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-2147483648}"
+GAPBS_CXL_PRETOUCH_RING="${GAPBS_CXL_PRETOUCH_RING:-1}"
+GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-4294967296}"
 GAPBS_CXL_MAP_OFFSET_VM1="${GAPBS_CXL_MAP_OFFSET_VM1:-0}"
 GAPBS_CXL_MAP_OFFSET_VM2="${GAPBS_CXL_MAP_OFFSET_VM2:-0}"
 
@@ -1113,9 +1123,15 @@ native_log="${RESULTS_DIR}/tdx_native_tcp_${ts}.log"
 sodium_log="${RESULTS_DIR}/tdx_sodium_tcp_${ts}.log"
 ring_log="${RESULTS_DIR}/tdx_ring_${ts}.log"
 ring_csv="${RESULTS_DIR}/tdx_ring_${ts}.csv"
+ring_crypto_log="${RESULTS_DIR}/tdx_ring_crypto_${ts}.log"
+ring_crypto_csv="${RESULTS_DIR}/tdx_ring_crypto_${ts}.csv"
 ring_secure_log="${RESULTS_DIR}/tdx_ring_secure_${ts}.log"
 ring_secure_csv="${RESULTS_DIR}/tdx_ring_secure_${ts}.csv"
 compare_csv="${RESULTS_DIR}/tdx_compare_${ts}.csv"
+
+redis_crypto_key_vm1_hex="$(openssl rand -hex 32)"
+redis_crypto_key_vm2_hex="$(openssl rand -hex 32)"
+redis_crypto_key_common_hex="$(openssl rand -hex 32)"
 
 echo "[*] Internal VM network (cxl0):"
 ssh_vm1 "ip -brief addr show cxl0 2>/dev/null || true"
@@ -1127,6 +1143,24 @@ if [[ "${RING_REDIS_PORT}" == "0" ]]; then
   # but bind a local unix socket so the process stays alive to serve the ring.
   ring_redis_sock_args="--unixsocket /tmp/redis_ring.sock --unixsocketperm 777"
 fi
+
+if ! [[ "${REDIS_BENCH_DATASIZE}" =~ ^[0-9]+$ ]] || (( REDIS_BENCH_DATASIZE < 1 )); then
+  echo "[!] REDIS_BENCH_DATASIZE must be a positive integer (bytes): '${REDIS_BENCH_DATASIZE}'" >&2
+  exit 1
+fi
+if ! [[ "${RING_BENCH_KEY_SIZE}" =~ ^[0-9]+([KkMmGg])?$ ]]; then
+  echo "[!] RING_BENCH_KEY_SIZE must be bytes (0=auto), optional K/M/G suffix: '${RING_BENCH_KEY_SIZE}'" >&2
+  exit 1
+fi
+if ! [[ "${RING_BENCH_VALUE_SIZE}" =~ ^[0-9]+([KkMmGg])?$ ]]; then
+  echo "[!] RING_BENCH_VALUE_SIZE must be bytes (0=auto), optional K/M/G suffix: '${RING_BENCH_VALUE_SIZE}'" >&2
+  exit 1
+fi
+
+ring_bench_kv_args=()
+if [[ "${RING_BENCH_KEY_SIZE}" != "0" ]]; then ring_bench_kv_args+=("--key-size" "${RING_BENCH_KEY_SIZE}"); fi
+if [[ "${RING_BENCH_VALUE_SIZE}" != "0" ]]; then ring_bench_kv_args+=("--val-size" "${RING_BENCH_VALUE_SIZE}"); fi
+ring_bench_kv_args_str="${ring_bench_kv_args[*]}"
 
 if [[ "${RING_ONLY}" == "1" ]]; then
   echo "[*] RING_ONLY=1: running ring-only quick validation."
@@ -1175,8 +1209,8 @@ if [[ "${RING_ONLY}" == "1" ]]; then
   fi
 
   echo "[*] Ring-only: tiny bench (n=${RING_ONLY_BENCH_N}, threads=${RING_ONLY_THREADS}) ..."
-	  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_only_n_per_thread} ${ring_only_pipeline_flag} --threads ${RING_ONLY_THREADS} --max-inflight ${RING_ONLY_MAX_INFLIGHT} --csv /tmp/${ring_only_label}.csv --label ${ring_only_label}" | tee "${ring_only_log}"
-  ssh_vm2 "cat /tmp/${ring_only_label}.csv" > "${ring_only_csv}"
+	  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_only_n_per_thread} ${ring_bench_kv_args_str} ${ring_only_pipeline_flag} --threads ${RING_ONLY_THREADS} --max-inflight ${RING_ONLY_MAX_INFLIGHT} --csv /tmp/${ring_only_label}.csv --label ${ring_only_label}" | tee "${ring_only_log}"
+	  ssh_vm2 "cat /tmp/${ring_only_label}.csv" > "${ring_only_csv}"
 
   ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
   ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
@@ -1195,7 +1229,7 @@ ssh_vm1 "tmux new-session -d -s redis_native_tdx \"/usr/bin/redis-server --port 
 ssh_vm1 "for i in \$(seq 1 200); do redis-cli -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'redis-server not ready' >&2; tail -n 200 /tmp/redis_native_tdx.log >&2 || true; exit 1"
 
 ssh_vm2 "for i in \$(seq 1 200); do redis-cli -h ${VMNET_VM1_IP} -p 6379 ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'tcp path not ready' >&2; exit 1"
-ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${native_log}"
+ssh_vm2 "redis-benchmark -h ${VMNET_VM1_IP} -p 6379 -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE} -d ${REDIS_BENCH_DATASIZE}" | tee "${native_log}"
 
 # Optional: run YCSB against native TCP endpoint
 if [[ "${YCSB_ENABLE}" == "1" ]]; then
@@ -1225,7 +1259,7 @@ if ! ssh_vm2 "for i in \$(seq 1 600); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCA
   exit 1
 fi
 
-ssh_vm2 "redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE}" | tee "${sodium_log}"
+ssh_vm2 "redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE} -d ${REDIS_BENCH_DATASIZE}" | tee "${sodium_log}"
 
 # Optional: run YCSB against libsodium-encrypted TCP tunnel
 if [[ "${YCSB_ENABLE}" == "1" ]]; then
@@ -1283,11 +1317,8 @@ fi
 
 ring_label="tdx_ring_${ts}"
 ring_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
-ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
+ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} /tmp/cxl_ring_direct --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_n_per_thread} ${ring_bench_kv_args_str} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_label}.csv --label ${ring_label}" | tee "${ring_log}"
 ssh_vm2 "cat /tmp/${ring_label}.csv" > "${ring_csv}"
-
-ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
-ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
 
 # Optional: run YCSB against ring via local RESP proxy inside VM2
 if [[ "${YCSB_ENABLE}" == "1" ]]; then
@@ -1301,9 +1332,45 @@ if [[ "${YCSB_ENABLE}" == "1" ]]; then
   ssh_vm2 "RING_RESP_PROXY=1 RING_PATH=${RING_PATH_VM2} RING_MAP_SIZE=${RING_MAP_SIZE} RING_MAP_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} RING_RESP_LISTEN=127.0.0.1:6381 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
 fi
 
+ssh_vm1 "tmux kill-session -t redis_ring_tdx >/dev/null 2>&1 || true"
+ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
+
+RUN_CRYPTO=0
+if [[ "${ENABLE_CRYPTO}" == "1" ]]; then
+  echo "[*] Benchmark 4/8: crypto ring Redis (software crypto, no manager)"
+  ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
+  ssh_vm1 "tmux kill-session -t redis_ring_tdx_crypto >/dev/null 2>&1 || true"
+  ssh_vm1 "tmux new-session -d -s redis_ring_tdx_crypto \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX=${redis_crypto_key_vm1_hex} CXL_SEC_COMMON_KEY_HEX=${redis_crypto_key_common_hex} CXL_CRYPTO_PRIV_REGION_SIZE=${CXL_CRYPTO_PRIV_REGION_SIZE} ./redis-server --port ${RING_REDIS_PORT} ${ring_redis_sock_args} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx_crypto.log 2>&1\""
+
+  ssh_vm2 "for i in \$(seq 1 200); do sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX=${redis_crypto_key_vm2_hex} CXL_SEC_COMMON_KEY_HEX=${redis_crypto_key_common_hex} CXL_CRYPTO_PRIV_REGION_SIZE=${CXL_CRYPTO_PRIV_REGION_SIZE} timeout 5 /tmp/cxl_ring_direct --crypto --sec-node-id 2 --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms 5000 >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'crypto ring not ready' >&2; exit 1"
+
+  ring_crypto_label="tdx_ring_crypto_${ts}"
+  ring_crypto_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
+  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX=${redis_crypto_key_vm2_hex} CXL_SEC_COMMON_KEY_HEX=${redis_crypto_key_common_hex} CXL_CRYPTO_PRIV_REGION_SIZE=${CXL_CRYPTO_PRIV_REGION_SIZE} /tmp/cxl_ring_direct --crypto --sec-node-id 2 --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_crypto_n_per_thread} ${ring_bench_kv_args_str} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_crypto_label}.csv --label ${ring_crypto_label}" | tee "${ring_crypto_log}"
+  ssh_vm2 "cat /tmp/${ring_crypto_label}.csv" > "${ring_crypto_csv}"
+
+  # Optional: run YCSB against crypto ring via local RESP proxy inside VM2
+  if [[ "${YCSB_ENABLE}" == "1" ]]; then
+    echo "[*] YCSB: crypto ring via RESP proxy (VM2 127.0.0.1:6383 -> ring BAR2)"
+    ycsb_args=("--host" "127.0.0.1" "--port" "6383" "--workloads" "${YCSB_WORKLOADS}" \
+               "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
+               "--threads" "${YCSB_THREADS}")
+    if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
+    if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
+    ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
+    ssh_vm2 "RING_RESP_PROXY=1 RING_RESP_CRYPTO=1 RING_PATH=${RING_PATH_VM2} RING_MAP_SIZE=${RING_MAP_SIZE} RING_MAP_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_REGION_BASE} CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX=${redis_crypto_key_vm2_hex} CXL_SEC_COMMON_KEY_HEX=${redis_crypto_key_common_hex} CXL_CRYPTO_PRIV_REGION_SIZE=${CXL_CRYPTO_PRIV_REGION_SIZE} RING_RESP_LISTEN=127.0.0.1:6383 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+  fi
+
+  ssh_vm1 "tmux kill-session -t redis_ring_tdx_crypto >/dev/null 2>&1 || true"
+  ssh_vm1 "sudo pkill -x redis-server >/dev/null 2>&1 || true"
+  RUN_CRYPTO=1
+else
+  echo "[*] Skipping crypto ring Redis (ENABLE_CRYPTO=0)"
+fi
+
 RUN_SECURE=0
 if [[ "${ENABLE_SECURE}" == "1" ]]; then
-  echo "[*] Benchmark 4/8: secure ring Redis (ACL + software crypto via cxl_sec_mgr)"
+  echo "[*] Benchmark 5/8: secure ring Redis (ACL + software crypto via cxl_sec_mgr)"
 
   echo "[*] Secure ring: clearing first page for CXLSEC table ..."
   ssh_vm1 "sudo -n env CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} python3 -c 'import mmap, os; off=int(os.environ.get(\"CXL_RING_OFFSET\", \"0\"), 0); fd=os.open(\"${RING_PATH_VM1}\", os.O_RDWR); m=mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off); m[:] = b\"\\0\"*4096; m.flush(); m.close(); os.close(fd)'"
@@ -1319,7 +1386,7 @@ if [[ "${ENABLE_SECURE}" == "1" ]]; then
 
   ring_secure_label="tdx_ring_secure_${ts}"
   ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
-  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --sec-timeout-ms ${SEC_MGR_TIMEOUT_MS} --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
+  ssh_vm2 "cd /tmp && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --sec-timeout-ms ${SEC_MGR_TIMEOUT_MS} --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --bench ${ring_secure_n_per_thread} ${ring_bench_kv_args_str} --pipeline --threads ${THREADS} --max-inflight ${MAX_INFLIGHT} --latency --cost --csv /tmp/${ring_secure_label}.csv --label ${ring_secure_label}" | tee "${ring_secure_log}"
   ssh_vm2 "cat /tmp/${ring_secure_label}.csv" > "${ring_secure_csv}"
 
   # Optional: run YCSB against secure ring via local RESP proxy inside VM2
@@ -1348,6 +1415,12 @@ sodium_set="$(awk '/====== SET ======/{sec=1;next} sec && /throughput summary:/{
 sodium_get="$(awk '/====== GET ======/{sec=1;next} sec && /throughput summary:/{print $3; exit} sec && /requests per second/{print $1; exit}' "${sodium_log}" || true)"
 ring_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_csv}" || true)"
 ring_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_csv}" || true)"
+ring_crypto_set=""
+ring_crypto_get=""
+if [[ "${RUN_CRYPTO}" == "1" ]]; then
+  ring_crypto_set="$(awk -F, 'NR>1 && $2=="SET"{print $8; exit}' "${ring_crypto_csv}" || true)"
+  ring_crypto_get="$(awk -F, 'NR>1 && $2=="GET"{print $8; exit}' "${ring_crypto_csv}" || true)"
+fi
 ring_secure_set=""
 ring_secure_get=""
 if [[ "${RUN_SECURE}" == "1" ]]; then
@@ -1363,6 +1436,10 @@ fi
   echo "TDXSodiumTCP,GET,${sodium_get}"
   echo "TDXRing,SET,${ring_set}"
   echo "TDXRing,GET,${ring_get}"
+  if [[ "${RUN_CRYPTO}" == "1" ]]; then
+    echo "TDXRingCrypto,SET,${ring_crypto_set}"
+    echo "TDXRingCrypto,GET,${ring_crypto_get}"
+  fi
   if [[ "${RUN_SECURE}" == "1" ]]; then
     echo "TDXRingSecure,SET,${ring_secure_set}"
     echo "TDXRingSecure,GET,${ring_secure_get}"

@@ -13,10 +13,14 @@ set -euo pipefail
 #   bash scripts/host_tdx_batch_suite.sh
 #
 # Tunables (env):
-#   THREAD_LIST          : comma-separated (default: 1,2,4,8)
+#   THREAD_LIST          : comma-separated (default: 1,2,4,8,16)
 #   RING_REGION_SIZE     : per-ring region size (default: 256M)
 #   RING_REGION_BASE     : base offset (default: 4096; keeps page 0 unused for fair ring vs ring-secure)
-#   RING_MAP_SIZE        : BAR2 map size (default: 4G)
+#   RING_MAP_SIZE        : BAR2 map size (default: 16G)
+#   CXL_CRYPTO_PRIV_REGION_SIZE: per-node crypto private region size (default: 1G)
+#   REDIS_BENCH_DATASIZE : redis-benchmark value size in bytes (-d) (default: 3)
+#   RING_BENCH_KEY_SIZE  : ring benchmark fixed key size (bytes; 0=use k%d; optional K/M/G suffix) (default: 0)
+#   RING_BENCH_VALUE_SIZE: ring benchmark fixed value size (bytes; 0=use v%d; optional K/M/G suffix) (default: 0)
 #   YCSB_WORKLOADS       : comma-separated workloads (default: workloada..workloade)
 #   GAPBS_KERNEL_LIST    : comma-separated kernels (default: bfs,sssp,pr,cc,bc,tc)
 #   VM1_CPUS/VM2_CPUS    : guest vCPUs (forwarded; see host_recreate_and_bench_tdx.sh)
@@ -29,7 +33,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 THREAD_LIST="${THREAD_LIST:-1,2,4,8,16}"
 RING_REGION_SIZE="${RING_REGION_SIZE:-256M}"
 RING_REGION_BASE="${RING_REGION_BASE:-4096}"
-RING_MAP_SIZE="${RING_MAP_SIZE:-4G}"
+RING_MAP_SIZE="${RING_MAP_SIZE:-16G}"
+CXL_CRYPTO_PRIV_REGION_SIZE="${CXL_CRYPTO_PRIV_REGION_SIZE:-1G}"
 
 YCSB_ENABLE="${YCSB_ENABLE:-0}"
 YCSB_WORKLOADS="${YCSB_WORKLOADS:-workloada,workloadb,workloadc,workloadd}"

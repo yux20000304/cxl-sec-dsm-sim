@@ -103,12 +103,22 @@ struct sec_resp {
 static volatile sig_atomic_t running = 1;
 
 static int g_secure = 0;
+static int g_crypto = 0; /* manager-less crypto mode (vm key + common key) */
 static const char *g_sec_mgr = NULL;
 static uint64_t g_sec_node_id = 0;
 static unsigned g_sec_timeout_ms = 10000;
 static unsigned char g_sec_key[MAX_RINGS][crypto_aead_chacha20poly1305_ietf_KEYBYTES];
 static int g_sec_key_ok[MAX_RINGS];
 static atomic_uint_fast64_t g_sec_nonce_ctr_req[MAX_RINGS];
+
+static const char *g_crypto_key_hex = NULL;
+static const char *g_crypto_common_hex = NULL;
+static unsigned char g_crypto_vm_key[crypto_stream_chacha20_ietf_KEYBYTES];
+static unsigned char g_crypto_common_key[crypto_stream_chacha20_ietf_KEYBYTES];
+static size_t g_crypto_priv_region_base = 0;
+static size_t g_crypto_priv_region_size = 0;
+static unsigned char *g_crypto_priv = NULL;
+static atomic_uint_fast64_t g_crypto_priv_nonce_ctr[MAX_RINGS];
 
 static uint64_t shm_delay_ns = 0;
 static uint64_t shm_pause_iters_per_ns_x1024 = 0;
@@ -146,6 +156,14 @@ static inline void cxl_shm_delay(void) {
     for (uint64_t i = 0; i < iters; i++) {
         __asm__ __volatile__("pause");
     }
+}
+
+static int parse_key_hex(const char *hex, unsigned char *out_key, size_t out_len) {
+    if (!hex || !hex[0] || !out_key || out_len == 0) return -1;
+    size_t bin_len = 0;
+    if (sodium_hex2bin(out_key, out_len, hex, strlen(hex), NULL, &bin_len, NULL) != 0) return -1;
+    if (bin_len != out_len) return -1;
+    return 0;
 }
 
 static int parse_size(const char *arg, size_t *out) {
@@ -276,6 +294,98 @@ struct layout {
 
 static size_t align_up(size_t v, size_t a) {
     return (v + a - 1U) & ~(a - 1U);
+}
+
+static int crypto_priv_init(unsigned char *mm, size_t map_size, const struct layout *lo) {
+    if (!g_crypto) return 0;
+    if (!mm || mm == MAP_FAILED || map_size == 0) return -1;
+    if (!lo || lo->ring_count == 0 || lo->ring_count > MAX_RINGS) return -1;
+    if (g_sec_node_id == 0) {
+        fprintf(stderr, "[!] --crypto requires --sec-node-id N (or env CXL_SEC_NODE_ID)\n");
+        return -1;
+    }
+
+    size_t region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
+    size_t region_base = env_size("CXL_RING_REGION_BASE", 0);
+
+    const size_t slot_stride = (size_t)TDX_SHM_SLOT_SIZE;
+    const size_t need_bytes = align_up((size_t)lo->ring_count * slot_stride, 4096U);
+    const size_t def_base = align_up(region_base + (size_t)lo->ring_count * region_size, 4096U);
+    const size_t base = env_size("CXL_CRYPTO_PRIV_REGION_BASE", def_base);
+    const size_t per_node = env_size("CXL_CRYPTO_PRIV_REGION_SIZE", need_bytes);
+
+    if ((base % 4096) != 0 || (per_node % 4096) != 0) {
+        fprintf(stderr, "[!] crypto: CXL_CRYPTO_PRIV_REGION_BASE/SIZE must be 4K-aligned (base=%zu size=%zu)\n",
+                base, per_node);
+        return -1;
+    }
+    if (per_node < need_bytes) {
+        fprintf(stderr, "[!] crypto: CXL_CRYPTO_PRIV_REGION_SIZE too small (need >= %zu, got %zu)\n",
+                need_bytes, per_node);
+        return -1;
+    }
+
+    uint64_t idx = g_sec_node_id - 1ULL;
+    uint64_t off64 = (uint64_t)base + idx * (uint64_t)per_node;
+    if (off64 > (uint64_t)map_size || (uint64_t)per_node > (uint64_t)map_size - off64) {
+        fprintf(stderr,
+                "[!] crypto: private region out of range (map_size=%zu base=%zu node=%" PRIu64 " per_node=%zu)\n",
+                map_size, base, g_sec_node_id, per_node);
+        return -1;
+    }
+
+    g_crypto_priv_region_base = base;
+    g_crypto_priv_region_size = per_node;
+    g_crypto_priv = mm + (size_t)off64;
+    memset(g_crypto_priv, 0, per_node);
+    for (uint32_t i = 0; i < lo->ring_count; i++) {
+        atomic_store_explicit(&g_crypto_priv_nonce_ctr[i], 0, memory_order_relaxed);
+    }
+    return 0;
+}
+
+static int crypto_priv_encrypt_then_decrypt(uint32_t ring_idx,
+                                            unsigned dir,
+                                            const unsigned char *payload,
+                                            uint32_t payload_len,
+                                            unsigned char *out,
+                                            uint32_t out_cap,
+                                            uint32_t *out_len) {
+    if (!out || !out_len || !payload) return -1;
+    if (!g_crypto || !g_crypto_priv) return -1;
+    if (ring_idx >= MAX_RINGS) return -1;
+    if (payload_len > out_cap) return -1;
+    const uint32_t nonce_bytes = crypto_stream_chacha20_ietf_NONCEBYTES;
+    if ((size_t)payload_len + (size_t)nonce_bytes > (size_t)TDX_SHM_SLOT_SIZE) return -1;
+
+    unsigned char *slot = g_crypto_priv + (size_t)ring_idx * (size_t)TDX_SHM_SLOT_SIZE;
+    unsigned char *nonce = slot;
+    unsigned char *cipher = slot + nonce_bytes;
+
+    cxl_shm_delay();
+    memset(nonce, 0, nonce_bytes);
+    nonce[0] = (unsigned char)(dir & 0xffu);
+    nonce[1] = (unsigned char)(ring_idx & 0xffu);
+    uint64_t ctr = atomic_fetch_add_explicit(&g_crypto_priv_nonce_ctr[ring_idx], 1, memory_order_relaxed);
+    for (int i = 0; i < 8; i++) {
+        nonce[4 + i] = (unsigned char)((ctr >> (8 * i)) & 0xffu);
+    }
+
+    memcpy(cipher, payload, payload_len);
+    crypto_stream_chacha20_ietf_xor(cipher,
+                                    cipher,
+                                    (unsigned long long)payload_len,
+                                    nonce,
+                                    g_crypto_vm_key);
+
+    cxl_shm_delay();
+    crypto_stream_chacha20_ietf_xor(out,
+                                    cipher,
+                                    (unsigned long long)payload_len,
+                                    nonce,
+                                    g_crypto_vm_key);
+    *out_len = payload_len;
+    return 0;
 }
 
 static int load_layout(unsigned char *mm, size_t map_size, struct layout *lo) {
@@ -484,10 +594,6 @@ out:
 
 static int secure_init(unsigned char *mm, size_t map_size, const struct layout *lo) {
     if (!g_secure) return 0;
-    if (!g_sec_mgr || !g_sec_mgr[0]) {
-        fprintf(stderr, "[!] --secure requires --sec-mgr ip:port (or env CXL_SEC_MGR)\n");
-        return -1;
-    }
     if (g_sec_node_id == 0) {
         fprintf(stderr, "[!] --secure requires --sec-node-id N (or env CXL_SEC_NODE_ID)\n");
         return -1;
@@ -497,13 +603,44 @@ static int secure_init(unsigned char *mm, size_t map_size, const struct layout *
         return -1;
     }
 
+    if (!lo || lo->ring_count == 0 || lo->ring_count > MAX_RINGS) return -1;
+    memset(g_sec_key_ok, 0, sizeof(g_sec_key_ok));
+
+    if (g_crypto) {
+        if (!g_crypto_key_hex || !g_crypto_key_hex[0]) g_crypto_key_hex = getenv("CXL_SEC_KEY_HEX");
+        if (!g_crypto_common_hex || !g_crypto_common_hex[0]) g_crypto_common_hex = getenv("CXL_SEC_COMMON_KEY_HEX");
+        if (!g_crypto_key_hex || !g_crypto_key_hex[0] || !g_crypto_common_hex || !g_crypto_common_hex[0]) {
+            fprintf(stderr, "[!] --crypto requires CXL_SEC_KEY_HEX and CXL_SEC_COMMON_KEY_HEX (or --sec-key-hex/--sec-common-key-hex)\n");
+            return -1;
+        }
+        if (parse_key_hex(g_crypto_key_hex, g_crypto_vm_key, sizeof(g_crypto_vm_key)) != 0) {
+            fprintf(stderr, "[!] invalid CXL_SEC_KEY_HEX (expected %d bytes hex)\n", (int)sizeof(g_crypto_vm_key));
+            return -1;
+        }
+        if (parse_key_hex(g_crypto_common_hex, g_crypto_common_key, sizeof(g_crypto_common_key)) != 0) {
+            fprintf(stderr, "[!] invalid CXL_SEC_COMMON_KEY_HEX (expected %d bytes hex)\n", (int)sizeof(g_crypto_common_key));
+            return -1;
+        }
+        for (uint32_t i = 0; i < lo->ring_count; i++) {
+            memcpy(g_sec_key[i], g_crypto_common_key, crypto_aead_chacha20poly1305_ietf_KEYBYTES);
+            g_sec_key_ok[i] = 1;
+            atomic_store_explicit(&g_sec_nonce_ctr_req[i], 0, memory_order_relaxed);
+        }
+        if (crypto_priv_init(mm, map_size, lo) != 0) return -1;
+        return 0;
+    }
+
+    if (!g_sec_mgr || !g_sec_mgr[0]) {
+        fprintf(stderr, "[!] --secure requires --sec-mgr ip:port (or env CXL_SEC_MGR)\n");
+        return -1;
+    }
+
     size_t region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
     size_t region_base = env_size("CXL_RING_REGION_BASE", 0);
     if (region_base < 4096) {
         fprintf(stderr, "[!] secure mode requires CXL_RING_REGION_BASE >= 4096 (reserved page for CXLSEC)\n");
         return -1;
     }
-    if (!lo || lo->ring_count == 0 || lo->ring_count > MAX_RINGS) return -1;
     if (map_size < CXL_SEC_TABLE_OFF + sizeof(CxlSecTable)) {
         fprintf(stderr, "[!] mapping too small for CXLSEC table\n");
         return -1;
@@ -522,7 +659,6 @@ static int secure_init(unsigned char *mm, size_t map_size, const struct layout *
         return -1;
     }
 
-    memset(g_sec_key_ok, 0, sizeof(g_sec_key_ok));
     for (uint32_t i = 0; i < lo->ring_count; i++) {
         uint64_t off = (uint64_t)region_base + (uint64_t)i * (uint64_t)region_size;
         uint32_t idx = 0;
@@ -818,8 +954,25 @@ static int conn_ring_flush_one(struct ring_info *ri, Conn *c, uint16_t flags, ui
         uint32_t send_len = plain_len;
         unsigned char enc[RING_MAX_PAYLOAD];
         if (g_secure) {
+            const unsigned char *plain2 = plain;
+            uint32_t plain2_len = plain_len;
+            unsigned char staged[RING_MAX_PAYLOAD];
+            uint32_t staged_len = 0;
+            if (g_crypto) {
+                if (crypto_priv_encrypt_then_decrypt(ring_idx,
+                                                     SEC_DIR_REQ,
+                                                     plain,
+                                                     plain_len,
+                                                     staged,
+                                                     (uint32_t)sizeof(staged),
+                                                     &staged_len) != 0) {
+                    return -1;
+                }
+                plain2 = staged;
+                plain2_len = staged_len;
+            }
             uint32_t enc_len = 0;
-            if (secure_encrypt(ring_idx, c->cid, MSG_DATA, flags, plain_len, plain, SEC_DIR_REQ, enc, (uint32_t)sizeof(enc), &enc_len) != 0) {
+            if (secure_encrypt(ring_idx, c->cid, MSG_DATA, flags, plain2_len, plain2, SEC_DIR_REQ, enc, (uint32_t)sizeof(enc), &enc_len) != 0) {
                 return -1;
             }
             send_ptr = enc;
@@ -854,8 +1007,25 @@ static int conn_ring_send_bytes(struct ring_info *ri, Conn *c, uint16_t flags, u
         uint32_t send_len = plain_len;
         unsigned char enc[RING_MAX_PAYLOAD];
         if (g_secure) {
+            const unsigned char *plain2 = plain;
+            uint32_t plain2_len = plain_len;
+            unsigned char staged[RING_MAX_PAYLOAD];
+            uint32_t staged_len = 0;
+            if (g_crypto) {
+                if (crypto_priv_encrypt_then_decrypt(ring_idx,
+                                                     SEC_DIR_REQ,
+                                                     plain,
+                                                     plain_len,
+                                                     staged,
+                                                     (uint32_t)sizeof(staged),
+                                                     &staged_len) != 0) {
+                    return -1;
+                }
+                plain2 = staged;
+                plain2_len = staged_len;
+            }
             uint32_t enc_len = 0;
-            if (secure_encrypt(ring_idx, c->cid, MSG_DATA, flags, plain_len, plain, SEC_DIR_REQ, enc, (uint32_t)sizeof(enc), &enc_len) != 0) {
+            if (secure_encrypt(ring_idx, c->cid, MSG_DATA, flags, plain2_len, plain2, SEC_DIR_REQ, enc, (uint32_t)sizeof(enc), &enc_len) != 0) {
                 return -1;
             }
             send_ptr = enc;
@@ -954,10 +1124,15 @@ static void usage(const char *argv0) {
     printf("Usage: %s [--path <bar2|uio>] [--map-size <bytes>] [--map-offset <bytes>]\n"
            "          [--listen <ip:port>] [--ring <base-idx>]\n"
            "          [--secure --sec-mgr <ip:port> --sec-node-id N [--sec-timeout-ms MS]]\n"
+           "          [--crypto --sec-node-id N [--sec-key-hex HEX] [--sec-common-key-hex HEX]]\n"
            "Env:\n"
            "  CXL_RING_COUNT        : number of rings/regions (default: 1)\n"
            "  CXL_RING_REGION_SIZE  : bytes per ring region (default: 16M)\n"
            "  CXL_RING_REGION_BASE  : base offset within the mmap (default: 0)\n"
+           "  CXL_SEC_KEY_HEX       : (crypto) per-node key (32B hex)\n"
+           "  CXL_SEC_COMMON_KEY_HEX: (crypto) common key (32B hex)\n"
+           "  CXL_CRYPTO_PRIV_REGION_BASE: (crypto) private staging base offset (default: after rings)\n"
+           "  CXL_CRYPTO_PRIV_REGION_SIZE: (crypto) per-node private staging size (default: ring_count*4KiB)\n"
            "  CXL_SHM_DELAY_NS      : simulated shm access delay (ns)\n",
            argv0);
 }
@@ -1002,9 +1177,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--listen") && i + 1 < argc) listen_addr = argv[++i];
         else if (!strcmp(argv[i], "--ring") && i + 1 < argc) ring_idx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--secure")) g_secure = 1;
+        else if (!strcmp(argv[i], "--crypto")) { g_secure = 1; g_crypto = 1; }
         else if (!strcmp(argv[i], "--sec-mgr") && i + 1 < argc) g_sec_mgr = argv[++i];
         else if (!strcmp(argv[i], "--sec-node-id") && i + 1 < argc) g_sec_node_id = strtoull(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "--sec-timeout-ms") && i + 1 < argc) g_sec_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
+        else if (!strcmp(argv[i], "--sec-key-hex") && i + 1 < argc) g_crypto_key_hex = argv[++i];
+        else if (!strcmp(argv[i], "--sec-common-key-hex") && i + 1 < argc) g_crypto_common_hex = argv[++i];
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(argv[0]);
             return 0;
@@ -1124,12 +1302,15 @@ int main(int argc, char **argv) {
     uint16_t data_flags = RING_FLAG_RESP | (g_secure ? RING_FLAG_SECURE : 0);
     uint16_t close_flags = RING_FLAG_RESP | (g_secure ? RING_FLAG_SECURE : 0);
 
-    printf("[*] ring RESP stream proxy listening on %s:%s (rings=%u base=%d secure=%d)\n",
+    printf("[*] ring RESP stream proxy listening on %s:%s (rings=%u base=%d secure=%d crypto=%d priv_base=%zu priv_size=%zu)\n",
            listen_host,
            listen_port,
            lo.ring_count,
            ring_idx,
-           g_secure ? 1 : 0);
+           g_secure ? 1 : 0,
+           g_crypto ? 1 : 0,
+           g_crypto_priv_region_base,
+           g_crypto_priv_region_size);
     fflush(stdout);
 
     uint32_t base_ring = (uint32_t)ring_idx;

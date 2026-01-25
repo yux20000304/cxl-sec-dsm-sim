@@ -171,6 +171,18 @@ maybe_start_ring_proxy() {
     secure_args+=( --secure --sec-mgr "${sec_mgr}" --sec-node-id "${sec_node_id}" )
     [[ -n "${sec_timeout_ms}" ]] && secure_args+=( --sec-timeout-ms "${sec_timeout_ms}" )
   fi
+  if [[ -n "${RING_RESP_CRYPTO:-}" ]]; then
+    if [[ -n "${RING_RESP_SECURE:-}" ]]; then
+      echo "[!] RING_RESP_CRYPTO cannot be combined with RING_RESP_SECURE" >&2
+      exit 1
+    fi
+    local sec_node_id="${RING_RESP_SEC_NODE_ID:-${CXL_SEC_NODE_ID:-}}"
+    if [[ -z "${sec_node_id}" ]]; then
+      echo "[!] RING_RESP_CRYPTO requires RING_RESP_SEC_NODE_ID (or CXL_SEC_NODE_ID) plus CXL_SEC_KEY_HEX/CXL_SEC_COMMON_KEY_HEX" >&2
+      exit 1
+    fi
+    secure_args+=( --crypto --sec-node-id "${sec_node_id}" )
+  fi
 
   echo "[*] Starting ring_resp_proxy at ${listen_addr} -> ${ring_path} (offset=${ring_offset} ring=${ring_idx})"
   ( "${sudo_prefix[@]}" env "${proxy_env[@]}" /tmp/ring_resp_proxy --path "${ring_path}" --map-size "${ring_size}" --map-offset "${ring_offset}" --ring "${ring_idx}" --listen "${listen_addr}" "${secure_args[@]}" >/tmp/ring_resp_proxy.log 2>&1 & echo $! > /tmp/ring_resp_proxy.pid )

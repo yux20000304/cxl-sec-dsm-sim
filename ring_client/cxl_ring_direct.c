@@ -195,12 +195,25 @@ struct ring_slot_hdr {
 };
 
 static int g_secure = 0;
+static int g_crypto = 0; /* manager-less crypto mode (vm key + common key) */
 static const char *g_sec_mgr = NULL;
 static uint64_t g_sec_node_id = 0;
 static unsigned g_sec_timeout_ms = 10000;
 static unsigned char g_sec_key[MAX_RINGS][crypto_aead_chacha20poly1305_ietf_KEYBYTES];
 static int g_sec_key_ok[MAX_RINGS];
 static atomic_uint_fast64_t g_sec_nonce_ctr_req[MAX_RINGS];
+
+static const char *g_crypto_key_hex = NULL;
+static const char *g_crypto_common_hex = NULL;
+static unsigned char g_crypto_vm_key[crypto_stream_chacha20_ietf_KEYBYTES];
+static unsigned char g_crypto_common_key[crypto_stream_chacha20_ietf_KEYBYTES];
+static size_t g_crypto_priv_region_base = 0;
+static size_t g_crypto_priv_region_size = 0;
+static unsigned char *g_crypto_priv = NULL;
+static atomic_uint_fast64_t g_crypto_priv_nonce_ctr[MAX_RINGS];
+
+static size_t g_bench_key_size = 0;
+static size_t g_bench_val_size = 0;
 
 static inline uint64_t nowns(void) {
     struct timespec ts;
@@ -211,6 +224,8 @@ static inline uint64_t nowns(void) {
 static inline size_t align_up(size_t value, size_t align) {
     return (value + align - 1U) & ~(align - 1U);
 }
+
+static size_t env_size(const char *key, size_t def);
 
 static void shm_delay_calibrate(void) {
     if (shm_pause_iters_per_ns_x1024) return;
@@ -234,6 +249,106 @@ static inline void shm_delay(void) {
     for (uint64_t i = 0; i < iters; i++) {
         __asm__ __volatile__("pause");
     }
+}
+
+static int parse_key_hex(const char *hex, unsigned char *out_key, size_t out_len) {
+    if (!hex || !hex[0] || !out_key || out_len == 0) return -1;
+    size_t bin_len = 0;
+    if (sodium_hex2bin(out_key, out_len, hex, strlen(hex), NULL, &bin_len, NULL) != 0) return -1;
+    if (bin_len != out_len) return -1;
+    return 0;
+}
+
+static int crypto_priv_init(unsigned char *mm, size_t map_size, const struct layout *lo) {
+    if (!g_crypto) return 0;
+    if (!mm || mm == MAP_FAILED || map_size == 0) return -1;
+    if (!lo || lo->ring_count == 0 || lo->ring_count > MAX_RINGS) return -1;
+    if (g_sec_node_id == 0) {
+        fprintf(stderr, "[!] --crypto requires --sec-node-id N (or env CXL_SEC_NODE_ID)\n");
+        return -1;
+    }
+
+    size_t region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
+    size_t region_base = env_size("CXL_RING_REGION_BASE", 0);
+
+    const size_t slot_stride = (size_t)TDX_SHM_SLOT_SIZE;
+    const size_t need_bytes = align_up((size_t)lo->ring_count * slot_stride, 4096U);
+    const size_t def_base = align_up(region_base + (size_t)lo->ring_count * region_size, 4096U);
+    const size_t base = env_size("CXL_CRYPTO_PRIV_REGION_BASE", def_base);
+    const size_t per_node = env_size("CXL_CRYPTO_PRIV_REGION_SIZE", need_bytes);
+
+    if ((base % 4096) != 0 || (per_node % 4096) != 0) {
+        fprintf(stderr, "[!] crypto: CXL_CRYPTO_PRIV_REGION_BASE/SIZE must be 4K-aligned (base=%zu size=%zu)\n",
+                base, per_node);
+        return -1;
+    }
+    if (per_node < need_bytes) {
+        fprintf(stderr, "[!] crypto: CXL_CRYPTO_PRIV_REGION_SIZE too small (need >= %zu, got %zu)\n",
+                need_bytes, per_node);
+        return -1;
+    }
+
+    uint64_t idx = g_sec_node_id - 1ULL;
+    uint64_t off64 = (uint64_t)base + idx * (uint64_t)per_node;
+    if (off64 > (uint64_t)map_size || (uint64_t)per_node > (uint64_t)map_size - off64) {
+        fprintf(stderr,
+                "[!] crypto: private region out of range (map_size=%zu base=%zu node=%" PRIu64 " per_node=%zu)\n",
+                map_size, base, g_sec_node_id, per_node);
+        return -1;
+    }
+
+    g_crypto_priv_region_base = base;
+    g_crypto_priv_region_size = per_node;
+    g_crypto_priv = mm + (size_t)off64;
+    memset(g_crypto_priv, 0, per_node);
+    for (uint32_t i = 0; i < lo->ring_count; i++) {
+        atomic_store_explicit(&g_crypto_priv_nonce_ctr[i], 0, memory_order_relaxed);
+    }
+    return 0;
+}
+
+static int crypto_priv_encrypt_then_decrypt(uint32_t ring_idx,
+                                            unsigned dir,
+                                            const unsigned char *payload,
+                                            uint32_t payload_len,
+                                            unsigned char *out,
+                                            uint32_t out_cap,
+                                            uint32_t *out_len) {
+    if (!out || !out_len || !payload) return -1;
+    if (!g_crypto || !g_crypto_priv) return -1;
+    if (ring_idx >= MAX_RINGS) return -1;
+    if (payload_len > out_cap) return -1;
+    const uint32_t nonce_bytes = crypto_stream_chacha20_ietf_NONCEBYTES;
+    if ((size_t)payload_len + (size_t)nonce_bytes > (size_t)TDX_SHM_SLOT_SIZE) return -1;
+
+    unsigned char *slot = g_crypto_priv + (size_t)ring_idx * (size_t)TDX_SHM_SLOT_SIZE;
+    unsigned char *nonce = slot;
+    unsigned char *cipher = slot + nonce_bytes;
+
+    shm_delay();
+    memset(nonce, 0, nonce_bytes);
+    nonce[0] = (unsigned char)(dir & 0xffu);
+    nonce[1] = (unsigned char)(ring_idx & 0xffu);
+    uint64_t ctr = atomic_fetch_add_explicit(&g_crypto_priv_nonce_ctr[ring_idx], 1, memory_order_relaxed);
+    for (int i = 0; i < 8; i++) {
+        nonce[4 + i] = (unsigned char)((ctr >> (8 * i)) & 0xffu);
+    }
+
+    memcpy(cipher, payload, payload_len);
+    crypto_stream_chacha20_ietf_xor(cipher,
+                                    cipher,
+                                    (unsigned long long)payload_len,
+                                    nonce,
+                                    g_crypto_vm_key);
+
+    shm_delay();
+    crypto_stream_chacha20_ietf_xor(out,
+                                    cipher,
+                                    (unsigned long long)payload_len,
+                                    nonce,
+                                    g_crypto_vm_key);
+    *out_len = payload_len;
+    return 0;
 }
 
 static inline void pause_ns(uint64_t ns) {
@@ -478,10 +593,6 @@ out:
 
 static int secure_init(unsigned char *mm, size_t map_size, const struct layout *lo) {
     if (!g_secure) return 0;
-    if (!g_sec_mgr || !g_sec_mgr[0]) {
-        fprintf(stderr, "[!] --secure requires --sec-mgr ip:port\n");
-        return -1;
-    }
     if (g_sec_node_id == 0) {
         fprintf(stderr, "[!] --secure requires --sec-node-id N\n");
         return -1;
@@ -491,13 +602,45 @@ static int secure_init(unsigned char *mm, size_t map_size, const struct layout *
         return -1;
     }
 
+    if (!lo || lo->ring_count == 0 || lo->ring_count > MAX_RINGS) return -1;
+
+    memset(g_sec_key_ok, 0, sizeof(g_sec_key_ok));
+
+    if (g_crypto) {
+        if (!g_crypto_key_hex || !g_crypto_key_hex[0]) g_crypto_key_hex = getenv("CXL_SEC_KEY_HEX");
+        if (!g_crypto_common_hex || !g_crypto_common_hex[0]) g_crypto_common_hex = getenv("CXL_SEC_COMMON_KEY_HEX");
+        if (!g_crypto_key_hex || !g_crypto_key_hex[0] || !g_crypto_common_hex || !g_crypto_common_hex[0]) {
+            fprintf(stderr, "[!] --crypto requires CXL_SEC_KEY_HEX and CXL_SEC_COMMON_KEY_HEX (or --sec-key-hex/--sec-common-key-hex)\n");
+            return -1;
+        }
+        if (parse_key_hex(g_crypto_key_hex, g_crypto_vm_key, sizeof(g_crypto_vm_key)) != 0) {
+            fprintf(stderr, "[!] invalid CXL_SEC_KEY_HEX (expected %d bytes hex)\n", (int)sizeof(g_crypto_vm_key));
+            return -1;
+        }
+        if (parse_key_hex(g_crypto_common_hex, g_crypto_common_key, sizeof(g_crypto_common_key)) != 0) {
+            fprintf(stderr, "[!] invalid CXL_SEC_COMMON_KEY_HEX (expected %d bytes hex)\n", (int)sizeof(g_crypto_common_key));
+            return -1;
+        }
+        for (uint32_t i = 0; i < lo->ring_count; i++) {
+            memcpy(g_sec_key[i], g_crypto_common_key, crypto_aead_chacha20poly1305_ietf_KEYBYTES);
+            g_sec_key_ok[i] = 1;
+            atomic_store_explicit(&g_sec_nonce_ctr_req[i], 0, memory_order_relaxed);
+        }
+        if (crypto_priv_init(mm, map_size, lo) != 0) return -1;
+        return 0;
+    }
+
+    if (!g_sec_mgr || !g_sec_mgr[0]) {
+        fprintf(stderr, "[!] --secure requires --sec-mgr ip:port\n");
+        return -1;
+    }
+
     size_t region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
     size_t region_base = env_size("CXL_RING_REGION_BASE", 0);
     if (region_base < 4096) {
         fprintf(stderr, "[!] secure mode requires CXL_RING_REGION_BASE >= 4096 (reserved header page for CXLSEC table)\n");
         return -1;
     }
-    if (!lo || lo->ring_count == 0 || lo->ring_count > MAX_RINGS) return -1;
     if (map_size < CXL_SEC_TABLE_OFF + sizeof(CxlSecTable)) {
         fprintf(stderr, "[!] mapping too small for CXLSEC table\n");
         return -1;
@@ -789,12 +932,40 @@ static inline int ring_pop_safe(unsigned char *mm, const struct ring_info *ri, u
     return r;
 }
 
+static inline void fill_fixed_key(unsigned char *dst, size_t klen, int idx) {
+    if (!dst || klen == 0) return;
+    memset(dst, 'k', klen);
+    uint32_t v = (uint32_t)idx;
+    size_t n = klen < sizeof(v) ? klen : sizeof(v);
+    memcpy(dst, &v, n);
+}
+
+static inline void fill_fixed_val(unsigned char *dst, size_t vlen, int idx) {
+    if (!dst || vlen == 0) return;
+    memset(dst, 'v', vlen);
+    uint32_t v = (uint32_t)idx;
+    size_t n = vlen < sizeof(v) ? vlen : sizeof(v);
+    memcpy(dst, &v, n);
+}
+
 static int push_set(unsigned char *mm, const struct ring_info *ri, uint32_t cid, int idx) {
-    char key[32], val[32];
-    snprintf(key, sizeof(key), "k%d", idx);
-    snprintf(val, sizeof(val), "v%d", idx);
-    uint8_t klen = (uint8_t)strlen(key);
-    uint16_t vlen = (uint16_t)strlen(val);
+    char key_s[32], val_s[32];
+    uint8_t klen = 0;
+    uint16_t vlen = 0;
+    if (g_bench_key_size == 0) {
+        snprintf(key_s, sizeof(key_s), "k%d", idx);
+        klen = (uint8_t)strlen(key_s);
+    } else {
+        if (g_bench_key_size > 0xff) return -1;
+        klen = (uint8_t)g_bench_key_size;
+    }
+    if (g_bench_val_size == 0) {
+        snprintf(val_s, sizeof(val_s), "v%d", idx);
+        vlen = (uint16_t)strlen(val_s);
+    } else {
+        if (g_bench_val_size > 0xffff) return -1;
+        vlen = (uint16_t)g_bench_val_size;
+    }
 
     unsigned char buf[TDX_SHM_SLOT_SIZE];
     size_t need = 4 + klen + vlen;
@@ -804,31 +975,79 @@ static int push_set(unsigned char *mm, const struct ring_info *ri, uint32_t cid,
     buf[1] = klen;
     buf[2] = (uint8_t)(vlen & 0xff);
     buf[3] = (uint8_t)((vlen >> 8) & 0xff);
-    memcpy(buf + 4, key, klen);
-    memcpy(buf + 4 + klen, val, vlen);
+    if (g_bench_key_size == 0) {
+        memcpy(buf + 4, key_s, klen);
+    } else {
+        fill_fixed_key(buf + 4, klen, idx);
+    }
+    if (g_bench_val_size == 0) {
+        memcpy(buf + 4 + klen, val_s, vlen);
+    } else {
+        fill_fixed_val(buf + 4 + klen, vlen, idx);
+    }
     if (g_secure) {
         unsigned char enc[RING_MAX_PAYLOAD];
         uint32_t enc_len = 0;
-        if (secure_encrypt(ri->ring_idx,
-                           cid,
-                           MSG_DATA,
-                           RING_FLAG_SECURE,
-                           (uint32_t)need,
-                           buf,
-                           SEC_DIR_REQ,
-                           enc,
-                           (uint32_t)sizeof(enc),
-                           &enc_len) != 0)
+        if (!g_crypto) {
+            if (secure_encrypt(ri->ring_idx,
+                               cid,
+                               MSG_DATA,
+                               RING_FLAG_SECURE,
+                               (uint32_t)need,
+                               buf,
+                               SEC_DIR_REQ,
+                               enc,
+                               (uint32_t)sizeof(enc),
+                               &enc_len) != 0)
+                return -1;
+            return ring_push_safe(mm, ri, cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
+        }
+
+        const unsigned char *plain = buf;
+        uint32_t plain_len = (uint32_t)need;
+        unsigned char staged[RING_MAX_PAYLOAD];
+        uint32_t staged_len = 0;
+        if (use_lock) pthread_mutex_lock(&req_lock);
+        if (crypto_priv_encrypt_then_decrypt(ri->ring_idx,
+                                             SEC_DIR_REQ,
+                                             buf,
+                                             (uint32_t)need,
+                                             staged,
+                                             (uint32_t)sizeof(staged),
+                                             &staged_len) != 0) {
+            if (use_lock) pthread_mutex_unlock(&req_lock);
             return -1;
-        return ring_push_safe(mm, ri, cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
+        }
+        plain = staged;
+        plain_len = staged_len;
+        int ok = secure_encrypt(ri->ring_idx,
+                                cid,
+                                MSG_DATA,
+                                RING_FLAG_SECURE,
+                                plain_len,
+                                plain,
+                                SEC_DIR_REQ,
+                                enc,
+                                (uint32_t)sizeof(enc),
+                                &enc_len);
+        int r = (ok == 0) ? ring_push(mm, ri, cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len) : -1;
+        if (use_lock) pthread_mutex_unlock(&req_lock);
+        if (ok != 0) return -1;
+        return r;
     }
     return ring_push_safe(mm, ri, cid, MSG_DATA, 0, buf, (uint32_t)need);
 }
 
 static int push_get(unsigned char *mm, const struct ring_info *ri, uint32_t cid, int idx) {
-    char key[32];
-    snprintf(key, sizeof(key), "k%d", idx);
-    uint8_t klen = (uint8_t)strlen(key);
+    char key_s[32];
+    uint8_t klen = 0;
+    if (g_bench_key_size == 0) {
+        snprintf(key_s, sizeof(key_s), "k%d", idx);
+        klen = (uint8_t)strlen(key_s);
+    } else {
+        if (g_bench_key_size > 0xff) return -1;
+        klen = (uint8_t)g_bench_key_size;
+    }
 
     unsigned char buf[TDX_SHM_SLOT_SIZE];
     size_t need = 4 + klen;
@@ -838,22 +1057,60 @@ static int push_get(unsigned char *mm, const struct ring_info *ri, uint32_t cid,
     buf[1] = klen;
     buf[2] = 0;
     buf[3] = 0;
-    memcpy(buf + 4, key, klen);
+    if (g_bench_key_size == 0) {
+        memcpy(buf + 4, key_s, klen);
+    } else {
+        fill_fixed_key(buf + 4, klen, idx);
+    }
     if (g_secure) {
         unsigned char enc[RING_MAX_PAYLOAD];
         uint32_t enc_len = 0;
-        if (secure_encrypt(ri->ring_idx,
-                           cid,
-                           MSG_DATA,
-                           RING_FLAG_SECURE,
-                           (uint32_t)need,
-                           buf,
-                           SEC_DIR_REQ,
-                           enc,
-                           (uint32_t)sizeof(enc),
-                           &enc_len) != 0)
+        if (!g_crypto) {
+            if (secure_encrypt(ri->ring_idx,
+                               cid,
+                               MSG_DATA,
+                               RING_FLAG_SECURE,
+                               (uint32_t)need,
+                               buf,
+                               SEC_DIR_REQ,
+                               enc,
+                               (uint32_t)sizeof(enc),
+                               &enc_len) != 0)
+                return -1;
+            return ring_push_safe(mm, ri, cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
+        }
+
+        const unsigned char *plain = buf;
+        uint32_t plain_len = (uint32_t)need;
+        unsigned char staged[RING_MAX_PAYLOAD];
+        uint32_t staged_len = 0;
+        if (use_lock) pthread_mutex_lock(&req_lock);
+        if (crypto_priv_encrypt_then_decrypt(ri->ring_idx,
+                                             SEC_DIR_REQ,
+                                             buf,
+                                             (uint32_t)need,
+                                             staged,
+                                             (uint32_t)sizeof(staged),
+                                             &staged_len) != 0) {
+            if (use_lock) pthread_mutex_unlock(&req_lock);
             return -1;
-        return ring_push_safe(mm, ri, cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len);
+        }
+        plain = staged;
+        plain_len = staged_len;
+        int ok = secure_encrypt(ri->ring_idx,
+                                cid,
+                                MSG_DATA,
+                                RING_FLAG_SECURE,
+                                plain_len,
+                                plain,
+                                SEC_DIR_REQ,
+                                enc,
+                                (uint32_t)sizeof(enc),
+                                &enc_len);
+        int r = (ok == 0) ? ring_push(mm, ri, cid, MSG_DATA, RING_FLAG_SECURE, enc, enc_len) : -1;
+        if (use_lock) pthread_mutex_unlock(&req_lock);
+        if (ok != 0) return -1;
+        return r;
     }
     return ring_push_safe(mm, ri, cid, MSG_DATA, 0, buf, (uint32_t)need);
 }
@@ -1446,6 +1703,22 @@ int main(int argc, char **argv) {
             }
             map_size = v;
         }
+        else if (!strcmp(argv[i], "--key-size") && i + 1 < argc) {
+            size_t v = 0;
+            if (parse_size(argv[++i], &v) != 0) {
+                fprintf(stderr, "[!] Invalid --key-size\n");
+                return 2;
+            }
+            g_bench_key_size = v;
+        }
+        else if (!strcmp(argv[i], "--val-size") && i + 1 < argc) {
+            size_t v = 0;
+            if (parse_size(argv[++i], &v) != 0) {
+                fprintf(stderr, "[!] Invalid --val-size\n");
+                return 2;
+            }
+            g_bench_val_size = v;
+        }
         else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench_n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--map-offset") && i + 1 < argc) {
             size_t v = 0;
@@ -1465,26 +1738,66 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--label") && i + 1 < argc) label = argv[++i];
         else if (!strcmp(argv[i], "--secure")) {
             g_secure = 1;
+        } else if (!strcmp(argv[i], "--crypto")) {
+            g_secure = 1;
+            g_crypto = 1;
         } else if (!strcmp(argv[i], "--sec-mgr") && i + 1 < argc) {
             g_sec_mgr = argv[++i];
         } else if (!strcmp(argv[i], "--sec-node-id") && i + 1 < argc) {
             g_sec_node_id = strtoull(argv[++i], NULL, 0);
         } else if (!strcmp(argv[i], "--sec-timeout-ms") && i + 1 < argc) {
             g_sec_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
+        } else if (!strcmp(argv[i], "--sec-key-hex") && i + 1 < argc) {
+            g_crypto_key_hex = argv[++i];
+        } else if (!strcmp(argv[i], "--sec-common-key-hex") && i + 1 < argc) {
+            g_crypto_common_hex = argv[++i];
         } else if (!strcmp(argv[i], "--ping-timeout-ms") && i + 1 < argc) ping_timeout_ms = (unsigned)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("Usage: %s [--path <bar2|uio>] [--map-size <bytes>] [--map-offset <bytes>] [--bench N] [--pipeline] [--threads N]\n"
+                   "          [--key-size <bytes>] [--val-size <bytes>]\n"
                    "          [--max-inflight N] [--latency] [--cost] [--csv <path>] [--label <name>]\n"
                    "          [--secure --sec-mgr <ip:port> --sec-node-id N [--sec-timeout-ms MS]]\n"
+                   "          [--crypto --sec-node-id N [--sec-key-hex HEX] [--sec-common-key-hex HEX]]\n"
                    "          [--ping-timeout-ms <ms>] (ping mode only; 0=wait forever)\n"
                    "Env:\n"
                    "  CXL_RING_COUNT        : number of rings/regions (default: 1)\n"
                    "  CXL_RING_REGION_SIZE  : bytes per ring region (default: 16M)\n"
                    "  CXL_RING_REGION_BASE  : base offset within the mmap (default: 0)\n"
+                   "  (bench) --key-size/--val-size accept optional K/M/G suffix.\n"
+                   "  CXL_SEC_KEY_HEX       : (crypto) per-node key (32B hex)\n"
+                   "  CXL_SEC_COMMON_KEY_HEX: (crypto) common key (32B hex)\n"
+                   "  CXL_CRYPTO_PRIV_REGION_BASE: (crypto) private staging base offset (default: after rings)\n"
+                   "  CXL_CRYPTO_PRIV_REGION_SIZE: (crypto) per-node private staging size (default: ring_count*4KiB)\n"
                    "  CXL_RING_POLL_SPIN_NS : spin-wait before sleeping when empty/full (default: 5000)\n"
                    "  CXL_RING_POLL_SLEEP_NS: nanosleep after spinning when empty/full (default: 50000)\n",
                    argv[0]);
             return 0;
+        }
+    }
+
+    if (g_bench_key_size > 0 && g_bench_key_size > 0xff) {
+        fprintf(stderr, "[!] --key-size too large (max 255)\n");
+        return 2;
+    }
+    if (g_bench_val_size > 0 && g_bench_val_size > 0xffff) {
+        fprintf(stderr, "[!] --val-size too large (max 65535)\n");
+        return 2;
+    }
+    {
+        int max_idx = 0;
+        if (bench_n > 0) max_idx = bench_n - 1;
+        char key_s[32], val_s[32];
+        snprintf(key_s, sizeof(key_s), "k%d", max_idx);
+        snprintf(val_s, sizeof(val_s), "v%d", max_idx);
+        size_t kmax = (g_bench_key_size > 0) ? g_bench_key_size : strlen(key_s);
+        size_t vmax = (g_bench_val_size > 0) ? g_bench_val_size : strlen(val_s);
+        if (4 + kmax > (size_t)RING_MAX_PAYLOAD) {
+            fprintf(stderr, "[!] key size too large for ring payload: need=%zu max=%u\n", 4 + kmax, RING_MAX_PAYLOAD);
+            return 2;
+        }
+        if (bench_n > 0 && 4 + kmax + vmax > (size_t)RING_MAX_PAYLOAD) {
+            fprintf(stderr, "[!] key+value too large for ring payload: need=%zu max=%u\n", 4 + kmax + vmax, RING_MAX_PAYLOAD);
+            return 2;
         }
     }
 
@@ -1557,8 +1870,9 @@ int main(int argc, char **argv) {
     size_t region_size = env_size("CXL_RING_REGION_SIZE", (size_t)TDX_SHM_DEFAULT_TOTAL_SIZE);
     size_t region_base = env_size("CXL_RING_REGION_BASE", 0);
 
-    printf("[*] tdx shm ring direct: path=%s map=%zu offset=%zu ring_count=%u region_base=%zu region_size=%zu slots=%u shm_delay_ns=%" PRIu64 " poll_spin_ns=%" PRIu64 " poll_sleep_ns=%" PRIu64 "\n",
-           path, map_size, map_offset, lo.ring_count, region_base, region_size, lo.rings[ring_idx].slots, shm_delay_ns, poll_spin_ns, poll_sleep_ns);
+    printf("[*] tdx shm ring direct: path=%s map=%zu offset=%zu ring_count=%u region_base=%zu region_size=%zu slots=%u shm_delay_ns=%" PRIu64 " poll_spin_ns=%" PRIu64 " poll_sleep_ns=%" PRIu64 " crypto=%d priv_base=%zu priv_size=%zu\n",
+           path, map_size, map_offset, lo.ring_count, region_base, region_size, lo.rings[ring_idx].slots, shm_delay_ns, poll_spin_ns, poll_sleep_ns,
+           g_crypto, g_crypto_priv_region_base, g_crypto_priv_region_size);
 
     if (bench_n > 0) {
         run_bench(mm, &lo, bench_n, pipeline, threads, max_inflight, collect_latency, collect_cost, csv_path, label);
