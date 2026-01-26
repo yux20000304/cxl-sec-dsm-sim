@@ -83,7 +83,7 @@ set -euo pipefail
 #   OMP_PLACES        : OpenMP place list (default: cores)
 #   GAPBS_DROP_FIRST_TRIAL : drop the first Trial Time when computing avg_time_s (default: 1)
 #   GAPBS_CXL_PRETOUCH_RING : enable GAPBS_CXL_PRETOUCH for ring attach runs (default: 1)
-#   GAPBS_CXL_MAP_SIZE: mmap size in bytes for the GAPBS graph region (default: 4294967296 = 4GB)
+#   GAPBS_CXL_MAP_SIZE: mmap size in bytes for the GAPBS graph region (default: 17179869184 = 16GB)
 #   SEC_MGR_TIMEOUT_MS: cxl_sec_mgr wait timeout for graph header (default: 600000)
 #
 # Shared-memory (CXL) latency simulation:
@@ -181,15 +181,15 @@ YCSB_CLUSTER="${YCSB_CLUSTER:-false}"
 
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
 GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-}"
-SCALE="${SCALE:-22}"
-DEGREE="${DEGREE:-16}"
+SCALE="${SCALE:-23}"
+DEGREE="${DEGREE:-22}"
 TRIALS="${TRIALS:-5}"
 OMP_THREADS="${OMP_THREADS:-4}"
 OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 OMP_PLACES="${OMP_PLACES:-cores}"
 GAPBS_DROP_FIRST_TRIAL="${GAPBS_DROP_FIRST_TRIAL:-1}"
 GAPBS_CXL_PRETOUCH_RING="${GAPBS_CXL_PRETOUCH_RING:-0}"
-GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-4294967296}"
+GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-17179869184}" # 16GB
 GAPBS_CXL_MAP_OFFSET_VM1="${GAPBS_CXL_MAP_OFFSET_VM1:-0}"
 GAPBS_CXL_MAP_OFFSET_VM2="${GAPBS_CXL_MAP_OFFSET_VM2:-0}"
 
@@ -1505,26 +1505,104 @@ e2e_avg_time_s_from_avg_attach_ms() {
   }'
 }
 
-cxl_attach_field_from_log() {
-  local log="$1"
-  local key="$2"
-  if [[ ! -f "${log}" ]]; then
-    echo ""
-    return 0
-  fi
-  awk -v k="${key}" '
-    /^\[gapbs\] CXL attach:/ {
-      for (i = 1; i <= NF; i++) {
-        if (index($i, k"=") == 1) {
-          v = $i;
-          sub(k"=", "", v);
-          print v;
-          exit;
+  cxl_attach_field_from_log() {
+    local log="$1"
+    local key="$2"
+    if [[ ! -f "${log}" ]]; then
+      echo ""
+      return 0
+    fi
+    awk -v k="${key}" '
+      /^\[gapbs\] CXL attach:/ {
+        for (i = 1; i <= NF; i++) {
+          if (index($i, k"=") == 1) {
+            v = $i;
+            sub(k"=", "", v);
+            print v;
+            exit;
+          }
         }
       }
-    }
-  ' "${log}" | tr -d '\r' || true
-}
+    ' "${log}" | tr -d '\r' || true
+  }
+
+  # Zero the 4K header page of GAPBS crypto private regions for vm1/vm2 to avoid
+  # stale busy bits across runs. Computes default priv_base/size from the crypto
+  # publish log (nodes/out_entries/total_bytes), assuming DestID=4 bytes.
+  gapbs_zero_crypto_priv_headers() {
+    local pub_log="$1"
+    if [[ ! -f "${pub_log}" ]]; then
+      return 0
+    fi
+    local total_bytes nodes out_entries inverse
+    total_bytes="$(awk '/CXL graph published:/{for(i=1;i<=NF;i++){if($i ~ /total_bytes=/){split($i,a,"=");print a[2]}}}' "${pub_log}" | tr -d '\r' | head -n1)"
+    nodes="$(awk '/CXL graph published:/{for(i=1;i<=NF;i++){if($i ~ /nodes=/){split($i,a,"=");print a[2]}}}' "${pub_log}" | tr -d '\r' | head -n1)"
+    out_entries="$(awk '/CXL graph published:/{for(i=1;i<=NF;i++){if($i ~ /out_entries=/){split($i,a,"=");print a[2]}}}' "${pub_log}" | tr -d '\r' | head -n1)"
+    inverse="$(awk '/CXL graph published:/{for(i=1;i<=NF;i++){if($i ~ /inverse=/){split($i,a,"=");print a[2]}}}' "${pub_log}" | tr -d '\r' | head -n1)"
+    if [[ -z "${total_bytes}" || -z "${nodes}" || -z "${out_entries}" ]]; then
+      return 0
+    fi
+    # Helpers
+    align64() { awk -v x="$1" 'BEGIN{printf "%d", int((x+63)/64)*64}'; }
+    align4096() { awk -v x="$1" 'BEGIN{printf "%d", int((x+4095)/4096)*4096}'; }
+    # Compute bytes_required (one private copy) and priv_base = AlignUp(total_bytes,4K)
+    # Assumes DestID=4, offsets are int64 (8B), inverse optional
+    local dest_bytes=4
+    local out_offsets_bytes=$(( (nodes + 1) * 8 ))
+    local out_neigh_bytes=$(( out_entries * dest_bytes ))
+    local need=4096
+    need="$(align64 "${need}")"; need=$(( need + out_offsets_bytes ))
+    need="$(align64 "${need}")"; need=$(( need + out_neigh_bytes ))
+    if [[ "${inverse}" == "1" ]]; then
+      local in_offsets_bytes=$(( (nodes + 1) * 8 ))
+      # Inverse entries count equals last offset value; approximate with out_entries
+      local in_neigh_bytes=$(( out_entries * dest_bytes ))
+      need="$(align64 "${need}")"; need=$(( need + in_offsets_bytes ))
+      need="$(align64 "${need}")"; need=$(( need + in_neigh_bytes ))
+    fi
+    local priv_size="$(align4096 "${need}")"
+    local priv_base="$(align4096 "${total_bytes}")"
+    # Zero vm1/vm2 header pages (node_id=1/2). Consider per-VM GAPBS map offset.
+    local off_vm1_bytes=$(( priv_base + GAPBS_CXL_MAP_OFFSET_VM1 ))
+    local off_vm2_bytes=$(( priv_base + priv_size + GAPBS_CXL_MAP_OFFSET_VM2 ))
+    # Use python+mmap to avoid dd write I/O errors on resource2; ignore failures quietly.
+    ssh_vm1 "sudo -n python3 - <<'PY' >/dev/null 2>&1
+import os, mmap
+path = r'''${RING_PATH_VM1}'''
+off = int(r'''${off_vm1_bytes}''')
+try:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        m = mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off)
+        try:
+            m[:] = b"\x00" * 4096
+            m.flush()
+        finally:
+            m.close()
+    finally:
+        os.close(fd)
+except Exception:
+    pass
+PY" || true
+    ssh_vm2 "sudo -n python3 - <<'PY' >/dev/null 2>&1
+import os, mmap
+path = r'''${RING_PATH_VM2}'''
+off = int(r'''${off_vm2_bytes}''')
+try:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        m = mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off)
+        try:
+            m[:] = b"\x00" * 4096
+            m.flush()
+        finally:
+            m.close()
+    finally:
+        os.close(fd)
+except Exception:
+    pass
+PY" || true
+  }
 
 edges_for_teps_from_log() {
   local log="$1"
@@ -1652,9 +1730,12 @@ run_gapbs_kernel() {
     crypto_key_vm2_hex="$(openssl rand -hex 32)"
     crypto_key_common_hex="$(openssl rand -hex 32)"
 
-    echo "[*] GAPBS kernel=${kernel}: multihost crypto publish in vm1 (libsodium; no mgr)"
-    ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
-      | tee "${gapbs_crypto_pub_log}"
+  echo "[*] GAPBS kernel=${kernel}: multihost crypto publish in vm1 (libsodium; no mgr)"
+  ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=publish GAPBS_CXL_PUBLISH_ONLY=1 CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n 1" \
+    | tee "${gapbs_crypto_pub_log}"
+
+  # Proactively clear private-region header pages to avoid stale busy state
+  gapbs_zero_crypto_priv_headers "${gapbs_crypto_pub_log}"
 
     echo "[*] GAPBS kernel=${kernel}: multihost crypto attach+run in vm1+vm2 (concurrent)"
     (
