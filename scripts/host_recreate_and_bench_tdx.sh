@@ -83,7 +83,7 @@ set -euo pipefail
 #   OMP_PLACES        : OpenMP place list (default: cores)
 #   GAPBS_DROP_FIRST_TRIAL : drop the first Trial Time when computing avg_time_s (default: 1)
 #   GAPBS_CXL_PRETOUCH_RING : enable GAPBS_CXL_PRETOUCH for ring attach runs (default: 1)
-#   GAPBS_CXL_MAP_SIZE: mmap size in bytes for the GAPBS graph region (default: 17179869184 = 16GB)
+#   GAPBS_CXL_MAP_SIZE: mmap size in bytes for the GAPBS graph region (default: 68719476736 = 64GB)
 #   SEC_MGR_TIMEOUT_MS: cxl_sec_mgr wait timeout for graph header (default: 600000)
 #
 # Shared-memory (CXL) latency simulation:
@@ -189,7 +189,7 @@ OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 OMP_PLACES="${OMP_PLACES:-cores}"
 GAPBS_DROP_FIRST_TRIAL="${GAPBS_DROP_FIRST_TRIAL:-1}"
 GAPBS_CXL_PRETOUCH_RING="${GAPBS_CXL_PRETOUCH_RING:-0}"
-GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-17179869184}" # 16GB
+GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-68719476736}" # 64GB
 GAPBS_CXL_MAP_OFFSET_VM1="${GAPBS_CXL_MAP_OFFSET_VM1:-0}"
 GAPBS_CXL_MAP_OFFSET_VM2="${GAPBS_CXL_MAP_OFFSET_VM2:-0}"
 
