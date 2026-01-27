@@ -132,7 +132,7 @@ run_ycsb() {
   "${launcher}" "${action}" redis -s -P "${YCSB_DIR}/${wl_file}" \
     -p "recordcount=${RECORDS}" -p "operationcount=${OPS}" \
     -p "redis.host=${HOST}" -p "redis.port=${PORT}" \
-    "${extra_p[@]}" -threads "${THREADS}" "${tgt_args[@]}" | tee "${outfile}"
+    "${extra_p[@]}" -threads "${THREADS}" "${tgt_args[@]}" 2>&1 | tee "${outfile}"
   echo "[+] Saved: ${outfile}"
 }
 

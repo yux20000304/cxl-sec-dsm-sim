@@ -268,7 +268,7 @@ if [[ "${YCSB_ENABLE}" == "1" ]]; then
   if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
   if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
   ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
-  ssh_vm2 "bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+  ssh_vm2 "sudo -n bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
 fi
 
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
@@ -307,7 +307,7 @@ if [[ "${YCSB_ENABLE}" == "1" ]]; then
   if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
   if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
   ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
-  ssh_vm2 "bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+  ssh_vm2 "sudo -n bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
 fi
 
 echo "[*] Benchmark 3/5: native Redis over libsodium-encrypted TCP (tunnel)"
@@ -337,7 +337,7 @@ if [[ "${YCSB_ENABLE}" == "1" ]]; then
   if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
   if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
   ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
-  ssh_vm2 "bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+  ssh_vm2 "sudo -n bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
 fi
 
 ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
@@ -369,7 +369,7 @@ if [[ "${YCSB_ENABLE}" == "1" ]]; then
              "--threads" "${YCSB_THREADS}")
   if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
   # Start local proxy inside VM2 pointing to BAR2 path
-  ssh_vm2 "RING_RESP_PROXY=1 RING_PATH=${RING_PATH} RING_MAP_SIZE=${RING_MAP_SIZE} RING_RESP_LISTEN=127.0.0.1:6381 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+  ssh_vm2 "sudo -n env RING_RESP_PROXY=1 RING_PATH=${RING_PATH} RING_MAP_SIZE=${RING_MAP_SIZE} RING_RESP_LISTEN=127.0.0.1:6381 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
 fi
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_ring_gramine >/dev/null 2>&1 || true"
@@ -397,7 +397,7 @@ if [[ "${YCSB_ENABLE}" == "1" ]]; then
              "--recordcount" "${YCSB_RECORDS}" "--operationcount" "${YCSB_OPS}" \
              "--threads" "${YCSB_THREADS}")
   if [[ -n "${YCSB_TARGET}" ]]; then ycsb_args+=("--target" "${YCSB_TARGET}"); fi
-  ssh_vm2 "RING_RESP_PROXY=1 RING_RESP_SECURE=1 RING_PATH=${RING_PATH} RING_MAP_SIZE=${RING_MAP_SIZE} RING_RESP_LISTEN=127.0.0.1:6382 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+  ssh_vm2 "sudo -n env RING_RESP_PROXY=1 RING_RESP_SECURE=1 RING_PATH=${RING_PATH} RING_MAP_SIZE=${RING_MAP_SIZE} RING_RESP_LISTEN=127.0.0.1:6382 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
 fi
 
 ssh_vm1 "tmux kill-session -t redis_ring_gramine_secure >/dev/null 2>&1 || true"
