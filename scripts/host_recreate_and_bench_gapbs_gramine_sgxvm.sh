@@ -566,11 +566,11 @@ sgx_ring_avg_time="$(avg2_float "${sgx_ring_vm1_avg}" "${sgx_ring_vm2_avg}")"
 sgx_crypto_avg_time="$(avg2_float "${sgx_crypto_vm1_avg}" "${sgx_crypto_vm2_avg}")"
 sgx_secure_avg_time="$(avg2_float "${sgx_secure_vm1_avg}" "${sgx_secure_vm2_avg}")"
 
-native_avg_teps="$(avg2_int "${native_vm1_teps}" "${native_vm2_teps}")"
-plain_ring_avg_teps="$(avg2_int "${plain_ring_vm1_teps}" "${plain_ring_vm2_teps}")"
-sgx_ring_avg_teps="$(avg2_int "${sgx_ring_vm1_teps}" "${sgx_ring_vm2_teps}")"
-sgx_crypto_avg_teps="$(avg2_int "${sgx_crypto_vm1_teps}" "${sgx_crypto_vm2_teps}")"
-sgx_secure_avg_teps="$(avg2_int "${sgx_secure_vm1_teps}" "${sgx_secure_vm2_teps}")"
+native_avg_teps="$(teps_from_edges_time "${native_avg_edges}" "${native_avg_time}")"
+plain_ring_avg_teps="$(teps_from_edges_time "${plain_ring_avg_edges}" "${plain_ring_avg_time}")"
+sgx_ring_avg_teps="$(teps_from_edges_time "${sgx_ring_avg_edges}" "${sgx_ring_avg_time}")"
+sgx_crypto_avg_teps="$(teps_from_edges_time "${sgx_crypto_avg_edges}" "${sgx_crypto_avg_time}")"
+sgx_secure_avg_teps="$(teps_from_edges_time "${sgx_secure_avg_edges}" "${sgx_secure_avg_time}")"
 
 {
   echo "label,vm,kernel,scale,degree,trials,omp_threads,edge_traversals,avg_time_s,throughput_teps"

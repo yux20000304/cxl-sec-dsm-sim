@@ -182,13 +182,15 @@ YCSB_CLUSTER="${YCSB_CLUSTER:-false}"
 GAPBS_KERNEL="${GAPBS_KERNEL:-bfs}"
 GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-}"
 SCALE="${SCALE:-24}"
-DEGREE="${DEGREE:-24}"
-TRIALS="${TRIALS:-5}"
+DEGREE="${DEGREE:-16}"
+TRIALS="${TRIALS:-3}"
 OMP_THREADS="${OMP_THREADS:-4}"
 OMP_PROC_BIND="${OMP_PROC_BIND:-true}"
 OMP_PLACES="${OMP_PLACES:-cores}"
 GAPBS_DROP_FIRST_TRIAL="${GAPBS_DROP_FIRST_TRIAL:-1}"
 GAPBS_CXL_PRETOUCH_RING="${GAPBS_CXL_PRETOUCH_RING:-0}"
+# GAPBS crypto (no mgr) cross-VM rekey: 1=enable (default), 0=disable.
+GAPBS_CXL_CRYPTO_REKEY="${GAPBS_CXL_CRYPTO_REKEY:-1}"
 GAPBS_CXL_MAP_SIZE="${GAPBS_CXL_MAP_SIZE:-68719476736}" # 64GB
 GAPBS_CXL_MAP_OFFSET_VM1="${GAPBS_CXL_MAP_OFFSET_VM1:-0}"
 GAPBS_CXL_MAP_OFFSET_VM2="${GAPBS_CXL_MAP_OFFSET_VM2:-0}"
@@ -1527,80 +1529,126 @@ e2e_avg_time_s_from_avg_attach_ms() {
   }
 
   # Zero the 4K header page of GAPBS crypto private regions for vm1/vm2 to avoid
-  # stale busy bits across runs. Computes default priv_base/size from the crypto
-  # publish log (nodes/out_entries/total_bytes), assuming DestID=4 bytes.
+  # stale busy bits across runs. Read the published CXL graph header to compute
+  # the correct per-entry size (e.g., SSSP uses 8-byte NodeWeight entries).
   gapbs_zero_crypto_priv_headers() {
     local pub_log="$1"
     if [[ ! -f "${pub_log}" ]]; then
       return 0
     fi
-    local total_bytes nodes out_entries inverse
-    total_bytes="$(awk '/CXL graph published:/{for(i=1;i<=NF;i++){if($i ~ /total_bytes=/){split($i,a,"=");print a[2]}}}' "${pub_log}" | tr -d '\r' | head -n1)"
-    nodes="$(awk '/CXL graph published:/{for(i=1;i<=NF;i++){if($i ~ /nodes=/){split($i,a,"=");print a[2]}}}' "${pub_log}" | tr -d '\r' | head -n1)"
-    out_entries="$(awk '/CXL graph published:/{for(i=1;i<=NF;i++){if($i ~ /out_entries=/){split($i,a,"=");print a[2]}}}' "${pub_log}" | tr -d '\r' | head -n1)"
-    inverse="$(awk '/CXL graph published:/{for(i=1;i<=NF;i++){if($i ~ /inverse=/){split($i,a,"=");print a[2]}}}' "${pub_log}" | tr -d '\r' | head -n1)"
-    if [[ -z "${total_bytes}" || -z "${nodes}" || -z "${out_entries}" ]]; then
-      return 0
-    fi
-    # Helpers
-    align64() { awk -v x="$1" 'BEGIN{printf "%d", int((x+63)/64)*64}'; }
-    align4096() { awk -v x="$1" 'BEGIN{printf "%d", int((x+4095)/4096)*4096}'; }
-    # Compute bytes_required (one private copy) and priv_base = AlignUp(total_bytes,4K)
-    # Assumes DestID=4, offsets are int64 (8B), inverse optional
-    local dest_bytes=4
-    local out_offsets_bytes=$(( (nodes + 1) * 8 ))
-    local out_neigh_bytes=$(( out_entries * dest_bytes ))
-    local need=4096
-    need="$(align64 "${need}")"; need=$(( need + out_offsets_bytes ))
-    need="$(align64 "${need}")"; need=$(( need + out_neigh_bytes ))
-    if [[ "${inverse}" == "1" ]]; then
-      local in_offsets_bytes=$(( (nodes + 1) * 8 ))
-      # Inverse entries count equals last offset value; approximate with out_entries
-      local in_neigh_bytes=$(( out_entries * dest_bytes ))
-      need="$(align64 "${need}")"; need=$(( need + in_offsets_bytes ))
-      need="$(align64 "${need}")"; need=$(( need + in_neigh_bytes ))
-    fi
-    local priv_size="$(align4096 "${need}")"
-    local priv_base="$(align4096 "${total_bytes}")"
-    # Zero vm1/vm2 header pages (node_id=1/2). Consider per-VM GAPBS map offset.
-    local off_vm1_bytes=$(( priv_base + GAPBS_CXL_MAP_OFFSET_VM1 ))
-    local off_vm2_bytes=$(( priv_base + priv_size + GAPBS_CXL_MAP_OFFSET_VM2 ))
     # Use python+mmap to avoid dd write I/O errors on resource2; ignore failures quietly.
+    # Clear both node_id=1 and node_id=2 header pages (the mapping is shared).
     ssh_vm1 "sudo -n python3 - <<'PY' >/dev/null 2>&1
-import os, mmap
+import mmap
+import os
+import struct
+
+def align_up(n: int, a: int) -> int:
+    return (n + (a - 1)) & ~(a - 1)
+
 path = r'''${RING_PATH_VM1}'''
-off = int(r'''${off_vm1_bytes}''')
+map_off = int(r'''${GAPBS_CXL_MAP_OFFSET_VM1}''', 0)
+
+fmt = '<QIIQQIIQQQQQIIQQQQ'
+
+fd = os.open(path, os.O_RDWR)
 try:
-    fd = os.open(path, os.O_RDWR)
-    try:
+    hmap = mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=map_off)
+    (magic, version, flags, num_nodes, out_entries, dest_bytes, owner_id,
+     out_offsets_off, out_neigh_off, in_offsets_off, in_neigh_off, total_bytes,
+     ready, reserved1, pub_out_offsets_off, pub_out_neigh_off, pub_in_offsets_off, pub_in_neigh_off) = (
+        struct.unpack_from(fmt, hmap, 0)
+    )
+    hmap.close()
+
+    out_offsets_bytes = (num_nodes + 1) * 8
+    out_neigh_bytes = out_entries * dest_bytes
+
+    need = 4096
+    need = align_up(need, 64)
+    need += out_offsets_bytes
+    need = align_up(need, 64)
+    need += out_neigh_bytes
+
+    directed = (flags & 1) != 0
+    has_inverse = (flags & (1 << 1)) != 0
+    if directed and has_inverse:
+        in_offsets_bytes = (num_nodes + 1) * 8
+        in_neigh_bytes = out_entries * dest_bytes
+        need = align_up(need, 64)
+        need += in_offsets_bytes
+        need = align_up(need, 64)
+        need += in_neigh_bytes
+
+    priv_size = align_up(need, 4096)
+    priv_base = align_up(total_bytes, 4096)
+
+    for node_id in (1, 2):
+        off = map_off + priv_base + (node_id - 1) * priv_size
         m = mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off)
-        try:
-            m[:] = b"\x00" * 4096
-            m.flush()
-        finally:
-            m.close()
-    finally:
-        os.close(fd)
+        m[:] = b'\\x00' * 4096
+        m.flush()
+        m.close()
 except Exception:
     pass
+finally:
+    os.close(fd)
 PY" || true
     ssh_vm2 "sudo -n python3 - <<'PY' >/dev/null 2>&1
-import os, mmap
+import mmap
+import os
+import struct
+
+def align_up(n: int, a: int) -> int:
+    return (n + (a - 1)) & ~(a - 1)
+
 path = r'''${RING_PATH_VM2}'''
-off = int(r'''${off_vm2_bytes}''')
+map_off = int(r'''${GAPBS_CXL_MAP_OFFSET_VM2}''', 0)
+
+fmt = '<QIIQQIIQQQQQIIQQQQ'
+
+fd = os.open(path, os.O_RDWR)
 try:
-    fd = os.open(path, os.O_RDWR)
-    try:
+    hmap = mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=map_off)
+    (magic, version, flags, num_nodes, out_entries, dest_bytes, owner_id,
+     out_offsets_off, out_neigh_off, in_offsets_off, in_neigh_off, total_bytes,
+     ready, reserved1, pub_out_offsets_off, pub_out_neigh_off, pub_in_offsets_off, pub_in_neigh_off) = (
+        struct.unpack_from(fmt, hmap, 0)
+    )
+    hmap.close()
+
+    out_offsets_bytes = (num_nodes + 1) * 8
+    out_neigh_bytes = out_entries * dest_bytes
+
+    need = 4096
+    need = align_up(need, 64)
+    need += out_offsets_bytes
+    need = align_up(need, 64)
+    need += out_neigh_bytes
+
+    directed = (flags & 1) != 0
+    has_inverse = (flags & (1 << 1)) != 0
+    if directed and has_inverse:
+        in_offsets_bytes = (num_nodes + 1) * 8
+        in_neigh_bytes = out_entries * dest_bytes
+        need = align_up(need, 64)
+        need += in_offsets_bytes
+        need = align_up(need, 64)
+        need += in_neigh_bytes
+
+    priv_size = align_up(need, 4096)
+    priv_base = align_up(total_bytes, 4096)
+
+    for node_id in (1, 2):
+        off = map_off + priv_base + (node_id - 1) * priv_size
         m = mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off)
-        try:
-            m[:] = b"\x00" * 4096
-            m.flush()
-        finally:
-            m.close()
-    finally:
-        os.close(fd)
+        m[:] = b'\\x00' * 4096
+        m.flush()
+        m.close()
 except Exception:
     pass
+finally:
+    os.close(fd)
 PY" || true
   }
 
@@ -1739,13 +1787,13 @@ run_gapbs_kernel() {
 
     echo "[*] GAPBS kernel=${kernel}: multihost crypto attach+run in vm1+vm2 (concurrent)"
     (
-      ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+      ssh_vm1 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM1}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM1}' GAPBS_CXL_MODE=attach GAPBS_CXL_CRYPTO_REKEY='${GAPBS_CXL_CRYPTO_REKEY}' CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=1 CXL_SEC_KEY_HEX='${crypto_key_vm1_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
         >"${gapbs_crypto_vm1_log}" 2>&1
     ) &
     local pid_gapbs_crypto_vm1=$!
 
     (
-      ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX='${crypto_key_vm2_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
+      ssh_vm2 "cd /mnt/hostshare/gapbs && sudo -n env OMP_NUM_THREADS='${OMP_THREADS}' OMP_PROC_BIND='${OMP_PROC_BIND}' OMP_PLACES='${OMP_PLACES}' CXL_SHM_DELAY_NS='${CXL_SHM_DELAY_NS}' GAPBS_CXL_PATH='${RING_PATH_VM2}' GAPBS_CXL_MAP_SIZE='${GAPBS_CXL_MAP_SIZE}' GAPBS_CXL_MAP_OFFSET='${GAPBS_CXL_MAP_OFFSET_VM2}' GAPBS_CXL_MODE=attach GAPBS_CXL_CRYPTO_REKEY='${GAPBS_CXL_CRYPTO_REKEY}' CXL_SEC_ENABLE=1 CXL_SEC_NODE_ID=2 CXL_SEC_KEY_HEX='${crypto_key_vm2_hex}' CXL_SEC_COMMON_KEY_HEX='${crypto_key_common_hex}' ./'${kernel}-ring-secure' -g '${SCALE}' -k '${DEGREE}' -n '${TRIALS}'" \
         >"${gapbs_crypto_vm2_log}" 2>&1
     ) &
     local pid_gapbs_crypto_vm2=$!
@@ -1863,10 +1911,10 @@ exit 1
   gapbs_secure_avg_time="$(avg2_float "${gapbs_secure_vm1_avg}" "${gapbs_secure_vm2_avg}")"
 
   local gapbs_native_avg_teps gapbs_ring_avg_teps gapbs_crypto_avg_teps gapbs_secure_avg_teps
-  gapbs_native_avg_teps="$(avg2_int "${gapbs_native_vm1_teps}" "${gapbs_native_vm2_teps}")"
-  gapbs_ring_avg_teps="$(avg2_int "${gapbs_ring_vm1_teps}" "${gapbs_ring_vm2_teps}")"
-  gapbs_crypto_avg_teps="$(avg2_int "${gapbs_crypto_vm1_teps}" "${gapbs_crypto_vm2_teps}")"
-  gapbs_secure_avg_teps="$(avg2_int "${gapbs_secure_vm1_teps}" "${gapbs_secure_vm2_teps}")"
+  gapbs_native_avg_teps="$(teps_from_edges_time "${gapbs_native_avg_edges}" "${gapbs_native_avg_time}")"
+  gapbs_ring_avg_teps="$(teps_from_edges_time "${gapbs_ring_avg_edges}" "${gapbs_ring_avg_time}")"
+  gapbs_crypto_avg_teps="$(teps_from_edges_time "${gapbs_crypto_avg_edges}" "${gapbs_crypto_avg_time}")"
+  gapbs_secure_avg_teps="$(teps_from_edges_time "${gapbs_secure_avg_edges}" "${gapbs_secure_avg_time}")"
 
   local gapbs_ring_vm1_attach_total_ms gapbs_ring_vm2_attach_total_ms gapbs_ring_vm1_attach_wait_ms gapbs_ring_vm2_attach_wait_ms
   local gapbs_ring_vm1_attach_decrypt_ms gapbs_ring_vm2_attach_decrypt_ms gapbs_ring_vm1_attach_pretouch_ms gapbs_ring_vm2_attach_pretouch_ms
@@ -1900,14 +1948,14 @@ exit 1
   gapbs_native_avg_e2e_time="$(avg2_float "${gapbs_native_vm1_e2e_avg}" "${gapbs_native_vm2_e2e_avg}")"
   gapbs_native_vm1_e2e_teps="$(teps_from_edges_time "${gapbs_native_vm1_edges}" "${gapbs_native_vm1_e2e_avg}")"
   gapbs_native_vm2_e2e_teps="$(teps_from_edges_time "${gapbs_native_vm2_edges}" "${gapbs_native_vm2_e2e_avg}")"
-  gapbs_native_avg_e2e_teps="$(avg2_int "${gapbs_native_vm1_e2e_teps}" "${gapbs_native_vm2_e2e_teps}")"
+  gapbs_native_avg_e2e_teps="$(teps_from_edges_time "${gapbs_native_avg_edges}" "${gapbs_native_avg_e2e_time}")"
 
   gapbs_ring_vm1_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_ring_vm1_avg}" "${gapbs_ring_vm1_attach_total_ms}" "${gapbs_ring_vm1_trials_used}")"
   gapbs_ring_vm2_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_ring_vm2_avg}" "${gapbs_ring_vm2_attach_total_ms}" "${gapbs_ring_vm2_trials_used}")"
   gapbs_ring_avg_e2e_time="$(avg2_float "${gapbs_ring_vm1_e2e_avg}" "${gapbs_ring_vm2_e2e_avg}")"
   gapbs_ring_vm1_e2e_teps="$(teps_from_edges_time "${gapbs_ring_vm1_edges}" "${gapbs_ring_vm1_e2e_avg}")"
   gapbs_ring_vm2_e2e_teps="$(teps_from_edges_time "${gapbs_ring_vm2_edges}" "${gapbs_ring_vm2_e2e_avg}")"
-  gapbs_ring_avg_e2e_teps="$(avg2_int "${gapbs_ring_vm1_e2e_teps}" "${gapbs_ring_vm2_e2e_teps}")"
+  gapbs_ring_avg_e2e_teps="$(teps_from_edges_time "${gapbs_ring_avg_edges}" "${gapbs_ring_avg_e2e_time}")"
 
   local gapbs_crypto_vm1_attach_total_ms gapbs_crypto_vm2_attach_total_ms gapbs_crypto_vm1_attach_wait_ms gapbs_crypto_vm2_attach_wait_ms
   local gapbs_crypto_vm1_attach_decrypt_ms gapbs_crypto_vm2_attach_decrypt_ms gapbs_crypto_vm1_attach_pretouch_ms gapbs_crypto_vm2_attach_pretouch_ms
@@ -1951,14 +1999,14 @@ exit 1
     gapbs_crypto_avg_e2e_time="$(avg2_float "${gapbs_crypto_vm1_e2e_avg}" "${gapbs_crypto_vm2_e2e_avg}")"
     gapbs_crypto_vm1_e2e_teps="$(teps_from_edges_time "${gapbs_crypto_vm1_edges}" "${gapbs_crypto_vm1_e2e_avg}")"
     gapbs_crypto_vm2_e2e_teps="$(teps_from_edges_time "${gapbs_crypto_vm2_edges}" "${gapbs_crypto_vm2_e2e_avg}")"
-    gapbs_crypto_avg_e2e_teps="$(avg2_int "${gapbs_crypto_vm1_e2e_teps}" "${gapbs_crypto_vm2_e2e_teps}")"
+    gapbs_crypto_avg_e2e_teps="$(teps_from_edges_time "${gapbs_crypto_avg_edges}" "${gapbs_crypto_avg_e2e_time}")"
 
     gapbs_secure_vm1_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_secure_vm1_avg}" "${gapbs_secure_vm1_attach_total_ms}" "${gapbs_secure_vm1_trials_used}")"
     gapbs_secure_vm2_e2e_avg="$(e2e_avg_time_s_from_avg_attach_ms "${gapbs_secure_vm2_avg}" "${gapbs_secure_vm2_attach_total_ms}" "${gapbs_secure_vm2_trials_used}")"
     gapbs_secure_avg_e2e_time="$(avg2_float "${gapbs_secure_vm1_e2e_avg}" "${gapbs_secure_vm2_e2e_avg}")"
     gapbs_secure_vm1_e2e_teps="$(teps_from_edges_time "${gapbs_secure_vm1_edges}" "${gapbs_secure_vm1_e2e_avg}")"
     gapbs_secure_vm2_e2e_teps="$(teps_from_edges_time "${gapbs_secure_vm2_edges}" "${gapbs_secure_vm2_e2e_avg}")"
-    gapbs_secure_avg_e2e_teps="$(avg2_int "${gapbs_secure_vm1_e2e_teps}" "${gapbs_secure_vm2_e2e_teps}")"
+    gapbs_secure_avg_e2e_teps="$(teps_from_edges_time "${gapbs_secure_avg_edges}" "${gapbs_secure_avg_e2e_time}")"
   fi
 
   {

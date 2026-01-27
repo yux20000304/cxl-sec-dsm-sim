@@ -443,11 +443,11 @@ gramine_ring_avg_time="$(avg2_float "${gramine_ring_vm1_avg}" "${gramine_ring_vm
 gramine_crypto_avg_time="$(avg2_float "${gramine_crypto_vm1_avg}" "${gramine_crypto_vm2_avg}")"
 gramine_secure_avg_time="$(avg2_float "${gramine_secure_vm1_avg}" "${gramine_secure_vm2_avg}")"
 
-plain_native_avg_teps="$(avg2_int "${plain_native_vm1_teps}" "${plain_native_vm2_teps}")"
-plain_ring_avg_teps="$(avg2_int "${plain_ring_vm1_teps}" "${plain_ring_vm2_teps}")"
-gramine_ring_avg_teps="$(avg2_int "${gramine_ring_vm1_teps}" "${gramine_ring_vm2_teps}")"
-gramine_crypto_avg_teps="$(avg2_int "${gramine_crypto_vm1_teps}" "${gramine_crypto_vm2_teps}")"
-gramine_secure_avg_teps="$(avg2_int "${gramine_secure_vm1_teps}" "${gramine_secure_vm2_teps}")"
+plain_native_avg_teps="$(teps_from_edges_time "${plain_native_avg_edges}" "${plain_native_avg_time}")"
+plain_ring_avg_teps="$(teps_from_edges_time "${plain_ring_avg_edges}" "${plain_ring_avg_time}")"
+gramine_ring_avg_teps="$(teps_from_edges_time "${gramine_ring_avg_edges}" "${gramine_ring_avg_time}")"
+gramine_crypto_avg_teps="$(teps_from_edges_time "${gramine_crypto_avg_edges}" "${gramine_crypto_avg_time}")"
+gramine_secure_avg_teps="$(teps_from_edges_time "${gramine_secure_avg_edges}" "${gramine_secure_avg_time}")"
 
 {
   echo "label,vm,kernel,scale,degree,trials,omp_threads,edge_traversals,avg_time_s,throughput_teps"
