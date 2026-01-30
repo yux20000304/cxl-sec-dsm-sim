@@ -29,12 +29,19 @@ TARGET=""         # ops/sec (optional)
 PASSWORD=""       # optional redis password
 CLUSTER="false"    # true/false
 YCSB_DIR=""        # optional, pre-installed YCSB dir
+REDIS_TIMEOUT_MS="" # optional redis socket timeout (ms)
+YCSB_PROXY_RETRIES="${YCSB_PROXY_RETRIES:-3}"
+YCSB_PROXY_PING_TRIES="${YCSB_PROXY_PING_TRIES:-50}"
+YCSB_PROXY_PING_DELAY_MS="${YCSB_PROXY_PING_DELAY_MS:-200}"
+YCSB_PROXY_PING_TIMEOUT_MS="${YCSB_PROXY_PING_TIMEOUT_MS:-2000}"
+RING_RESP_PROXY_LOG=""
 
 usage() {
   cat <<EOF
 Usage: $0 [--host 127.0.0.1] [--port 6379] [--workloads workloada,workloadb] \
           [--recordcount 100000] [--operationcount 100000] [--threads 4] \
-          [--target OPS] [--password PWD] [--cluster true|false] [--ycsb-dir PATH]
+          [--target OPS] [--password PWD] [--cluster true|false] [--ycsb-dir PATH] \
+          [--redis-timeout-ms MS]
 
 Runs YCSB (redis binding) against the given Redis host:port.
 Downloads YCSB locally if needed (to /tmp/ycsb-0.17.0).
@@ -54,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --password) PASSWORD="$2"; shift 2 ;;
     --cluster) CLUSTER="$2"; shift 2 ;;
     --ycsb-dir) YCSB_DIR="$2"; shift 2 ;;
+    --redis-timeout-ms) REDIS_TIMEOUT_MS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -121,6 +129,7 @@ run_ycsb() {
   local extra_p=()
   [[ -n "${PASSWORD}" ]] && extra_p+=( -p "redis.password=${PASSWORD}" )
   [[ -n "${CLUSTER}" ]] && extra_p+=( -p "redis.cluster=${CLUSTER}" )
+  [[ -n "${REDIS_TIMEOUT_MS}" ]] && extra_p+=( -p "redis.timeout.ms=${REDIS_TIMEOUT_MS}" )
 
   local tgt_args=()
   [[ -n "${TARGET}" ]] && tgt_args+=( -target "${TARGET}" )
@@ -134,6 +143,60 @@ run_ycsb() {
     -p "redis.host=${HOST}" -p "redis.port=${PORT}" \
     "${extra_p[@]}" -threads "${THREADS}" "${tgt_args[@]}" 2>&1 | tee "${outfile}"
   echo "[+] Saved: ${outfile}"
+}
+
+resp_ping() {
+  local host="$1"
+  local port="$2"
+  local timeout_ms="$3"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$host" "$port" "$timeout_ms" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+timeout = float(sys.argv[3]) / 1000.0
+
+try:
+    s = socket.create_connection((host, port), timeout=timeout)
+    s.settimeout(timeout)
+    s.sendall(b"*1\r\n$4\r\nPING\r\n")
+    data = s.recv(64)
+    s.close()
+    sys.exit(0 if b"+PONG" in data else 1)
+except Exception:
+    sys.exit(1)
+PY
+    return $?
+  fi
+  local timeout_s
+  timeout_s="$(awk "BEGIN{print ${timeout_ms}/1000}")"
+  if exec 3<>"/dev/tcp/${host}/${port}" 2>/dev/null; then
+    printf '*1\r\n$4\r\nPING\r\n' >&3 || true
+    local line=""
+    IFS= read -r -t "${timeout_s}" line <&3 || true
+    exec 3>&-
+    [[ "${line}" == "+PONG"* ]] && return 0
+  fi
+  return 1
+}
+
+wait_for_proxy_ready() {
+  local host="$1"
+  local port="$2"
+  local tries="$3"
+  local delay_ms="$4"
+  local timeout_ms="$5"
+  local attempt=1
+  while [[ "${attempt}" -le "${tries}" ]]; do
+    if resp_ping "${host}" "${port}" "${timeout_ms}"; then
+      return 0
+    fi
+    sleep "$(awk "BEGIN{print ${delay_ms}/1000}")"
+    attempt=$((attempt + 1))
+  done
+  return 1
 }
 
 # If caller sets RING_RESP_PROXY=1, try to launch local RESP-over-ring stream proxy
@@ -150,6 +213,9 @@ maybe_start_ring_proxy() {
     "CXL_RING_REGION_SIZE=${CXL_RING_REGION_SIZE:-}"
     "CXL_RING_REGION_BASE=${CXL_RING_REGION_BASE:-}"
     "CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS:-}"
+    "CXL_SEC_KEY_HEX=${CXL_SEC_KEY_HEX:-}"
+    "CXL_SEC_COMMON_KEY_HEX=${CXL_SEC_COMMON_KEY_HEX:-}"
+    "CXL_CRYPTO_PRIV_REGION_SIZE=${CXL_CRYPTO_PRIV_REGION_SIZE:-}"
   )
   if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
     sudo_prefix=(sudo -n)
@@ -184,9 +250,30 @@ maybe_start_ring_proxy() {
     secure_args+=( --crypto --sec-node-id "${sec_node_id}" )
   fi
 
-  echo "[*] Starting ring_resp_proxy at ${listen_addr} -> ${ring_path} (offset=${ring_offset} ring=${ring_idx})"
-  ( "${sudo_prefix[@]}" env "${proxy_env[@]}" /tmp/ring_resp_proxy --path "${ring_path}" --map-size "${ring_size}" --map-offset "${ring_offset}" --ring "${ring_idx}" --listen "${listen_addr}" "${secure_args[@]}" >/tmp/ring_resp_proxy.log 2>&1 & echo $! > /tmp/ring_resp_proxy.pid )
-  sleep 0.3
+  local listen_host="${listen_addr%:*}"
+  local listen_port="${listen_addr##*:}"
+  local attempt=1
+  local proxy_log_ts
+  proxy_log_ts="$(date +%Y%m%d_%H%M%S)"
+  RING_RESP_PROXY_LOG="${OUTDIR}/ring_resp_proxy_${listen_port}_${proxy_log_ts}.log"
+
+  while [[ "${attempt}" -le "${YCSB_PROXY_RETRIES}" ]]; do
+    maybe_stop_ring_proxy
+    echo "[*] Starting ring_resp_proxy at ${listen_addr} -> ${ring_path} (offset=${ring_offset} ring=${ring_idx})"
+    ( "${sudo_prefix[@]}" env "${proxy_env[@]}" /tmp/ring_resp_proxy --path "${ring_path}" --map-size "${ring_size}" --map-offset "${ring_offset}" --ring "${ring_idx}" --listen "${listen_addr}" "${secure_args[@]}" >"${RING_RESP_PROXY_LOG}" 2>&1 & echo $! > /tmp/ring_resp_proxy.pid )
+    sleep 0.3
+    if wait_for_proxy_ready "${listen_host}" "${listen_port}" "${YCSB_PROXY_PING_TRIES}" "${YCSB_PROXY_PING_DELAY_MS}" "${YCSB_PROXY_PING_TIMEOUT_MS}"; then
+      return 0
+    fi
+    echo "[!] ring_resp_proxy not ready after attempt ${attempt}/${YCSB_PROXY_RETRIES}" >&2
+    if [[ -f "${RING_RESP_PROXY_LOG}" ]]; then
+      echo "--- ${RING_RESP_PROXY_LOG} (tail) ---" >&2
+      tail -n 200 "${RING_RESP_PROXY_LOG}" >&2 || true
+    fi
+    attempt=$((attempt + 1))
+  done
+  echo "[!] ring_resp_proxy failed to start or respond; aborting YCSB." >&2
+  exit 1
 }
 
 maybe_stop_ring_proxy() {

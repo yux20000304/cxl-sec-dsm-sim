@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
 #
-# Merge Redis + GAPBS benchmark outputs into a single "wide" CSV for analysis.
+# Merge Redis + GAPBS + YCSB benchmark outputs into a single "wide" CSV for analysis.
 #
 # Inputs (per timestamp, from scripts/host_recreate_and_bench_tdx.sh):
 # - Redis:
@@ -12,6 +12,8 @@
 # - GAPBS:
 #   - results/tdx_gapbs_compare_<kernel>_<ts>.csv
 #   - results/tdx_gapbs_overhead_<kernel>_<ts>.csv
+# - YCSB:
+#   - results/ycsb_<workload>_{load|run}_HOST_PORT_<ts>.log
 #
 # Output:
 # - One CSV with a superset schema; columns not applicable to a row are blank.
@@ -38,6 +40,11 @@ UNIFIED_FIELDS: List[str] = [
     "op",  # SET|GET (redis)
     "kernel",  # bfs|sssp|...
     "threads",  # redis threads / OMP threads
+    # YCSB identity
+    "workload",
+    "phase",  # load|run
+    "host",
+    "port",
     # Redis metrics/config (microseconds for latency columns)
     "throughput_rps",
     "avg_us",
@@ -67,6 +74,18 @@ UNIFIED_FIELDS: List[str] = [
     "attach_wait_ms",
     "attach_decrypt_ms",
     "attach_pretouch_ms",
+    # YCSB metrics/config
+    "runtime_ms",
+    "throughput_ops_sec",
+    "read_avg_us",
+    "read_p95_us",
+    "read_p99_us",
+    "update_avg_us",
+    "update_p95_us",
+    "update_p99_us",
+    "insert_avg_us",
+    "insert_p95_us",
+    "insert_p99_us",
     # Traceability
     "source_file",
 ]
@@ -99,6 +118,15 @@ def _format_num(v: Optional[float]) -> str:
 
 def _format_int(v: Optional[int]) -> str:
     return "" if v is None else str(v)
+
+
+def _format_metric(val: str) -> str:
+    if not val:
+        return ""
+    parsed = _to_float(val)
+    if parsed is None:
+        return val
+    return _format_num(parsed)
 
 
 def _quantile_from_points(points: List[Tuple[float, float]], q: float) -> Optional[float]:
@@ -197,6 +225,49 @@ def parse_redis_benchmark_log(path: Path) -> List[RedisSummary]:
             )
         )
     return out
+
+
+def parse_ycsb_log(path: Path) -> Optional[Dict[str, str]]:
+    # Filename: ycsb_<workload>_{load|run}_HOST_PORT_TIMESTAMP.log
+    m = re.match(r"ycsb_(?P<workload>[^_]+)_(?P<phase>load|run)_(?P<host>[^_]+)_(?P<port>\d+)_\d+\.log$", path.name)
+    workload = m.group("workload") if m else ""
+    phase = m.group("phase") if m else ""
+    host = m.group("host") if m else ""
+    port = m.group("port") if m else ""
+
+    metrics: Dict[str, str] = {}
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line or "," not in line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 3:
+                continue
+            section = parts[0].strip("[] ")
+            key = parts[1]
+            val = parts[2]
+            metrics[f"{section}.{key}"] = val
+    except Exception:
+        return None
+
+    return {
+        "workload": workload,
+        "phase": phase,
+        "host": host,
+        "port": port,
+        "runtime_ms": metrics.get("OVERALL.RunTime(ms)", ""),
+        "throughput_ops_sec": metrics.get("OVERALL.Throughput(ops/sec)", ""),
+        "read_avg_us": metrics.get("READ.AverageLatency(us)", ""),
+        "read_p95_us": metrics.get("READ.95thPercentileLatency(us)", ""),
+        "read_p99_us": metrics.get("READ.99thPercentileLatency(us)", ""),
+        "update_avg_us": metrics.get("UPDATE.AverageLatency(us)", ""),
+        "update_p95_us": metrics.get("UPDATE.95thPercentileLatency(us)", ""),
+        "update_p99_us": metrics.get("UPDATE.99thPercentileLatency(us)", ""),
+        "insert_avg_us": metrics.get("INSERT.AverageLatency(us)", ""),
+        "insert_p95_us": metrics.get("INSERT.95thPercentileLatency(us)", ""),
+        "insert_p99_us": metrics.get("INSERT.99thPercentileLatency(us)", ""),
+    }
 
 
 def read_csv_rows(path: Path) -> List[Dict[str, str]]:
@@ -344,11 +415,42 @@ def build_rows_for_ts(results_dir: Path, ts: str) -> List[Dict[str, str]]:
             r["source_file"] = str(p)
             rows.append(r)
 
+    # YCSB logs.
+    for p in results_dir.glob(f"ycsb_*_{ts}.log"):
+        y = parse_ycsb_log(p)
+        if not y:
+            continue
+        r = _new_row()
+        r["ts"] = ts
+        r["app"] = "ycsb"
+        if y.get("phase"):
+            r["scenario"] = f"YCSB{y['phase'].capitalize()}"
+        else:
+            r["scenario"] = "YCSB"
+        r["run_label"] = p.stem
+        r["workload"] = y.get("workload", "")
+        r["phase"] = y.get("phase", "")
+        r["host"] = y.get("host", "")
+        r["port"] = y.get("port", "")
+        r["runtime_ms"] = _format_metric(y.get("runtime_ms", ""))
+        r["throughput_ops_sec"] = _format_metric(y.get("throughput_ops_sec", ""))
+        r["read_avg_us"] = _format_metric(y.get("read_avg_us", ""))
+        r["read_p95_us"] = _format_metric(y.get("read_p95_us", ""))
+        r["read_p99_us"] = _format_metric(y.get("read_p99_us", ""))
+        r["update_avg_us"] = _format_metric(y.get("update_avg_us", ""))
+        r["update_p95_us"] = _format_metric(y.get("update_p95_us", ""))
+        r["update_p99_us"] = _format_metric(y.get("update_p99_us", ""))
+        r["insert_avg_us"] = _format_metric(y.get("insert_avg_us", ""))
+        r["insert_p95_us"] = _format_metric(y.get("insert_p95_us", ""))
+        r["insert_p99_us"] = _format_metric(y.get("insert_p99_us", ""))
+        r["source_file"] = str(p)
+        rows.append(r)
+
     return rows
 
 
 def main(argv: List[str]) -> int:
-    ap = argparse.ArgumentParser(description="Unify Redis + GAPBS result CSV/logs into one CSV.")
+    ap = argparse.ArgumentParser(description="Unify Redis + GAPBS + YCSB result CSV/logs into one CSV.")
     ap.add_argument("--results-dir", default="results", help="Results directory (default: results)")
     ap.add_argument("--ts", default="", help="Timestamp filter (e.g. 20260123_060544). Default: all.")
     ap.add_argument("--out", default="", help="Output CSV path. Default: results/tdx_unified_<ts>.csv or ..._all.csv")

@@ -43,7 +43,7 @@ CXL_CRYPTO_PRIV_REGION_SIZE="${CXL_CRYPTO_PRIV_REGION_SIZE:-32G}"
 
 YCSB_ENABLE="${YCSB_ENABLE:-1}"
 YCSB_WORKLOADS="${YCSB_WORKLOADS:-workloada,workloadb,workloadc,workloadd}"
-GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-bfs,sssp,pr,cc,bc}"
+GAPBS_KERNEL_LIST="${GAPBS_KERNEL_LIST:-}"
 
 IFS=',' read -r -a threads_arr <<< "${THREAD_LIST}"
 
