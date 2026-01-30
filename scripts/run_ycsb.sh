@@ -21,6 +21,7 @@ mkdir -p "${OUTDIR}"
 
 HOST="127.0.0.1"
 PORT=6379
+DB="redis"
 WORKLOADS="workloada,workloadb"   # comma-separated; files in YCSB workloads/
 RECORDS=100000
 OPS=100000
@@ -41,7 +42,7 @@ usage() {
 Usage: $0 [--host 127.0.0.1] [--port 6379] [--workloads workloada,workloadb] \
           [--recordcount 100000] [--operationcount 100000] [--threads 4] \
           [--target OPS] [--password PWD] [--cluster true|false] [--ycsb-dir PATH] \
-          [--redis-timeout-ms MS]
+          [--redis-timeout-ms MS] [--db redis|rediskv|ringkv]
 
 Runs YCSB (redis binding) against the given Redis host:port.
 Downloads YCSB locally if needed (to /tmp/ycsb-0.17.0).
@@ -53,6 +54,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --db) DB="$2"; shift 2 ;;
     --workloads) WORKLOADS="$2"; shift 2 ;;
     --recordcount) RECORDS="$2"; shift 2 ;;
     --operationcount) OPS="$2"; shift 2 ;;
@@ -84,6 +86,23 @@ ensure_java() {
   fi
 }
 
+ensure_javac() {
+  if command -v javac >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "[*] Installing JDK (openjdk-headless) ..."
+  if command -v sudo >/dev/null 2>&1; then
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get update -y
+    if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-11-jdk-headless >/dev/null 2>&1; then
+      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jdk-headless
+    fi
+  else
+    env DEBIAN_FRONTEND=noninteractive apt-get update -y
+    env DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-11-jdk-headless || \
+      env DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jdk-headless
+  fi
+}
+
 ensure_ycsb() {
   if [[ -n "${YCSB_DIR}" ]]; then
     return 0
@@ -105,6 +124,67 @@ ensure_ycsb() {
   mkdir -p "${dir}"
   tar -C /tmp -xzf "${tgz}"
   YCSB_DIR="${dir}"
+}
+
+ensure_kv_bindings() {
+  local src_dir="${ROOT}/ycsb_bindings/src"
+  if [[ ! -d "${src_dir}" ]]; then
+    echo "[!] Missing KV binding sources at ${src_dir}" >&2
+    exit 1
+  fi
+  ensure_javac
+
+  local build_dir="/tmp/ycsb_kv_build"
+  local jar_path="/tmp/ycsb_kv_binding.jar"
+  local core_jar="${YCSB_DIR}/lib/core-0.17.0.jar"
+  local redis_lib="${YCSB_DIR}/redis-binding/lib"
+  local cp="${core_jar}:${redis_lib}/jedis-2.9.0.jar:${redis_lib}/commons-pool2-2.4.2.jar"
+
+  if [[ ! -f "${jar_path}" ]] || [[ "${src_dir}" -nt "${jar_path}" ]]; then
+    rm -rf "${build_dir}"
+    mkdir -p "${build_dir}"
+    javac -cp "${cp}" -d "${build_dir}" \
+      "${src_dir}/site/ycsb/db/KVRecordCodec.java" \
+      "${src_dir}/site/ycsb/db/RedisKVClient.java" \
+      "${src_dir}/site/ycsb/db/RingKVClient.java"
+    jar cf "${jar_path}" -C "${build_dir}" .
+  fi
+
+  mkdir -p "${YCSB_DIR}/rediskv-binding/lib" "${YCSB_DIR}/ringkv-binding/lib"
+  cp -f "${jar_path}" "${YCSB_DIR}/rediskv-binding/lib/"
+  cp -f "${jar_path}" "${YCSB_DIR}/ringkv-binding/lib/"
+  cp -f "${redis_lib}"/*.jar "${YCSB_DIR}/rediskv-binding/lib/" || true
+
+  local bindings_file="${YCSB_DIR}/bin/bindings.properties"
+  if [[ -f "${bindings_file}" ]]; then
+    if ! grep -q "^rediskv:" "${bindings_file}"; then
+      echo "rediskv:site.ycsb.db.RedisKVClient" >> "${bindings_file}"
+    fi
+    if ! grep -q "^ringkv:" "${bindings_file}"; then
+      echo "ringkv:site.ycsb.db.RingKVClient" >> "${bindings_file}"
+    fi
+  fi
+}
+
+ensure_ringkv_native() {
+  local src="${ROOT}/ring_client/ring_kv_jni.c"
+  local out="/tmp/libringkvjni.so"
+  if [[ ! -f "${src}" ]]; then
+    echo "[!] Missing ring kv JNI source: ${src}" >&2
+    exit 1
+  fi
+  ensure_javac
+  if [[ ! -f "${out}" ]] || [[ "${src}" -nt "${out}" ]]; then
+    local javac_bin
+    javac_bin="$(command -v javac)"
+    local java_home
+    java_home="$(dirname "$(dirname "$(readlink -f "${javac_bin}")")")"
+    local jni_inc="${java_home}/include"
+    local jni_inc_os="${jni_inc}/linux"
+    gcc -O2 -fPIC -shared -I"${jni_inc}" -I"${jni_inc_os}" -I"${ROOT}" \
+      -o "${out}" "${src}" -lsodium -lpthread
+  fi
+  export RING_KV_NATIVE_LIB="${out}"
 }
 
 find_ycsb_launcher() {
@@ -137,8 +217,8 @@ run_ycsb() {
   local launcher
   launcher="$(find_ycsb_launcher)" || { echo "[!] YCSB launcher not found under: ${YCSB_DIR}/bin" >&2; exit 1; }
 
-  echo "[*] YCSB ${action} ${wl_file} -> ${HOST}:${PORT} (threads=${THREADS}, records=${RECORDS}, ops=${OPS})"
-  "${launcher}" "${action}" redis -s -P "${YCSB_DIR}/${wl_file}" \
+  echo "[*] YCSB ${action} ${wl_file} -> ${HOST}:${PORT} (db=${DB} threads=${THREADS}, records=${RECORDS}, ops=${OPS})"
+  "${launcher}" "${action}" "${DB}" -s -P "${YCSB_DIR}/${wl_file}" \
     -p "recordcount=${RECORDS}" -p "operationcount=${OPS}" \
     -p "redis.host=${HOST}" -p "redis.port=${PORT}" \
     "${extra_p[@]}" -threads "${THREADS}" "${tgt_args[@]}" 2>&1 | tee "${outfile}"
@@ -290,8 +370,16 @@ maybe_stop_ring_proxy() {
 
 ensure_java
 ensure_ycsb
+if [[ "${DB}" == "rediskv" || "${DB}" == "ringkv" ]]; then
+  ensure_kv_bindings
+fi
+if [[ "${DB}" == "ringkv" ]]; then
+  ensure_ringkv_native
+fi
 
-maybe_start_ring_proxy
+if [[ "${DB}" != "ringkv" ]]; then
+  maybe_start_ring_proxy
+fi
 
 IFS=',' read -r -a wls <<< "${WORKLOADS}"
 for w in "${wls[@]}"; do
@@ -304,4 +392,6 @@ for w in "${wls[@]}"; do
   run_ycsb run  "${wl_path}"
 done
 
-maybe_stop_ring_proxy
+if [[ "${DB}" != "ringkv" ]]; then
+  maybe_stop_ring_proxy
+fi

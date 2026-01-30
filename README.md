@@ -133,7 +133,11 @@ The repo is mounted inside the guests at `/mnt/hostshare` via 9p (the script mou
 
 ### 3.2 Optional: enable YCSB
 
-YCSB requires RESP/TCP. For ring and secure-ring, the script starts a local proxy on VM2 (`ring_resp_proxy`) that exposes a TCP/RESP endpoint backed by the shared-memory ring.
+YCSB now uses two bindings:
+- `rediskv` (RESP/TCP GET+SET/DEL/SCAN) for native/sodium.
+- `ringkv` (binary ring direct, no RESP) for ring/crypto/secure.
+
+`ringkv` encodes each YCSB record into a single value (KV blob). SCAN returns up to the requested count, but each response is limited by the ring slot size (~4 KiB), so large records may require multiple scan rounds.
 
 ```bash
 sudo -E YCSB_ENABLE=1 YCSB_WORKLOADS=workloada,workloadb \
