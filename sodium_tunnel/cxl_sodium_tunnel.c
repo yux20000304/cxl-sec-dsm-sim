@@ -6,6 +6,7 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 #include <sodium.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -18,11 +19,77 @@
 #define CHUNK_SIZE 16384
 #define MAX_RECORD (1U << 20) /* 1MB safety cap */
 
+/*
+ * Lightweight instrumentation to attribute time spent on:
+ * - crypto (secretstream push/pull)
+ * - read()/write() syscalls
+ *
+ * When SODIUM_STATS_OUT is set to a writable path, the process will dump
+ * a JSON line with aggregated counters at exit or on SIGTERM/SIGINT/SIGHUP.
+ * Counters are approximate but cheap and thread-safe.
+ */
+static const char *g_stats_path = NULL;
+static int g_stats_enabled = 0;
+
+static inline unsigned long long nsec_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
 static volatile sig_atomic_t g_running = 1;
+
+/* Global accumulators (ns / bytes). Use atomic adds for cross-thread updates. */
+static unsigned long long g_crypto_push_ns = 0;
+static unsigned long long g_crypto_pull_ns = 0;
+static unsigned long long g_read_ns = 0;
+static unsigned long long g_write_ns = 0;
+static unsigned long long g_read_bytes = 0;
+static unsigned long long g_write_bytes = 0;
+static unsigned long long g_crypto_in_bytes = 0;  /* plaintext bytes encrypted */
+static unsigned long long g_crypto_out_bytes = 0; /* plaintext bytes decrypted */
+
+static void stats_add(volatile unsigned long long *dst, unsigned long long v) {
+    __atomic_fetch_add((unsigned long long *)dst, v, __ATOMIC_RELAXED);
+}
+
+static void write_stats_json(void) {
+    if (!g_stats_path) return;
+    FILE *f = fopen(g_stats_path, "w");
+    if (!f) return;
+    fprintf(f,
+            "{\n"
+            "  \"pid\": %d,\n"
+            "  \"crypto_push_ns\": %llu,\n"
+            "  \"crypto_pull_ns\": %llu,\n"
+            "  \"read_ns\": %llu,\n"
+            "  \"write_ns\": %llu,\n"
+            "  \"read_bytes\": %llu,\n"
+            "  \"write_bytes\": %llu,\n"
+            "  \"crypto_in_bytes\": %llu,\n"
+            "  \"crypto_out_bytes\": %llu\n"
+            "}\n",
+            (int)getpid(),
+            (unsigned long long)g_crypto_push_ns,
+            (unsigned long long)g_crypto_pull_ns,
+            (unsigned long long)g_read_ns,
+            (unsigned long long)g_write_ns,
+            (unsigned long long)g_read_bytes,
+            (unsigned long long)g_write_bytes,
+            (unsigned long long)g_crypto_in_bytes,
+            (unsigned long long)g_crypto_out_bytes);
+    fclose(f);
+}
+
+static void on_exit_dump(void) {
+    write_stats_json();
+}
 
 static void on_sig(int sig) {
     (void)sig;
     g_running = 0;
+    /* Dump promptly so stats are not lost on termination. */
+    write_stats_json();
 }
 
 static void usage(const char *prog) {
@@ -155,7 +222,16 @@ static ssize_t read_full(int fd, void *buf, size_t n) {
 static int write_full(int fd, const void *buf, size_t n) {
     size_t off = 0;
     while (off < n) {
+        unsigned long long t0 = 0;
+        if (g_stats_enabled) t0 = nsec_now();
         ssize_t w = write(fd, (const unsigned char *)buf + off, n - off);
+        if (g_stats_enabled) {
+            unsigned long long t1 = nsec_now();
+            stats_add(&g_write_ns, (t1 - t0));
+            if (w > 0) {
+                stats_add(&g_write_bytes, (unsigned long long)w);
+            }
+        }
         if (w < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -215,7 +291,16 @@ static void *plain_to_enc(void *arg) {
     unsigned char tag = 0;
 
     while (1) {
+        unsigned long long t0r = 0;
+        if (g_stats_enabled) t0r = nsec_now();
         ssize_t r = read(c->fd_plain, inbuf, sizeof(inbuf));
+        if (g_stats_enabled) {
+            unsigned long long t1r = nsec_now();
+            stats_add(&g_read_ns, (t1r - t0r));
+            if (r > 0) {
+                stats_add(&g_read_bytes, (unsigned long long)r);
+            }
+        }
         if (r < 0) {
             if (errno == EINTR) continue;
             break;
@@ -227,9 +312,16 @@ static void *plain_to_enc(void *arg) {
         }
 
         unsigned long long clen = 0;
+        unsigned long long t0c = 0;
+        if (g_stats_enabled) t0c = nsec_now();
         if (crypto_secretstream_xchacha20poly1305_push(&c->st_push, cbuf, &clen, inbuf, (unsigned long long)r, NULL, 0,
                                                        tag) != 0) {
             break;
+        }
+        if (g_stats_enabled) {
+            unsigned long long t1c = nsec_now();
+            stats_add(&g_crypto_push_ns, (t1c - t0c));
+            if (r > 0) stats_add(&g_crypto_in_bytes, (unsigned long long)r);
         }
         if (clen > MAX_RECORD) break;
 
@@ -250,19 +342,42 @@ static int enc_to_plain(struct conn_ctx *c) {
 
     while (1) {
         uint32_t be_len = 0;
+        unsigned long long t0r = 0;
+        if (g_stats_enabled) t0r = nsec_now();
         ssize_t r = read_full(c->fd_enc, &be_len, sizeof(be_len));
+        if (g_stats_enabled) {
+            unsigned long long t1r = nsec_now();
+            stats_add(&g_read_ns, (t1r - t0r));
+            if (r > 0) stats_add(&g_read_bytes, (unsigned long long)r);
+        }
         if (r == 0) break; /* EOF */
         if (r != (ssize_t)sizeof(be_len)) return -1;
         uint32_t clen = ntohl(be_len);
         if (clen == 0 || clen > MAX_RECORD) return -1;
 
+        t0r = 0;
+        if (g_stats_enabled) t0r = nsec_now();
         ssize_t rr = read_full(c->fd_enc, cbuf, clen);
+        if (g_stats_enabled) {
+            unsigned long long t1r = nsec_now();
+            stats_add(&g_read_ns, (t1r - t0r));
+            if (rr > 0) {
+                stats_add(&g_read_bytes, (unsigned long long)rr);
+            }
+        }
         if (rr != (ssize_t)clen) return -1;
 
         unsigned long long plen = 0;
         unsigned char tag = 0;
+        unsigned long long t0c = 0;
+        if (g_stats_enabled) t0c = nsec_now();
         if (crypto_secretstream_xchacha20poly1305_pull(&c->st_pull, pbuf, &plen, &tag, cbuf, clen, NULL, 0) != 0) {
             return -1;
+        }
+        if (g_stats_enabled) {
+            unsigned long long t1c = nsec_now();
+            stats_add(&g_crypto_pull_ns, (t1c - t0c));
+            if (plen > 0) stats_add(&g_crypto_out_bytes, (unsigned long long)plen);
         }
 
         if (plen) {
@@ -526,6 +641,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    g_stats_path = getenv("SODIUM_STATS_OUT");
+    if (g_stats_path && g_stats_path[0] != '\0') {
+        g_stats_enabled = 1;
+        atexit(on_exit_dump);
+    } else {
+        g_stats_path = NULL;
+    }
+
     unsigned char key[crypto_secretstream_xchacha20poly1305_KEYBYTES];
     if (parse_key_hex(key_hex, key, sizeof(key)) != 0) {
         fprintf(stderr, "[!] Invalid --key (expected hex64 for 32 bytes)\n");
@@ -538,6 +661,7 @@ int main(int argc, char **argv) {
     sa.sa_handler = on_sig;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
 
     char *lh = NULL, *lp = NULL;
     if (parse_hostport(listen, &lh, &lp) != 0) {

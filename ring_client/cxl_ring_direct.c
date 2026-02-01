@@ -215,10 +215,56 @@ static atomic_uint_fast64_t g_crypto_priv_nonce_ctr[MAX_RINGS];
 static size_t g_bench_key_size = 0;
 static size_t g_bench_val_size = 0;
 
+struct sec_perm_stats {
+    uint64_t table_wait_ns;
+    uint64_t principal_sleep_ns;
+    uint64_t mgr_calls;
+    uint64_t mgr_ns;
+};
+
+static const char *g_sec_stats_out = NULL;
+static int g_sec_stats_enabled = 0;
+static struct sec_perm_stats g_sec_perm = {0};
+
 static inline uint64_t nowns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void write_sec_perm_stats_json(const struct layout *lo) {
+    if (!g_sec_stats_enabled || !g_sec_stats_out || !g_sec_stats_out[0]) return;
+    int fd = open(g_sec_stats_out, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno != EEXIST) perror("open CXL_SEC_STATS_OUT");
+        return;
+    }
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        return;
+    }
+    uint64_t total_perm_ns = g_sec_perm.table_wait_ns + g_sec_perm.principal_sleep_ns + g_sec_perm.mgr_ns;
+    fprintf(f,
+            "{\n"
+            "  \"mode\": \"%s\",\n"
+            "  \"node_id\": %" PRIu64 ",\n"
+            "  \"ring_count\": %u,\n"
+            "  \"table_wait_ns\": %" PRIu64 ",\n"
+            "  \"principal_sleep_ns\": %" PRIu64 ",\n"
+            "  \"sec_mgr_calls\": %" PRIu64 ",\n"
+            "  \"sec_mgr_ns\": %" PRIu64 ",\n"
+            "  \"perm_total_ns\": %" PRIu64 "\n"
+            "}\n",
+            g_crypto ? "crypto" : (g_secure ? "secure" : "none"),
+            (uint64_t)g_sec_node_id,
+            lo ? lo->ring_count : 0u,
+            g_sec_perm.table_wait_ns,
+            g_sec_perm.principal_sleep_ns,
+            g_sec_perm.mgr_calls,
+            g_sec_perm.mgr_ns,
+            total_perm_ns);
+    fclose(f);
 }
 
 static inline size_t align_up(size_t value, size_t align) {
@@ -597,6 +643,7 @@ static int secure_init(unsigned char *mm, size_t map_size, const struct layout *
         fprintf(stderr, "[!] --secure requires --sec-node-id N\n");
         return -1;
     }
+    if (g_sec_stats_enabled) memset(&g_sec_perm, 0, sizeof(g_sec_perm));
     if (sodium_init() < 0) {
         fprintf(stderr, "[!] sodium_init failed\n");
         return -1;
@@ -651,7 +698,10 @@ static int secure_init(unsigned char *mm, size_t map_size, const struct layout *
     while (running) {
         if (sec_table_ready(t)) break;
         if (waited >= g_sec_timeout_ms) break;
+        uint64_t t0 = 0;
+        if (g_sec_stats_enabled) t0 = nowns();
         sleep_ms(10);
+        if (g_sec_stats_enabled) g_sec_perm.table_wait_ns += (nowns() - t0);
         waited += 10;
     }
     if (!sec_table_ready(t)) {
@@ -670,9 +720,20 @@ static int secure_init(unsigned char *mm, size_t map_size, const struct layout *
         unsigned waited2 = 0;
         while (running) {
             if (sec_entry_has_principal(&t->entries[idx], g_sec_node_id)) break;
-            (void)sec_mgr_request_access(g_sec_mgr, g_sec_node_id, off, 1);
+            if (g_sec_stats_enabled) {
+                uint64_t m0 = nowns();
+                (void)sec_mgr_request_access(g_sec_mgr, g_sec_node_id, off, 1);
+                uint64_t m1 = nowns();
+                g_sec_perm.mgr_ns += (m1 - m0);
+                g_sec_perm.mgr_calls++;
+            } else {
+                (void)sec_mgr_request_access(g_sec_mgr, g_sec_node_id, off, 1);
+            }
             if (waited2 >= g_sec_timeout_ms) break;
+            uint64_t s0 = 0;
+            if (g_sec_stats_enabled) s0 = nowns();
             sleep_ms(10);
+            if (g_sec_stats_enabled) g_sec_perm.principal_sleep_ns += (nowns() - s0);
             waited2 += 10;
         }
         if (!sec_entry_has_principal(&t->entries[idx], g_sec_node_id)) {
@@ -1809,6 +1870,9 @@ int main(int argc, char **argv) {
         }
     }
 
+    g_sec_stats_out = getenv("CXL_SEC_STATS_OUT");
+    if (g_sec_stats_out && g_sec_stats_out[0]) g_sec_stats_enabled = 1;
+
     signal(SIGINT, handle_sig);
     signal(SIGTERM, handle_sig);
 
@@ -1923,6 +1987,8 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+
+    write_sec_perm_stats_json(&lo);
 
     munmap(mm, map_size);
     close(fd);

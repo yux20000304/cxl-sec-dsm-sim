@@ -57,6 +57,7 @@ set -euo pipefail
 #   SODIUM_KEY_HEX : pre-shared key for libsodium tunnel (hex64, default: deterministic test key)
 #   SODIUM_PORT    : vm1 tunnel listen port on cxl0 (default: 6380)
 #   SODIUM_LOCAL_PORT: vm2 local tunnel listen port (default: 6380)
+#   OVERHEAD_STATS : 1 to enable overhead profiling (sodium strace/stats, secure-ring permission stats) (default: 0)
 #   TDX_BIOS       : firmware file passed to QEMU `-bios` (default auto-detected)
 #   RING_ONLY      : 1 to run a ring-only quick validation and exit (default: 0)
 #   RING_ONLY_BENCH_N : total ops for ring-only bench (default: 10000)
@@ -168,6 +169,9 @@ CXL_CRYPTO_PRIV_REGION_SIZE="${CXL_CRYPTO_PRIV_REGION_SIZE:-1G}"
 SODIUM_KEY_HEX="${SODIUM_KEY_HEX:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
 SODIUM_PORT="${SODIUM_PORT:-6380}"
 SODIUM_LOCAL_PORT="${SODIUM_LOCAL_PORT:-6380}"
+# Enable optional syscall/crypto overhead profiling for the sodium tunnel and redis-benchmark.
+# NOTE: This adds noticeable overhead and will distort benchmark numbers; use only for profiling.
+OVERHEAD_STATS="${OVERHEAD_STATS:-1}"
 RING_SECURE_REGION_BASE="${RING_SECURE_REGION_BASE:-4096}"
 
 # YCSB (optional; runs inside VM2 against TCP endpoints)
@@ -956,6 +960,9 @@ ssh_retry_lock ssh_vm2 "vm2 apt-get install deps" "sudo env DEBIAN_FRONTEND=noni
 if [[ "${YCSB_ENABLE}" == "1" ]]; then
   ssh_retry_lock ssh_vm2 "vm2 apt-get install openjdk" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-11-jre-headless || sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jre-headless"
 fi
+if [[ "${OVERHEAD_STATS}" == "1" ]]; then
+  ssh_retry_lock ssh_vm2 "vm2 apt-get install strace" "sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y strace"
+fi
 
 echo "[*] Ensuring SSH service is running in guests ..."
 ssh_vm1 "sudo systemctl enable --now ssh.service >/dev/null 2>&1 || sudo systemctl enable --now sshd.service >/dev/null 2>&1 || true"
@@ -1257,8 +1264,14 @@ echo "[*] Benchmark 2/8: native Redis over libsodium-encrypted TCP (tunnel)"
 ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
 ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
 
-ssh_vm1 "tmux new-session -d -s sodium_server \"/tmp/cxl_sodium_tunnel --mode server --listen 0.0.0.0:${SODIUM_PORT} --backend 127.0.0.1:6379 --key ${SODIUM_KEY_HEX} >/tmp/sodium_server_${ts}.log 2>&1\""
-ssh_vm2 "tmux new-session -d -s sodium_client \"/tmp/cxl_sodium_tunnel --mode client --listen 127.0.0.1:${SODIUM_LOCAL_PORT} --connect ${VMNET_VM1_IP}:${SODIUM_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_client_${ts}.log 2>&1\""
+sodium_stats_env_vm1=""
+sodium_stats_env_vm2=""
+if [[ "${OVERHEAD_STATS}" == "1" ]]; then
+  sodium_stats_env_vm1="SODIUM_STATS_OUT=/tmp/sodium_server_stats.json"
+  sodium_stats_env_vm2="SODIUM_STATS_OUT=/tmp/sodium_client_stats.json"
+fi
+ssh_vm1 "tmux new-session -d -s sodium_server \"${sodium_stats_env_vm1:+${sodium_stats_env_vm1} }/tmp/cxl_sodium_tunnel --mode server --listen 0.0.0.0:${SODIUM_PORT} --backend 127.0.0.1:6379 --key ${SODIUM_KEY_HEX} >/tmp/sodium_server_${ts}.log 2>&1\""
+ssh_vm2 "tmux new-session -d -s sodium_client \"${sodium_stats_env_vm2:+${sodium_stats_env_vm2} }/tmp/cxl_sodium_tunnel --mode client --listen 127.0.0.1:${SODIUM_LOCAL_PORT} --connect ${VMNET_VM1_IP}:${SODIUM_PORT} --key ${SODIUM_KEY_HEX} >/tmp/sodium_client_${ts}.log 2>&1\""
 
 if ! ssh_vm2 "for i in \$(seq 1 600); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} ping >/dev/null 2>&1 && exit 0; sleep 0.25; done; exit 1"; then
   echo "[!] libsodium tunnel not ready. Dumping diagnostics..." >&2
@@ -1270,7 +1283,12 @@ if ! ssh_vm2 "for i in \$(seq 1 600); do redis-cli -h 127.0.0.1 -p ${SODIUM_LOCA
 fi
 
 if [[ "${YCSB_ONLY}" != "1" ]]; then
-  ssh_vm2 "redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE} -d ${REDIS_BENCH_DATASIZE}" | tee "${sodium_log}"
+  if [[ "${OVERHEAD_STATS}" == "1" ]]; then
+    # Overhead profiling: run redis-benchmark under strace summary (adds noticeable overhead).
+    ssh_vm2 "strace -f -c -S time -o /tmp/sodium_rb_${ts}.strace.sum redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE} -d ${REDIS_BENCH_DATASIZE}" | tee "${sodium_log}"
+  else
+    ssh_vm2 "redis-benchmark -h 127.0.0.1 -p ${SODIUM_LOCAL_PORT} -t set,get -n ${REQ_N} -c ${CLIENTS} --threads ${THREADS} -P ${PIPELINE} -d ${REDIS_BENCH_DATASIZE}" | tee "${sodium_log}"
+  fi
 fi
 
 # Optional: run YCSB against libsodium-encrypted TCP tunnel
@@ -1287,6 +1305,23 @@ fi
 
 ssh_vm2 "tmux kill-session -t sodium_client >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t sodium_server >/dev/null 2>&1 || true"
+if [[ "${OVERHEAD_STATS}" == "1" && "${YCSB_ONLY}" != "1" ]]; then
+  if ssh_vm1 "test -f /tmp/sodium_server_stats.json"; then
+    ssh_vm1 "cat /tmp/sodium_server_stats.json" > "${RESULTS_DIR}/sodium_server_stats_${ts}.json"
+  else
+    echo "[!] Missing /tmp/sodium_server_stats.json in vm1 (sodium tunnel stats)" >&2
+  fi
+  if ssh_vm2 "test -f /tmp/sodium_client_stats.json"; then
+    ssh_vm2 "cat /tmp/sodium_client_stats.json" > "${RESULTS_DIR}/sodium_client_stats_${ts}.json"
+  else
+    echo "[!] Missing /tmp/sodium_client_stats.json in vm2 (sodium tunnel stats)" >&2
+  fi
+  if ssh_vm2 "test -f /tmp/sodium_rb_${ts}.strace.sum"; then
+    ssh_vm2 "cat /tmp/sodium_rb_${ts}.strace.sum" > "${RESULTS_DIR}/sodium_rb_${ts}.strace.sum"
+  else
+    echo "[!] Missing /tmp/sodium_rb_${ts}.strace.sum in vm2 (strace summary)" >&2
+  fi
+fi
 
 ssh_vm1 "redis-cli -p 6379 shutdown nosave >/dev/null 2>&1 || true"
 ssh_vm1 "tmux kill-session -t redis_native_tdx >/dev/null 2>&1 || true"
@@ -1388,6 +1423,14 @@ RUN_SECURE=0
 if [[ "${ENABLE_SECURE}" == "1" ]]; then
   echo "[*] Benchmark 5/8: secure ring Redis (ACL + software crypto via cxl_sec_mgr)"
 
+  secure_perm_env_vm2=""
+  secure_perm_json_vm2=""
+  if [[ "${OVERHEAD_STATS}" == "1" ]]; then
+    secure_perm_json_vm2="/tmp/secure_perm_${ts}.json"
+    secure_perm_env_vm2="CXL_SEC_STATS_OUT=${secure_perm_json_vm2}"
+    ssh_vm2 "sudo rm -f ${secure_perm_json_vm2}" || true
+  fi
+
   echo "[*] Secure ring: clearing first page for CXLSEC table ..."
   ssh_vm1 "sudo -n env CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} python3 -c 'import mmap, os; off=int(os.environ.get(\"CXL_RING_OFFSET\", \"0\"), 0); fd=os.open(\"${RING_PATH_VM1}\", os.O_RDWR); m=mmap.mmap(fd, 4096, access=mmap.ACCESS_WRITE, offset=off); m[:] = b\"\\0\"*4096; m.flush(); m.close(); os.close(fd)'"
 
@@ -1398,7 +1441,7 @@ if [[ "${ENABLE_SECURE}" == "1" ]]; then
   ssh_vm1 "tmux new-session -d -s cxl_sec_mgr_ring_tdx \"sudo -n /tmp/cxl_sec_mgr --ring ${RING_PATH_VM1} --listen 0.0.0.0:${SEC_MGR_PORT} --map-size ${RING_MAP_SIZE} --map-offset ${RING_MAP_OFFSET_VM1} --tdx-ring --ring-count ${RING_COUNT} --ring-region-size ${RING_REGION_SIZE} --ring-region-base ${RING_SECURE_REGION_BASE} >/tmp/cxl_sec_mgr_ring_tdx_${ts}.log 2>&1\""
   ssh_vm1 "tmux new-session -d -s redis_ring_tdx_secure \"cd /mnt/hostshare/redis/src && sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_PATH=${RING_PATH_VM1} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM1} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} CXL_SEC_MGR=127.0.0.1:${SEC_MGR_PORT} CXL_SEC_NODE_ID=1 ./redis-server --port ${RING_REDIS_PORT} ${ring_redis_sock_args} --protected-mode no --save '' --appendonly no >/tmp/redis_ring_tdx_secure.log 2>&1\""
 
-  ssh_vm2 "for i in \$(seq 1 200); do sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --sec-timeout-ms ${SEC_MGR_TIMEOUT_MS} --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms 5000 >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'secure ring not ready' >&2; exit 1"
+  ssh_vm2 "for i in \$(seq 1 200); do sudo env CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_POLL_SPIN_NS=${CXL_RING_POLL_SPIN_NS} CXL_RING_POLL_SLEEP_NS=${CXL_RING_POLL_SLEEP_NS} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} ${secure_perm_env_vm2:+${secure_perm_env_vm2} }timeout 5 /tmp/cxl_ring_direct --secure --sec-mgr ${VMNET_VM1_IP}:${SEC_MGR_PORT} --sec-node-id 2 --sec-timeout-ms ${SEC_MGR_TIMEOUT_MS} --path ${RING_PATH_VM2} --map-size ${RING_MAP_SIZE} --ping-timeout-ms 5000 >/dev/null 2>&1 && exit 0; sleep 0.25; done; echo 'secure ring not ready' >&2; exit 1"
 
   ring_secure_label="tdx_ring_secure_${ts}"
   ring_secure_n_per_thread=$(( (REQ_N + THREADS - 1) / THREADS ))
@@ -1417,6 +1460,14 @@ if [[ "${ENABLE_SECURE}" == "1" ]]; then
     if [[ -n "${YCSB_PASSWORD}" ]]; then ycsb_args+=("--password" "${YCSB_PASSWORD}"); fi
     ycsb_args+=("--cluster" "${YCSB_CLUSTER}")
     ssh_vm2 "sudo -n env RING_PATH=${RING_PATH_VM2} RING_MAP_SIZE=${RING_MAP_SIZE} RING_MAP_OFFSET=${RING_MAP_OFFSET_VM2} CXL_RING_PATH=${RING_PATH_VM2} CXL_RING_MAP_SIZE=${RING_MAP_SIZE} CXL_RING_OFFSET=${RING_MAP_OFFSET_VM2} CXL_SHM_DELAY_NS=${CXL_SHM_DELAY_NS} CXL_RING_COUNT=${RING_COUNT} CXL_RING_REGION_SIZE=${RING_REGION_SIZE} CXL_RING_REGION_BASE=${RING_SECURE_REGION_BASE} CXL_SEC_ENABLE=1 CXL_SEC_TIMEOUT_MS=${SEC_MGR_TIMEOUT_MS} CXL_SEC_MGR=${VMNET_VM1_IP}:${SEC_MGR_PORT} CXL_SEC_NODE_ID=2 bash /mnt/hostshare/scripts/run_ycsb.sh ${ycsb_args[*]}"
+  fi
+
+  if [[ "${OVERHEAD_STATS}" == "1" && -n "${secure_perm_json_vm2}" ]]; then
+    if ssh_vm2 "test -f ${secure_perm_json_vm2}"; then
+      ssh_vm2 "cat ${secure_perm_json_vm2}" > "${RESULTS_DIR}/secure_perm_${ts}.json"
+    else
+      echo "[!] Missing ${secure_perm_json_vm2} in vm2 (secure-ring permission stats)" >&2
+    fi
   fi
 
   ssh_vm1 "tmux kill-session -t redis_ring_tdx_secure >/dev/null 2>&1 || true"
